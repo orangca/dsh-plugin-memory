@@ -1,0 +1,4 @@
+# 统一行尾：仓库内一律 LF，避免跨平台 diff 噪声
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.tgz binary
