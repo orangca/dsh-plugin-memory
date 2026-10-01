@@ -190,6 +190,9 @@ Two development notes that cost real debugging time and are worth knowing:
 - `deploy-dev.ps1` never reuses a revision number, because Node's ESM cache is keyed by resolved path: reusing a
   path hands you the previously cached module.
 
+See [`docs/dsh-mechanisms.md`](docs/dsh-mechanisms.md) for the DSH seams, slot semantics and environment facts this
+plugin is built on — written for plugin authors, with no environment-specific details.
+
 ## Known limitations
 
 - **Consolidation of compaction summaries depends on the deployment.** The code path listens to

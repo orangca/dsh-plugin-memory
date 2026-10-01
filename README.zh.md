@@ -180,6 +180,9 @@ node tools/scan-asar.cjs settingsNumberField    # 定位某个符号在 app.asar
 - **条目要能在 profile patch 里被定位**，settings 服务才会为它投影表单；只存在于 bundle 层的行可能不出现。
 - `deploy-dev.ps1` **永不重用修订号**：Node 的 ESM 缓存按解析后的真实路径命中，复用路径会拿到缓存里的旧模块。
 
+本插件依赖的 DSH 接缝、插槽语义与环境事实，见 [`docs/dsh-mechanisms.md`](docs/dsh-mechanisms.md)
+（面向插件作者，不含任何环境特定信息）。
+
 ## 已知限制
 
 - **压缩固化取决于部署**：代码监听 `compaction/summary`；没有挂载压缩插件的 profile 不会产生该事件。
