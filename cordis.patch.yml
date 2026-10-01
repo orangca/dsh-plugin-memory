@@ -1,0 +1,25 @@
+# dsh-plugin-memory 组合包层：把长期记忆插件挂进 profile。
+#
+# 安装：dsh plugin --profile <name> add <本包路径或 tgz>（或由插件管理器安装）
+# 卸载：dsh plugin --profile <name> remove dsh-plugin-memory
+#   注意：卸载**不会**删除记忆数据；数据在 $DSH_HOME/storages/<domainName>/ 下，需自行清理。
+#
+# 配置说明见 README.md 的「配置」一节；下面只列出常用项。
+- insert:
+    - id: dsh-memory
+      name: dsh-plugin-memory
+      config:
+        # 记忆领域名（必须匹配 /^[a-z][a-z0-9_]*$/，且兼作落盘目录名）
+        domainName: dsh_memory
+        # 注入预算（token）
+        maxInjectedTokens: 300
+        selfPortraitMaxTokens: 120
+        # 召回：off | dry（只算不注入）| inject
+        recallMode: inject
+        recallTopK: 8
+        # 自动捕获：off | rule（默认，零模型调用）| rule+llm（未实现）| llm（未实现）
+        captureMode: rule
+        captureMaxPerTurn: 3
+        # 整合治理
+        consolidateEnabled: true
+        consolidateIntervalMinutes: 30

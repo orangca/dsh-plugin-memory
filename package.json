@@ -1,0 +1,60 @@
+{
+  "name": "dsh-plugin-memory",
+  "version": "0.4.2",
+  "type": "module",
+  "description": "Personalized long-term memory for DSH (DeepSeek Harness): local-first, rule-based capture, dual-channel injection, explainable and deletable. 个性化长期记忆插件：本地优先、自动捕获、双通道注入、可解释可删除。",
+  "license": "MIT",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "bundle",
+    "memory",
+    "long-term-memory",
+    "local-first"
+  ],
+  "scripts": {
+    "test": "node --test tests/lib.test.mjs tests/module.test.mjs",
+    "eval": "node tools/eval-recall.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "*",
+    "@deepseek-ai/dsh-client-ui-primitives": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-primitives": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
