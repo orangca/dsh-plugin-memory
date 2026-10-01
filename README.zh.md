@@ -1,6 +1,6 @@
 # dsh-plugin-memory
 
-[DSH（DeepSeek Harness）](https://github.com/) 的**个性化长期记忆**插件：本地优先、自动捕获、双通道注入、
+DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自动捕获、双通道注入、
 可解释可删除。
 
 中文 | [English](README.md)
@@ -54,10 +54,10 @@
 
 ```sh
 # 从 tarball 安装（发布产物推荐这种方式）
-dsh plugin --profile desktop add ./dsh-plugin-memory-0.4.2.tgz
+dsh plugin --profile desktop add ./dsh-plugin-memory-0.4.3.tgz
 
 # 直接从 GitHub 安装（本包无需构建，因此不需要 prepare 授权）
-dsh plugin --profile desktop add github:<you>/dsh-plugin-memory
+dsh plugin --profile desktop add github:orangca/dsh-plugin-memory
 
 # 发布到 npm 后
 dsh plugin --profile desktop add dsh-plugin-memory

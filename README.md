@@ -1,7 +1,7 @@
 # dsh-plugin-memory
 
-Personalized long-term memory for [DSH (DeepSeek Harness)](https://github.com/): local-first, automatic capture,
-dual-channel injection, explainable and deletable.
+Personalized long-term memory for DSH (DeepSeek Harness): local-first, automatic capture, dual-channel injection,
+explainable and deletable.
 
 [中文说明](README.zh.md) | English
 
@@ -59,10 +59,10 @@ dual-channel injection, explainable and deletable.
 
 ```sh
 # from a tarball (recommended for release artifacts)
-dsh plugin --profile desktop add ./dsh-plugin-memory-0.4.2.tgz
+dsh plugin --profile desktop add ./dsh-plugin-memory-0.4.3.tgz
 
 # straight from GitHub (works because this package needs no build step)
-dsh plugin --profile desktop add github:<you>/dsh-plugin-memory
+dsh plugin --profile desktop add github:orangca/dsh-plugin-memory
 
 # from npm, once published
 dsh plugin --profile desktop add dsh-plugin-memory

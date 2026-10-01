@@ -1,9 +1,17 @@
 {
   "name": "dsh-plugin-memory",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "type": "module",
   "description": "Personalized long-term memory for DSH (DeepSeek Harness): local-first, rule-based capture, dual-channel injection, explainable and deletable. 个性化长期记忆插件：本地优先、自动捕获、双通道注入、可解释可删除。",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/orangca/dsh-plugin-memory.git"
+  },
+  "homepage": "https://github.com/orangca/dsh-plugin-memory#readme",
+  "bugs": {
+    "url": "https://github.com/orangca/dsh-plugin-memory/issues"
+  },
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
