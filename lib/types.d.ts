@@ -123,7 +123,6 @@ export interface MemoryConfig {
     captureTimeoutMs: number;
     echoThreshold: number;
     gistMinMarkers: number;
-    gistMaxPerWorkspace: number;
     selfPortraitMinConfidence: number;
     selfPortraitModelMinConfidence: number;
     selfPortraitPromoteSessions: number;

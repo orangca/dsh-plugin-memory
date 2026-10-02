@@ -47,14 +47,15 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 ## 环境要求
 
 - DSH Desktop 或带 profile 的 `dsh` CLI（本插件以**组合包 / bundle** 形式安装，贡献一个 patch 层）。
-- Node.js ≥ 22（跑单测与工具用）。
-- 纯 JavaScript，**无构建步骤**：clone 下来即可运行。
+- **安装方不需要任何额外条件**：包里已带构建好的 `lib/`，`dsh plugin add` 不跑构建，也不需要 `allowBuilds` 授权。
+- **参与开发**需要 Node.js ≥ 22.18（原生剥离 TypeScript 类型；更早的 22.x 需加 `--experimental-strip-types`）
+  以及 pnpm（版本见 `packageManager`）。
 
 ## 安装
 
 ```sh
 # 从 tarball 安装（发布产物推荐这种方式）
-dsh plugin --profile desktop add ./dsh-plugin-memory-0.5.0.tgz
+dsh plugin --profile desktop add ./dsh-plugin-memory-<version>.tgz
 
 # 直接从 GitHub 安装（本包无需构建，因此不需要 prepare 授权）
 dsh plugin --profile desktop add github:orangca/dsh-plugin-memory
@@ -191,6 +192,7 @@ node tools/scan-asar.ts settingsNumberField       # 定位某个符号在 app.as
 | `src/types.ts`、`src/shims.d.ts` | 领域类型 + 本插件实际依赖的 DSH 接缝子集 |
 | `lib/` | 构建产物：**刻意提交进仓库**（见下），并通过 `files` 进发布包 |
 | `tools/build-client.ts` | 把编译后的客户端包成 `window.__ModuleLoader__.load({ id, factory })` |
+| `tools/deploy-dev.ts` | 把 `lib/` 复制成一个新的开发修订版并改写 profile patch |
 
 为什么把构建产物也提交：`dsh plugin add github:<owner>/<repo>` 拉的是**源码而不是产物**，也**不会**跑构建脚本。
 如果 `lib/` 被 git 忽略，GitHub 安装下来的包 `main` 会指向不存在的文件。提交它可以让安装保持「零构建步骤」——

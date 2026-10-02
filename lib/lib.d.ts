@@ -78,6 +78,16 @@ export declare function fnv1a(input: unknown): string;
 export declare function normalizeText(text: unknown): string;
 /** 廉价 token 估算：保守折中（中文约 1.5 字/token、英文约 4 字/token）。 */
 export declare function estimateTokens(text: unknown, charsPerToken?: number): number;
+/**
+ * 把文本压成**单行**并截断到预算内。
+ *
+ * 为什么必须压成单行：常驻块与召回块的结构是「块头 + 逐条 `- …` 行 + 块尾声明」，
+ * 而记忆文本可能来自模型写入、含换行的用户消息、`/memory import` 或压缩摘要固化。
+ * 若文本自带换行，就能伪造出额外的行 —— 包括伪造成块尾声明或 `[系统] …` 这类指令行
+ * （实测：一条含换行的 user_profile 让「以当前对话为准」在块里出现两次）。
+ * 因此这里把控制字符（含 \r\n\t\u0085）折成空格、连续空白折成一个空格，
+ * 并剔除零宽与双向控制字符，保证**一条记忆 = 一行**。
+ */
 export declare function clampText(text: unknown, maxTokens: number, charsPerToken?: number): string;
 /** 去重指纹：kind|scope.level|scope.key|subject|归一化文本。
  *  必须含 `scope.key`：否则 A 项目里写的同一句话会被判成「B 项目已有」而合并到错误的 scope。 */
@@ -98,9 +108,18 @@ export declare function renderSelfBlock(records: Iterable<MemoryRecord>, cfg: Me
 /** 召回块（context 通道）：用户画像/事实 + 当前 workspace 的项目模糊印象。
  *  常驻注入只收 profile 级与「当前 workspace」级；session 级属于临时上下文，永不常驻。 */
 export declare function renderContextBlock(records: Iterable<MemoryRecord>, cfg: MemoryConfig, workspaceKey: string | null): RenderedBlock;
-/** 敏感信息扫描：返回命中的 reason，或 null。 */
+/** 敏感信息扫描：返回命中的 reason，或 null。全角/兼容写法同样命中。 */
 export declare function scanSensitive(text: unknown): string | null;
-/** 可脱敏（而非直接拒写）的个人信息形态：邮箱、手机号（设计稿 §8.3）。 */
+/**
+ * 邮箱/手机号脱敏。
+ *
+ * 只有当**折叠后的视图**确实命中 PII 形态时才折叠并脱敏 —— 这样普通文本一字不改
+ * （不引入 NFKC 的副作用），而全角写法的 PII 也会被正确脱敏而不是原样落盘。
+ *
+ * 取舍：命中 PII 的那条文本会**整体**走 NFKC（全角标点等也随之半角化）。
+ * 这是有意的：宁可规范一条含 PII 的记录，也不要让它带着全角形态落盘、
+ * 之后在注入前被折成可读的号码。
+ */
 export declare function maskPii(text: unknown): string;
 /**
  * 写入来源判定（设计稿 §5.1：判定权在插件，不在模型）。

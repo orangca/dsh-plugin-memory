@@ -1,0 +1,11 @@
+# pnpm 10+ 的 pnpm 专属设置写在这里（不再从 .npmrc 读取 —— 实测 `pnpm config get auto-install-peers`
+# 对 .npmrc 里的同名键返回 undefined）。本仓库是单包仓库，没有 workspace 成员。
+
+# peer 由宿主提供，不由本仓库自动安装：否则会把 @deepseek-ai/* 的**旧发布版**拉进来
+# （发布版 dsh-client-ui-primitives 甚至不导出 settings API，见 src/shims.d.ts），误导类型。
+autoInstallPeers: false
+strictPeerDependencies: false
+
+# 跑脚本前不再另起子进程做依赖状态校验：本仓库脚本（build/typecheck/test）不依赖它，
+# 而实测在受限环境里那个子进程会偶发失败，导致 pnpm 自身报错、掩盖真正的脚本结果。
+verifyDepsBeforeRun: false

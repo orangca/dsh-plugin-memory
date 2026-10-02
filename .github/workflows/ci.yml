@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.x', '24.x']
+    env:
+      # Node 22.x 早于 22.18 时类型剥离仍需显式开启；24 上该标志是空操作。
+      NODE_OPTIONS: --experimental-strip-types
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck (host + client + tools)
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      # lib/ 是提交进仓库的构建产物（GitHub 安装不跑构建），所以必须保证它与 src/ 同步。
+      - name: Build output is in sync with sources
+        run: |
+          pnpm build
+          git diff --exit-code -- lib
+
+      - name: Package contains what the plugin manager needs
+        run: |
+          pnpm pack --pack-destination /tmp
+          tar -tzf /tmp/dsh-plugin-memory-*.tgz | sort > /tmp/contents.txt
+          grep -qx 'package/lib/index.js' /tmp/contents.txt
+          grep -qx 'package/lib/client.js' /tmp/contents.txt
+          grep -qx 'package/cordis.patch.yml' /tmp/contents.txt
+          grep -qx 'package/package.json' /tmp/contents.txt

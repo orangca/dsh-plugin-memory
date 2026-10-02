@@ -52,14 +52,16 @@ explainable and deletable.
 ## Requirements
 
 - DSH Desktop or the `dsh` CLI with a profile (the plugin installs as a **bundle**: it contributes one patch layer).
-- Node.js ≥ 22 for running the tests and tools.
-- Plain JavaScript, **no build step** — what you clone is what runs.
+- **Installing** needs nothing else: the package ships prebuilt `lib/` output, so `dsh plugin add` runs no build step
+  and needs no `allowBuilds` authorization.
+- **Contributing** needs Node.js ≥ 22.18 (native TypeScript type stripping; earlier 22.x needs
+  `--experimental-strip-types`) and pnpm (the version in `packageManager`).
 
 ## Install
 
 ```sh
 # from a tarball (recommended for release artifacts)
-dsh plugin --profile desktop add ./dsh-plugin-memory-0.5.0.tgz
+dsh plugin --profile desktop add ./dsh-plugin-memory-<version>.tgz
 
 # straight from GitHub (works because this package needs no build step)
 dsh plugin --profile desktop add github:orangca/dsh-plugin-memory

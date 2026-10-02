@@ -239,8 +239,6 @@ interface ConsolidateSummary {
   usageFlushed?: number
   ms?: number
   error?: string
-  /** 历史遗留读数：runConsolidate 第 6 步用它算冷却表 cutoff。 */
-  turn?: number
 }
 
 interface ConsolidateState {
@@ -323,6 +321,12 @@ interface PluginState {
   capture: CaptureState
   consolidate: ConsolidateState
   consolidating: boolean
+  /**
+   * 捕获重入锁。`agent/turn-stopping` 用 `Promise.race([runCapture, 超时])` 只保证「按时返回」，
+   * 被超时的那次仍在后台写库 —— 没有这个锁，下一个回合会与它并发改同一批
+   * `state.records` / `state.capture.*`（`consolidate` 早已有同类锁）。
+   */
+  capturing: boolean
   rejectedHashes: Set<string>
   recall: RecallState
   recallTurnById: Map<string, number>
@@ -468,6 +472,35 @@ const passthroughSchema = {
 
 const ORIGIN_RANK: Record<MemoryOrigin, number> = { observed: 0, model_proposed: 1, user_correction: 2, user_explicit: 3 }
 
+// ---------------------------------------------------------------- 白名单与硬上限
+//
+// 命令层（`/memory clear --kind=`）与数据层（`/memory import`）都要按枚举校验，
+// 两处各写一份必然漂移 —— 这里放唯一真源，配 `isMemoryKind` / `isScopeLevel` 类型守卫
+// （守卫返回类型谓词，避免调用方再写 `as MemoryKind` 这种逃逸）。
+
+const MEMORY_KINDS: readonly MemoryKind[] = ['user_profile', 'agent_self', 'project_gist', 'episodic', 'semantic', 'procedural']
+const SCOPE_LEVELS: readonly ScopeLevel[] = ['profile', 'workspace', 'session']
+
+function isMemoryKind(value: unknown): value is MemoryKind {
+  return typeof value === 'string' && (MEMORY_KINDS as readonly string[]).includes(value)
+}
+
+function isScopeLevel(value: unknown): value is ScopeLevel {
+  return typeof value === 'string' && (SCOPE_LEVELS as readonly string[]).includes(value)
+}
+
+/** `[0,1]` 夹取：非有限数（缺失 / 字符串 / NaN / ±Infinity）返回 undefined，由调用方走默认值。 */
+function clamp01(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined
+  return Math.min(1, Math.max(0, value))
+}
+
+/** 冷却表（`state.recallTurnById`）保留的回合数：更早的注入记录不再压制冷却判定。 */
+const RECALL_COOLDOWN_KEEP_TURNS = 200
+
+/** 工具结果里列表条目的硬上限（按条目数截断，见 `jsonList`）。 */
+const WIRE_MAX_ITEMS = 50
+
 /**
  * 归一化宿主下发的配置。
  *
@@ -508,6 +541,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     capture: { turns: 0, written: 0, skipped: {}, last: null, hourWindow: [], lastWriteByHash: new Map(), gistRefreshed: 0 },
     consolidate: { runs: 0, merged: 0, archived: 0, invalidated: 0, summarized: 0, solidified: 0, skipped: 0, last: null },
     consolidating: false,
+    capturing: false,
     rejectedHashes: new Set(),
     recall: { injected: 0, turns: 0, last: null },
     recallTurnById: new Map(),
@@ -531,10 +565,12 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   ctx.effect(() => () => {
     disposed = true
     const handle = domain
-    domain = null
     return (async () => {
-      // 卸载前把内存里累加的用量落盘（best-effort），再释放领域句柄。
+      // 卸载前把内存里累加的用量落盘（best-effort），**然后**再释放领域句柄。
+      // 顺序不能反：persist() 走的就是 `domain`，先把它置空会让整个用量落盘静默失败
+      // （失败被 persist 内部的 catch 吞掉，外面只看到 openError）。
       try { await flushUsage() } catch { /* 落盘失败不阻塞卸载 */ }
+      domain = null
       try { await handle?.close?.() } catch { /* 关闭失败不阻塞卸载 */ }
     })()
   }, 'dsh-memory.domain')
@@ -663,18 +699,31 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     }
   }
 
+  /**
+   * 删除：先摘内存再落盘。**落盘失败必须返回 false 并回滚内存**：
+   * 旧实现只记 `openError` 却 `return true`，于是 `/memory forget` 与 `clear` 报「已删除」，
+   * 而重启后条目从盘上复活（审计 R7）。调用方按返回值汇总失败条数。
+   */
   const remove = async (id: string): Promise<boolean> => {
     if (!state.opened) return false
-    const existed = state.records.delete(id)
-    if (!existed) return false
-    state.collectionVersion += 1
+    const record = state.records.get(id)
+    if (!record) return false
+    state.records.delete(id)
     try {
       await domain!.table<MemoryRecord>('memories').delete(id)
     } catch (error) {
       state.openError = `delete failed: ${errorText(error)}`
+      // 回滚：让内存与盘保持一致（「没删掉」就是没删掉），而不是留在「内存没有、重启复活」的中间态。
+      state.records.set(id, record)
+      return false
     }
+    state.collectionVersion += 1
     return true
   }
+
+  /** 删除失败时的统一说明：盘上仍在，重启后会回来。 */
+  const removeFailureText = (id: string): string =>
+    `删除未落盘：${id}（${state.openError ?? '未知错误'}）；该条目仍在，重启后不会消失。`
 
   const findByHash = (hash: string): MemoryRecord | undefined => [...state.records.values()].find((record) => record.status === 'active' && record.hash === hash)
 
@@ -792,7 +841,10 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       }
       state.opened = true
       try {
-        state.meta = (domain.global.get() ?? null) as MemoryMeta | null
+        // 必须 await：`domain.global.get()` 在运行版里返回 Promise。
+        // 不 await 会把一个 Thenable 存进 state.meta —— 之后 `state.meta?.lastConsolidatedAt`
+        // 恒为 undefined，启动水位丢失，每次启动都白跑一整轮整合。
+        state.meta = ((await domain.global.get()) ?? null) as MemoryMeta | null
       } catch { /* 水位读取失败不影响加载 */ }
       for (const entry of domain.table<MemoryRecord>('memories').entries()) {
         const value = Array.isArray(entry) ? entry[1] : entry
@@ -977,8 +1029,32 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     return target
   }
 
-  /** 一次回合收尾的捕获：规则抽取 → 节流 → 落盘 → 项目印象刷新。任何异常都不得外抛。 */
+  /**
+   * 捕获入口：重入保护 + 实际捕获。
+   *
+   * 为什么需要锁：`agent/turn-stopping` 用 `Promise.race([runCapture(...), 超时])`，超时只意味着
+   * 「本回合不再等它」，被超时的那次仍在后台继续写 `state.records` 与 `state.capture.*`；
+   * 下一个回合再进来就会与它并发改同一批状态。重入时直接跳过并记一次 skipped，
+   * `Promise.race` 的语义（按时返回）保持不变。
+   */
   const runCapture = async (agent: DshAgent | undefined): Promise<void> => {
+    if (state.capturing) {
+      state.capture.turns += 1
+      state.capture.skipped['capture-in-flight'] = (state.capture.skipped['capture-in-flight'] ?? 0) + 1
+      const payload: Record<string, unknown> = { skipped: 'capture-in-flight' }
+      state.capture.last = { at: new Date().toISOString(), ...payload }
+      return
+    }
+    state.capturing = true
+    try {
+      await runCaptureInner(agent)
+    } finally {
+      state.capturing = false
+    }
+  }
+
+  /** 一次回合收尾的捕获：规则抽取 → 节流 → 落盘 → 项目印象刷新。任何异常都不得外抛。 */
+  const runCaptureInner = async (agent: DshAgent | undefined): Promise<void> => {
     const began = Date.now()
     state.capture.turns += 1
     const done = (payload: Record<string, unknown>): void => {
@@ -1298,8 +1374,22 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (flushedUsage > 0) summary.usageFlushed = flushedUsage
       // 6) 无界状态收敛：冷却表与写入窗口表只增不删会慢慢吃掉内存
       if (state.recallTurnById.size > 500) {
-        const cutoff = Math.max(0, state.consolidate.last?.turn ?? 0) - 200
-        for (const [id, turn] of state.recallTurnById) if (turn < cutoff) state.recallTurnById.delete(id)
+        // 冷却表按**回合号**记账（key = 记录 id，value = 最近一次注入它的回合号；
+        // 判定在 `agent/pre-step`：`turn - last >= cooldownTurns`）。
+        // cutoff 必须用**当前回合号**：旧实现读 `state.consolidate.last?.turn`，
+        // 而那个字段从来没有被写过（恒为 undefined → 0），cutoff 恒为 -200，
+        // `turn < -200` 永不成立 —— 冷却表因此跨会话无限增长。
+        // 当前回合号直接取 `state.recall.last.turn`（pre-step 每次都会写它），不引入新的全局状态；
+        // 它缺席（pre-step 因异常只写了 error）时本轮不收敛，等下一个回合再说。
+        const currentTurn = state.recall.last?.turn
+        if (typeof currentTurn === 'number' && Number.isFinite(currentTurn)) {
+          const cutoff = currentTurn - RECALL_COOLDOWN_KEEP_TURNS
+          for (const [id, turn] of state.recallTurnById) {
+            // turn > currentTurn 是**上一个会话**遗留的回合号（回合号按会话从 0 重新计数）：
+            // 它永远不会被冷却判定放过，留着只会永久压制该条目 —— 与过期条目一起清掉。
+            if (turn < cutoff || turn > currentTurn) state.recallTurnById.delete(id)
+          }
+        }
       }
       if (state.capture.lastWriteByHash.size > 2000) {
         const cutoff = now - 7 * 86_400_000
@@ -1374,7 +1464,23 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     schema: { type: 'string' },
     render: (_args: unknown, value: unknown): Array<{ type: string; text: string }> => [{ type: 'text', text: String(value) }],
   }
-  const json = (value: unknown): string => JSON.stringify(value, null, 2).slice(0, 8000)
+  /**
+   * 工具结果序列化：**绝不在 JSON 文本中间切**。
+   * 旧实现是 `JSON.stringify(value, null, 2).slice(0, 8000)`：会在任意位置切断，
+   * 模型拿到的是解析失败的残片（而且没有任何截断标记）。
+   */
+  const json = (value: unknown): string => JSON.stringify(value, null, 2)
+
+  /**
+   * 列表型结果的统一形状：按**条目数**截断（保留前 `WIRE_MAX_ITEMS` 条）后整体序列化，
+   * 并带上 `total` 与 `truncated`，让模型知道「这不是全部」，而不是拿到坏 JSON。
+   * `key` 保持各工具原有的字段名（items / matches / candidates），不额外制造 API 漂移。
+   */
+  const jsonList = (key: string, items: readonly unknown[], extra: Record<string, unknown> = {}): string => {
+    const total = items.length
+    const kept = items.slice(0, WIRE_MAX_ITEMS)
+    return json({ ...extra, count: kept.length, total, truncated: total > kept.length, [key]: kept })
+  }
 
   const toolMessages = (exec: DshToolExecContext | undefined): unknown => {
     try {
@@ -1447,11 +1553,11 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         // 归档条目（设计稿 §4.4）只是不常驻注入，模型主动检索时应当可见
         const hits = recallRecords(state.records.values(), { ...(args ?? {}), includeArchived: true })
         markUsed(hits.map((hit) => hit.record))
-        return json({ count: hits.length, items: hits.map(({ record, score }) => ({
+        return jsonList('items', hits.map(({ record, score }) => ({
           id: record.id, kind: record.kind, scope: record.scope, origin: record.origin,
           text: record.text, pinned: record.pinned, score: Number(score.toFixed(3)),
           observedAt: new Date(record.observedAt).toISOString(),
-        })) })
+        })))
       },
     },
     {
@@ -1475,10 +1581,10 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           .filter((record) => (args?.kind ? record.kind === args.kind : true))
           .sort(compareRecords)
           .slice(0, Math.max(1, Math.min(100, args?.limit ?? 50)))
-        return json({ count: rows.length, items: rows.map((record) => ({
+        return jsonList('items', rows.map((record) => ({
           id: record.id, kind: record.kind, status: record.status, origin: record.origin,
           scope: record.scope, pinned: record.pinned, importance: record.importance, text: record.text,
-        })) })
+        })))
       },
     },
     {
@@ -1499,7 +1605,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         if (args?.id) {
           const target = [...state.records.values()].find((record) => record.id === args.id || record.id.startsWith(args.id as string))
           if (!target) return json({ ok: false, error: 'not_found' })
-          await remove(target.id)
+          // 落盘失败必须如实回报：否则「已删除」的条目重启后会复活。
+          if (!(await remove(target.id))) return json({ ok: false, error: 'delete_failed', id: target.id, detail: state.openError })
           state.writes.deleted += 1
           flush()
           return json({ ok: true, deleted: [target.id], text: target.text })
@@ -1508,14 +1615,16 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           // 破坏性操作：词面覆盖率必须 ≥ 0.6，宁可少删不可错删。
           const hits = recallRecords(state.records.values(), { query: args.query, limit: 20, minLexical: 0.6 }, Date.now())
           if (!args.confirm) {
-            return json({ ok: false, needsConfirm: true, matches: hits.map(({ record }) => ({ id: record.id, text: record.text })) })
+            return jsonList('matches', hits.map(({ record }) => ({ id: record.id, text: record.text })), { ok: false, needsConfirm: true })
           }
           const deleted: string[] = []
           for (const { record } of hits) {
             if (await remove(record.id)) deleted.push(record.id)
           }
+          const failed = hits.length - deleted.length
           state.writes.deleted += deleted.length
           flush()
+          if (failed > 0) return json({ ok: false, error: 'delete_failed', deleted, failed, detail: state.openError })
           return json({ ok: true, deleted })
         }
         return json({ ok: false, error: 'provide id or query' })
@@ -1570,7 +1679,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           signal: candidate.signal, kind: candidate.kind, origin: candidate.origin,
           confidence: candidate.confidence, importance: candidate.importance, text: candidate.text,
         })) }
-        if (args?.apply !== true) return json(report0)
+        if (args?.apply !== true) return jsonList('candidates', report0.candidates, { skipped: report0.skipped })
         const origin = cfg.trustToolWrites ? 'user_explicit' : deriveOriginFromMessages(toolMessages(exec))
         const written: Array<{ ok: boolean; status?: string; id?: string; error?: string }> = []
         for (const candidate of candidates) {
@@ -1587,7 +1696,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           })
           written.push({ ok: result.ok, status: result.status, id: result.id, error: result.error })
         }
-        return json({ ...report0, applied: true, written })
+        return jsonList('candidates', report0.candidates, { skipped: report0.skipped, applied: true, written })
       },
     },
   ]
@@ -1640,7 +1749,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (!id) return { kind: 'error', text: '用法：/memory forget <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
-      await remove(target.id)
+      if (!(await remove(target.id))) return { kind: 'error', text: removeFailureText(target.id) }
       state.writes.deleted += 1
       flush()
       return { kind: 'success', text: `已删除 ${target.id}\n${target.text}` }
@@ -1733,16 +1842,44 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     async clear(args: string[]): Promise<DshCommandResult> {
       const all = args.includes('--all')
       const confirmed = args.includes('--yes')
-      const kind = args.find((part) => part.startsWith('--kind='))?.slice(7)
-      const scope = args.find((part) => part.startsWith('--scope='))?.slice(8)
-      if (!all && !kind && !scope) return { kind: 'error', text: '用法：/memory clear --all --yes | --kind=<kind> --yes | --scope=<level> --yes' }
+      const kindRaw = args.find((part) => part.startsWith('--kind='))?.slice(7)
+      const scopeRaw = args.find((part) => part.startsWith('--scope='))?.slice(8)
+      const usage = '用法：/memory clear --all --yes | /memory clear --kind=<kind> [--scope=<level>] --yes（多个条件按 AND 组合；--all 不能与其它条件同时使用）'
+      if (!all && kindRaw === undefined && scopeRaw === undefined) return { kind: 'error', text: usage }
+      // 枚举校验：拼错的 --kind/--scope 以前会静默匹配 0 条却回「已永久删除」。
+      if (kindRaw !== undefined && !isMemoryKind(kindRaw)) {
+        return { kind: 'error', text: `未知的 --kind=${kindRaw}（可用：${MEMORY_KINDS.join(' | ')}）。${usage}` }
+      }
+      if (scopeRaw !== undefined && !isScopeLevel(scopeRaw)) {
+        return { kind: 'error', text: `未知的 --scope=${scopeRaw}（可用：${SCOPE_LEVELS.join(' | ')}）。${usage}` }
+      }
+      // `--all` 是「无条件全删」，与其它条件混用只会让人误判删除范围 —— 直接拒绝，不猜意图。
+      if (all && (kindRaw !== undefined || scopeRaw !== undefined)) {
+        return { kind: 'error', text: `--all 不能与 --kind/--scope 同时使用（前者是全部，后者是筛选）。${usage}` }
+      }
       if (!confirmed) return { kind: 'error', text: '这是不可逆操作，请加 --yes 确认。' }
+      const kind = kindRaw as MemoryKind | undefined
+      const scope = scopeRaw as ScopeLevel | undefined
+      // 多条件 **AND**（旧实现是 OR：`--kind=a --scope=b` 会删掉「所有 a」加上「所有 b」）。
       const victims = [...state.records.values()].filter((record) =>
-        all || (kind ? record.kind === kind : false) || (scope ? record.scope.level === scope : false))
-      for (const victim of victims) await remove(victim.id)
-      state.writes.deleted += victims.length
+        (all || (kind !== undefined && record.kind === kind)) && (scope === undefined || record.scope.level === scope))
+      if (victims.length === 0) return { kind: 'success', text: '没有匹配的记忆，未删除任何条目。' }
+      let deleted = 0
+      let failed = 0
+      for (const victim of victims) {
+        if (await remove(victim.id)) deleted += 1
+        else failed += 1
+      }
+      state.writes.deleted += deleted
       flush()
-      return { kind: 'success', text: `已永久删除 ${victims.length} 条记忆（不可恢复）。` }
+      // 失败条数如实汇报：落盘失败的条目重启后仍在，不能笼统说「已永久删除」。
+      if (failed > 0) {
+        return {
+          kind: 'error',
+          text: `已永久删除 ${deleted} 条；${failed} 条落盘失败（${state.openError ?? '未知错误'}），重启后仍在。`,
+        }
+      }
+      return { kind: 'success', text: `已永久删除 ${deleted} 条记忆（不可恢复）。` }
     },
     async import(args: string[]): Promise<DshCommandResult> {
       const path = args[0]
@@ -1752,26 +1889,44 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         const items = Array.isArray(doc?.items) ? doc.items : []
         let created = 0
         let skipped = 0
+        let invalid = 0
         for (const item of items) {
-          const row = item as { kind?: unknown; text?: unknown; subject?: string | null; field?: string | null; value?: string | null; tags?: string[]; scope?: MemoryScope; origin?: MemoryOrigin; confidence?: number; importance?: number; pinned?: boolean } | null
-          if (!row || typeof row.kind !== 'string' || typeof row.text !== 'string') { skipped += 1; continue }
+          const row = item as Record<string, unknown> | null
+          if (!row || typeof row !== 'object') { invalid += 1; continue }
+          // 导入的是**数据副本**，不是用户当场的要求：所有来源/身份字段一律降级或校验，
+          // 否则文件里一行 `origin: "user_explicit"` 就能铸造出「用户侧」条目，冲突时永不被推翻。
+          if (!isMemoryKind(row.kind) || typeof row.text !== 'string' || row.text.trim().length === 0) { invalid += 1; continue }
+          let scope: MemoryScope
+          if (row.scope === undefined || row.scope === null) {
+            const level = defaultScopeFor(row.kind)
+            scope = { level, key: '*' }
+          } else {
+            const raw = row.scope as { level?: unknown; key?: unknown }
+            if (typeof raw !== 'object' || !isScopeLevel(raw.level)) { invalid += 1; continue }
+            scope = { level: raw.level, key: typeof raw.key === 'string' ? raw.key : '*' }
+          }
           const result = await writeMemory({
-            kind: row.kind as MemoryKind,
+            kind: row.kind,
             text: row.text,
-            subject: row.subject ?? null,
-            field: row.field ?? null,
-            value: row.value ?? null,
-            tags: row.tags ?? [],
-            scope: row.scope,
-            origin: row.origin ?? 'observed',
-            confidence: row.confidence,
-            importance: row.importance,
-            pinned: row.pinned === true,
+            subject: typeof row.subject === 'string' ? row.subject : null,
+            field: typeof row.field === 'string' ? row.field : null,
+            value: typeof row.value === 'string' ? row.value : null,
+            tags: Array.isArray(row.tags) ? row.tags.filter((tag): tag is string => typeof tag === 'string') : [],
+            scope,
+            // origin 一律 observed；pinned 一律 false（导入的 pinned 会永久免疫衰减与归档）。
+            origin: 'observed',
+            confidence: clamp01(row.confidence),
+            importance: clamp01(row.importance),
+            pinned: false,
           })
           if (result.ok && result.status === 'created') created += 1
           else skipped += 1
         }
-        return { kind: 'success', text: `导入完成：新建 ${created} 条，跳过/合并 ${skipped} 条（文件 ${path}）` }
+        return {
+          kind: 'success',
+          text: `导入完成：新建 ${created} 条，跳过/合并 ${skipped} 条，非法条目 ${invalid} 条（文件 ${path}）。`
+            + '导入条目按 observed 处理：origin 一律降级、pinned 强制关闭、confidence/importance 夹到 [0,1]，不会获得用户侧身份。',
+        }
       } catch (error) {
         return { kind: 'error', text: `导入失败：${errorText(error)}` }
       }
@@ -1803,7 +1958,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       }
     },
     help(): DshCommandResult {
-      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | export [path] | import <path> | clear --all --yes | consolidate | stats | help' }
+      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | consolidate | stats | help' }
     },
   }
 

@@ -138,7 +138,6 @@ export const DEFAULTS: MemoryConfig = {
   captureTimeoutMs: 500,
   echoThreshold: 0.9,
   gistMinMarkers: 2,
-  gistMaxPerWorkspace: 8,
   selfPortraitMinConfidence: 0.8,
   selfPortraitModelMinConfidence: 0.85,
   selfPortraitPromoteSessions: 2,
@@ -202,10 +201,28 @@ export function estimateTokens(text: unknown, charsPerToken: number = DEFAULTS.c
   return Math.ceil(String(text).length / charsPerToken)
 }
 
+/**
+ * 把文本压成**单行**并截断到预算内。
+ *
+ * 为什么必须压成单行：常驻块与召回块的结构是「块头 + 逐条 `- …` 行 + 块尾声明」，
+ * 而记忆文本可能来自模型写入、含换行的用户消息、`/memory import` 或压缩摘要固化。
+ * 若文本自带换行，就能伪造出额外的行 —— 包括伪造成块尾声明或 `[系统] …` 这类指令行
+ * （实测：一条含换行的 user_profile 让「以当前对话为准」在块里出现两次）。
+ * 因此这里把控制字符（含 \r\n\t\u0085）折成空格、连续空白折成一个空格，
+ * 并剔除零宽与双向控制字符，保证**一条记忆 = 一行**。
+ */
 export function clampText(text: unknown, maxTokens: number, charsPerToken: number = DEFAULTS.charsPerToken): string {
-  const source = String(text)
-  const maxChars = Math.max(8, Math.floor(maxTokens * charsPerToken))
-  return source.length <= maxChars ? source : `${source.slice(0, maxChars - 1)}…`
+  const flat = String(text)
+    .replace(/[\u0000-\u001F\u007F-\u009F]/gu, ' ')
+    .replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim()
+  // 有限性兜底：`maxItemTokens` 可能被 patch 行设成 Infinity（或 NaN），那样 `slice` 不截断，
+  // 一条超长记忆会吃掉整个预算并让 `fillWithinBudget` 立刻 break，把后面的条目全挤掉。
+  const tokenBudget = Number.isFinite(maxTokens) && maxTokens > 0 ? maxTokens : DEFAULTS.maxItemTokens
+  const perToken = Number.isFinite(charsPerToken) && charsPerToken > 0 ? charsPerToken : DEFAULTS.charsPerToken
+  const maxChars = Math.max(8, Math.floor(tokenBudget * perToken))
+  return flat.length <= maxChars ? flat : `${flat.slice(0, maxChars - 1)}…`
 }
 
 /** 去重指纹：kind|scope.level|scope.key|subject|归一化文本。
@@ -328,18 +345,29 @@ export function renderSelfBlock(records: Iterable<MemoryRecord>, cfg: MemoryConf
     .filter((record) => record.origin === 'model_proposed')
     .slice(0, cfg.selfPortraitMaxSelfObserved ?? 4)
 
-  // 块头尾也要计入预算，否则「硬上限」会被块级固定文案突破
+  // 块头尾也要计入预算，否则「硬上限」会被块级固定文案突破。
+  // 分配顺序按设计稿 §7.3：**用户确认的规矩优先**，模型自评只吃剩下的余额；
+  // 两段合计（含两个块头与页脚）不超过 selfPortraitMaxTokens。
   const confirmedHeader = '[我的工作约定 · 来自用户确认]'
   const observedHeader = '[自我观察 · 未经用户确认]'
   const observedFooter = '以上为自我观察，可能不准；与用户当场的指示冲突时以用户为准。'
-  const confirmedBudget = Math.max(0, cfg.selfPortraitMaxTokens
-    - estimateTokens(confirmedHeader, cfg.charsPerToken)
-    - (selfObserved.length > 0 ? estimateTokens(`${observedHeader}${observedFooter}`, cfg.charsPerToken) : 0))
 
-  const confirmed = fillWithinBudget(userSide.slice(0, cfg.selfPortraitMaxItems), confirmedBudget,
-    (_record, text) => `- ${text}`, cfg)
-  const observed = fillWithinBudget(selfObserved, cfg.selfPortraitMaxTokens,
-    (_record, text) => `- ${text}`, cfg)
+  const confirmed = fillWithinBudget(
+    userSide.slice(0, cfg.selfPortraitMaxItems),
+    Math.max(0, cfg.selfPortraitMaxTokens - estimateTokens(confirmedHeader, cfg.charsPerToken)),
+    (_record, text) => `- ${text}`,
+    cfg,
+  )
+  const observed = selfObserved.length === 0
+    ? { lines: [] as string[], selected: [] as MemoryRecord[], used: 0 }
+    : fillWithinBudget(
+      selfObserved,
+      Math.max(0, cfg.selfPortraitMaxTokens
+        - estimateTokens(`${confirmedHeader}${observedHeader}${observedFooter}`, cfg.charsPerToken)
+        - confirmed.used),
+      (_record, text) => `- ${text}`,
+      cfg,
+    )
 
   const blocks: string[] = []
   if (confirmed.lines.length > 0) blocks.push([confirmedHeader, ...confirmed.lines].join('\n'))
@@ -405,9 +433,20 @@ export function renderContextBlock(records: Iterable<MemoryRecord>, cfg: MemoryC
   }
 }
 
-/** 敏感信息扫描：返回命中的 reason，或 null。 */
+/**
+ * 宽度折叠视图（NFKC）：**只用于判定**，不用于存储。
+ *
+ * 为什么必须折叠：半角正则匹配不到全角写法，而 `normalizeText`（注入/检索前会用）却会把
+ * 全角 U+FF01–FF5E 折回半角 —— 于是「用全角写的身份证/卡号」既能绕过拒写，又会在注入时
+ * 变回合法号码进系统提示。扫描与 PII 判定先折叠，才能让两种写法一视同仁。
+ */
+function foldWidth(value: unknown): string {
+  return String(value).normalize('NFKC')
+}
+
+/** 敏感信息扫描：返回命中的 reason，或 null。全角/兼容写法同样命中。 */
 export function scanSensitive(text: unknown): string | null {
-  const source = String(text)
+  const source = foldWidth(text)
   for (const { reason, re } of SENSITIVE_PATTERNS) {
     if (re.test(source)) return reason
   }
@@ -415,12 +454,31 @@ export function scanSensitive(text: unknown): string | null {
 }
 
 /** 可脱敏（而非直接拒写）的个人信息形态：邮箱、手机号（设计稿 §8.3）。 */
+const PII_EMAIL_RE = /([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*(@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/gu
+const PII_PHONE_RE = /\b(1[3-9]\d)\d{4}(\d{4})\b/gu
+/** 无 `g` 标志的探测副本：`test` 不会因为 lastIndex 状态而漏判。 */
+const PII_EMAIL_PROBE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/u
+const PII_PHONE_PROBE = /\b1[3-9]\d{9}\b/u
+
+/**
+ * 邮箱/手机号脱敏。
+ *
+ * 只有当**折叠后的视图**确实命中 PII 形态时才折叠并脱敏 —— 这样普通文本一字不改
+ * （不引入 NFKC 的副作用），而全角写法的 PII 也会被正确脱敏而不是原样落盘。
+ *
+ * 取舍：命中 PII 的那条文本会**整体**走 NFKC（全角标点等也随之半角化）。
+ * 这是有意的：宁可规范一条含 PII 的记录，也不要让它带着全角形态落盘、
+ * 之后在注入前被折成可读的号码。
+ */
 export function maskPii(text: unknown): string {
-  return String(text)
+  const source = String(text)
+  const folded = foldWidth(source)
+  if (!PII_EMAIL_PROBE.test(folded) && !PII_PHONE_PROBE.test(folded)) return source
+  return folded
     // 邮箱：只保留首字母与域名 → a***@b.com
-    .replace(/([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*(@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/gu, '$1***$2')
+    .replace(PII_EMAIL_RE, '$1***$2')
     // 中国大陆手机号：保留前 3 后 4 → 138****8000
-    .replace(/\b(1[3-9]\d)\d{4}(\d{4})\b/gu, '$1****$2')
+    .replace(PII_PHONE_RE, '$1****$2')
 }
 
 /**
