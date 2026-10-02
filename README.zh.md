@@ -54,7 +54,7 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 
 ```sh
 # 从 tarball 安装（发布产物推荐这种方式）
-dsh plugin --profile desktop add ./dsh-plugin-memory-0.4.3.tgz
+dsh plugin --profile desktop add ./dsh-plugin-memory-0.5.0.tgz
 
 # 直接从 GitHub 安装（本包无需构建，因此不需要 prepare 授权）
 dsh plugin --profile desktop add github:orangca/dsh-plugin-memory
@@ -86,7 +86,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 ## 配置表单在哪
 
 插件导出 schemastery `Config`，其中 10 个可调字段声明为 `volatile()`；同时附带一个小的浏览器半边
-（`src/client.js`）把它们渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
+（`src/client.ts`，构建为 `lib/client.js`）把它们渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
 （列表里的行卡片上还有一行摘要）。
 
 实现上，客户端半边注册进 **keyed** 插槽 `plugins.row.config`，key 为
@@ -128,7 +128,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置
 
-在 patch 行里设置 `config`；完整默认值见 `src/lib.js` 的 `DEFAULTS`。表单里可改的 10 个字段：
+在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 10 个字段：
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -166,19 +166,41 @@ $DSH_HOME/storages/dsh_memory/
 
 ## 开发
 
-```powershell
-npm test                                        # 34 项单测（纯函数层 + 模块加载契约）
+TypeScript 编写、`tsc` 构建、pnpm 管理。
+
+```sh
+pnpm install                                    # 只装开发依赖：typescript、@types/node、schemastery 类型
+pnpm build                                      # src/*.ts → lib/*.js（并给客户端半边套上 lazy-CJS 包装）
+pnpm test                                       # 先构建，再对构建产物跑单测
+pnpm typecheck                                  # 宿主半边与客户端半边分别检查，不产出文件
 node tools/eval-recall.mjs                      # 离线召回评测（读真实会话日志）
-pwsh -File tools/deploy-dev.ps1                 # 把当前 src/ 挂成新的开发修订版
+pwsh -File tools/deploy-dev.ps1                 # 把 lib/ 挂成新的开发修订版（需先 pnpm build）
 pwsh -File tools/deploy-dev.ps1 -Set "recallMode='dry';maxInjectedTokens=200"
 node tools/extract-asar.cjs                     # 提取 DSH 客户端产物（排查界面问题）
 node tools/scan-asar.cjs settingsNumberField    # 定位某个符号在 app.asar 里的位置
 ```
 
-两条用真实调试时间换来的经验：
+目录职责：
+
+| 路径 | 作用 |
+|---|---|
+| `src/index.ts` | 宿主半边：存储、捕获、注入、整合、工具、命令 |
+| `src/lib.ts` | 纯函数层（不依赖 `ctx`）——单测的全部对象 |
+| `src/client.ts` | 浏览器半边：设置表单（编成 CommonJS 后再被包装） |
+| `src/types.ts`、`src/shims.d.ts` | 领域类型 + 本插件实际依赖的 DSH 接缝子集 |
+| `lib/` | 构建产物：**刻意提交进仓库**（见下），并通过 `files` 进发布包 |
+| `tools/build-client.mjs` | 把编译后的客户端包成 `window.__ModuleLoader__.load({ id, factory })` |
+
+为什么把构建产物也提交：`dsh plugin add github:<owner>/<repo>` 拉的是**源码而不是产物**，也**不会**跑构建脚本。
+如果 `lib/` 被 git 忽略，GitHub 安装下来的包 `main` 会指向不存在的文件。提交它可以让安装保持「零构建步骤」——
+既不需要 `prepare`，也就不需要用户为构建脚本授予 `allowBuilds`（那等于允许代码在安装时于本机执行）。
+
+三条用真实调试时间换来的经验：
 
 - **条目要能在 profile patch 里被定位**，settings 服务才会为它投影表单；只存在于 bundle 层的行可能不出现。
 - `deploy-dev.ps1` **永不重用修订号**：Node 的 ESM 缓存按解析后的真实路径命中，复用路径会拿到缓存里的旧模块。
+- **npm 上的 `@deepseek-ai/*` 包比你正在运行的 DSH 旧**——发布版 `dsh-client-ui-primitives` 甚至不导出 settings API。
+  因此按 `src/types.ts` / `src/shims.d.ts` 里**实测验证过的子集**打类型，而不是导入不匹配的发布版类型。
 
 本插件依赖的 DSH 接缝、插槽语义与环境事实，见 [`docs/dsh-mechanisms.md`](docs/dsh-mechanisms.md)
 （面向插件作者，不含任何环境特定信息）。

@@ -27,7 +27,7 @@ import {
   renderContextBlock,
   renderSelfBlock,
   workspaceKeyOf,
-} from '../src/lib.js'
+} from '../lib/lib.js'
 
 const args = process.argv.slice(2)
 const argOf = (name, fallback) => {

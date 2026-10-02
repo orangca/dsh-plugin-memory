@@ -59,7 +59,7 @@ explainable and deletable.
 
 ```sh
 # from a tarball (recommended for release artifacts)
-dsh plugin --profile desktop add ./dsh-plugin-memory-0.4.3.tgz
+dsh plugin --profile desktop add ./dsh-plugin-memory-0.5.0.tgz
 
 # straight from GitHub (works because this package needs no build step)
 dsh plugin --profile desktop add github:orangca/dsh-plugin-memory
@@ -91,7 +91,7 @@ Add this package to the profile's `dependencies`, append `dsh-plugin-memory` to
 ## The settings form
 
 The plugin exports a schemastery `Config` whose 10 tunable fields are declared `volatile()`, and ships a small
-browser half (`src/client.js`) that renders them as a form. Find it under **Plugins → `dsh-plugin-memory` →
+browser half (`src/client.ts`, built to `lib/client.js`) that renders them as a form. Find it under **Plugins → `dsh-plugin-memory` →
 row `dsh-memory`** (the list card also shows a one-line summary).
 
 Under the hood the client half registers into the keyed `plugins.row.config` slot with
@@ -133,7 +133,7 @@ whole Config through the settings service and persists it into the profile patch
 
 ## Configuration
 
-Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.js`. The ten fields exposed in
+Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The ten fields exposed in
 the settings form:
 
 | Field | Default | Meaning |
@@ -174,21 +174,45 @@ $DSH_HOME/storages/dsh_memory/
 
 ## Development
 
-```powershell
-npm test                                        # 34 unit tests (pure functions + module contract)
+Written in TypeScript, built with `tsc`, managed with pnpm.
+
+```sh
+pnpm install                                    # devDependencies: typescript, @types/node, schemastery types
+pnpm build                                      # src/*.ts -> lib/*.js (+ the client half's lazy-CJS wrapper)
+pnpm test                                       # builds, then runs the unit tests on the built output
+pnpm typecheck                                  # host half and client half, no emit
 node tools/eval-recall.mjs                      # offline recall eval over real session logs
-pwsh -File tools/deploy-dev.ps1                 # mount the current src/ as a new dev revision
+pwsh -File tools/deploy-dev.ps1                 # mount lib/ as a new dev revision (run pnpm build first)
 pwsh -File tools/deploy-dev.ps1 -Set "recallMode='dry';maxInjectedTokens=200"
 node tools/extract-asar.cjs                     # extract DSH client bundles (UI debugging)
 node tools/scan-asar.cjs settingsNumberField    # find where a symbol lives in app.asar
 ```
 
-Two development notes that cost real debugging time and are worth knowing:
+Layout:
+
+| Path | Role |
+|---|---|
+| `src/index.ts` | Host half: storage, capture, injection, consolidation, tools, commands |
+| `src/lib.ts` | Pure functions (no `ctx`) — the entire unit-test surface |
+| `src/client.ts` | Browser half: the settings form (compiled to CommonJS, then wrapped) |
+| `src/types.ts`, `src/shims.d.ts` | Domain types plus the DSH seam subset this plugin relies on |
+| `lib/` | Build output — **committed on purpose** (see below), shipped in the package (`files`) |
+| `tools/build-client.mjs` | Wraps the compiled client into `window.__ModuleLoader__.load({ id, factory })` |
+
+Why the build output is committed: `dsh plugin add github:<owner>/<repo>` fetches **source, not artifacts** and
+runs no build script. If `lib/` were gitignored, a GitHub install would end up with a `main` pointing at a file that
+does not exist. Committing it keeps the install a no-op — no build step, and no `allowBuilds` authorization for a
+`prepare` script that would otherwise execute code on the user's machine.
+
+Three development notes that cost real debugging time and are worth knowing:
 
 - DSH resolves configuration from the profile patch, and a plugin row may need to be **locatable in that file** for
   the settings service to project its form — a bundle-layer-only row may not appear.
 - `deploy-dev.ps1` never reuses a revision number, because Node's ESM cache is keyed by resolved path: reusing a
   path hands you the previously cached module.
+- The `@deepseek-ai/*` packages on npm are **older than the DSH you are running** — the published
+  `dsh-client-ui-primitives` does not even export the settings API. Type against the empirically verified subset in
+  `src/types.ts` / `src/shims.d.ts` instead of importing mismatched types.
 
 See [`docs/dsh-mechanisms.md`](docs/dsh-mechanisms.md) for the DSH seams, slot semantics and environment facts this
 plugin is built on — written for plugin authors, with no environment-specific details.

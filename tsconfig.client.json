@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023", "DOM"],
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "types": ["node"],
+    "outDir": "build/client",
+    "rootDir": "src",
+    "strict": true,
+    "noUncheckedIndexedAccess": false,
+    "verbatimModuleSyntax": false,
+    "isolatedModules": true,
+    "declaration": false,
+    "sourceMap": false,
+    "skipLibCheck": true,
+    "noEmitOnError": true
+  },
+  "include": ["src/client.ts", "src/types.ts", "src/shims.d.ts"]
+}

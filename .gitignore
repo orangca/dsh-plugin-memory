@@ -1,6 +1,14 @@
-# 依赖与产物
+# 依赖与中间产物
 node_modules/
+build/
+*.tsbuildinfo
 *.tgz
+
+# 注意：lib/ **不**忽略，而是提交进仓库。
+# 原因：`dsh plugin add github:<owner>/<repo>` 拉的是源码、**不会**跑构建脚本；
+# 若 lib/ 不入库，装下来的包 main 指向不存在的 lib/index.js，直接加载失败。
+# 提交构建产物可以换来「零构建步骤、无需 allowBuilds 授权」的安装体验。
+# （中间产物 build/client/ 仍然忽略。）
 
 # 开发期产物（含本机路径与会话信息，不入库）
 reports/

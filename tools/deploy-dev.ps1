@@ -9,11 +9,13 @@
 # 所以每次迭代 = 复制到 dev/rev<N>/ + 在 profile patch 里新增一条 memory-dev<N>，
 # 并把之前的修订版标记为 disabled。配置层的变化是即时的，无需重启 DSH。
 #
-# 用法：pwsh -File tools\deploy-dev.ps1 [-Source <path>] [-Domain <name>]
+# 用法：pwsh -File tools\deploy-dev.ps1 [-LibDir <path>] [-Domain <name>]
+#
+# 注意：源码已是 TypeScript，必须**先构建**（pnpm build），本脚本部署的是编译产物 lib/。
 
 param(
-  # 默认取本仓库的 src/（相对于脚本位置，不写死任何绝对路径）
-  [string]$SrcDir = (Join-Path (Split-Path $PSScriptRoot -Parent) 'src'),
+  # 默认取本仓库的 lib/（编译产物，相对于脚本位置，不写死任何绝对路径）
+  [string]$LibDir = (Join-Path (Split-Path $PSScriptRoot -Parent) 'lib'),
   [string]$Domain = 'dsh_memory_dev',
   [switch]$SimulateCaptureError,
   # 追加配置，形如 -Set "recallMode='dry';maxInjectedTokens=200"（分号分隔；
@@ -26,7 +28,9 @@ $profileDir = $env:DSH_PROFILE_DIR
 if (-not $profileDir) { throw 'DSH_PROFILE_DIR 不可用：请在 DSH 的 shell 中运行' }
 $patchPath = Join-Path $profileDir 'cordis.patch.yml'
 if (-not (Test-Path $patchPath)) { throw "找不到 profile patch: $patchPath" }
-if (-not (Test-Path (Join-Path $SrcDir 'index.js'))) { throw "找不到插件入口: $SrcDir\index.js" }
+if (-not (Test-Path (Join-Path $LibDir 'index.js'))) {
+  throw "找不到编译产物: $LibDir\index.js —— 请先在仓库根目录运行 pnpm build"
+}
 
 $devRoot = Join-Path $profileDir 'dev'
 New-Item -ItemType Directory -Force -Path $devRoot | Out-Null
@@ -47,7 +51,7 @@ Set-Content $counterPath $rev -Encoding utf8 -NoNewline
 
 $revDir = Join-Path $devRoot "rev$rev"
 New-Item -ItemType Directory -Force -Path $revDir | Out-Null
-Copy-Item (Join-Path $SrcDir '*') $revDir -Recurse -Force
+Copy-Item (Join-Path $LibDir '*') $revDir -Recurse -Force
 # 必须同时有非空 name 与 version：plugin-package-inventory 会读每个活动条目的清单，
 # 缺字段会让该 profile 的每个模型请求都以 REQUEST_EXTENSION 失败（UI 上看不出原因）。
 ('{ "name": "dsh-memory-dev", "version": "0.' + $rev + '.0", "private": true, "type": "module" }') |

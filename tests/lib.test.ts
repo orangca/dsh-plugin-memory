@@ -1,8 +1,11 @@
 // dsh-memory 纯函数层单测（node --test）
 // 覆盖设计稿 §11.1 的 store/retrieve/inject/redact 四类：
+// 被测代码取自**编译产物** `lib/lib.js`（由 src/lib.ts 编译而来），不是 src/lib.ts 本身。
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+
+import type { MakeRecordInput, MemoryConfig } from '../lib/lib.js'
 
 import {
   DEFAULTS,
@@ -35,9 +38,9 @@ import {
   shouldArchive,
   tokenize,
   workspaceKeyOf,
-} from '../src/lib.js'
+} from '../lib/lib.js'
 
-const cfg = { ...DEFAULTS }
+const cfg: MemoryConfig = { ...DEFAULTS }
 
 test('normalizeText：全角转半角、折叠空白、英文小写、去尾部标点', () => {
   assert.equal(normalizeText('  用户   偏好中文。 '), '用户 偏好中文')
@@ -51,7 +54,7 @@ test('fnv1a：稳定且对输入敏感', () => {
 })
 
 test('recordHash：同 kind/scope/subject 且文本归一化相同 → 同指纹（去重基础）', () => {
-  const base = { kind: 'user_profile', scope: { level: 'profile', key: '*' }, subject: 'lang', text: '偏好中文。' }
+  const base: MakeRecordInput = { kind: 'user_profile', scope: { level: 'profile', key: '*' }, subject: 'lang', text: '偏好中文。' }
   const a = makeRecord(base)
   const b = makeRecord({ ...base, text: '  偏好中文 ' })
   assert.equal(a.hash, b.hash)
@@ -67,10 +70,10 @@ test('makeRecord：按 kind 推断默认作用域', () => {
 })
 
 test('renderContextBlock：session 级记录永不常驻注入；非当前 workspace 的也不注入', () => {
-  const currentKey = workspaceKeyOf('C:/proj/a')
+  const currentKey = workspaceKeyOf('C:/proj/a')!
   const records = [
     makeRecord({ kind: 'semantic', text: '临时结论', scope: { level: 'session', key: '*' } }),
-    makeRecord({ kind: 'semantic', text: '别的项目知识', scope: { level: 'workspace', key: workspaceKeyOf('C:/proj/b') } }),
+    makeRecord({ kind: 'semantic', text: '别的项目知识', scope: { level: 'workspace', key: workspaceKeyOf('C:/proj/b')! } }),
     makeRecord({ kind: 'semantic', text: '本项目知识', scope: { level: 'workspace', key: currentKey } }),
   ]
   const block = renderContextBlock(records, cfg, currentKey)
@@ -111,7 +114,7 @@ test('renderSelfBlock：只收 agent_self，模型自评需跨会话复现才晋
   // 模型自评必须**独立成块**（设计稿 §7.3），不能混进「用户确认」块
   assert.match(block.text, /\[自我观察 · 未经用户确认\]/)
   assert.match(block.text, /我倾向于先写测试/)
-  const confirmedPart = block.text.split('[自我观察')[0]
+  const confirmedPart = block.text.split('[自我观察')[0]!
   assert.doesNotMatch(confirmedPart, /我倾向于先写测试/)
   // 只复现 1 次的不能进
   assert.doesNotMatch(block.text, /只在一个会话里出现过/)
@@ -136,18 +139,18 @@ test('renderSelfBlock：只收 agent_self，模型自评需跨会话复现才晋
 test('extractCandidates：信号表、排除规则、每回合配额', () => {
   const explicit = extractCandidates('记住：以后都用 pnpm 管理依赖。', cfg)
   assert.equal(explicit.candidates.length, 1)
-  assert.equal(explicit.candidates[0].kind, 'user_profile')
-  assert.equal(explicit.candidates[0].origin, 'user_explicit')
-  assert.match(explicit.candidates[0].text, /pnpm/)
-  assert.ok(!explicit.candidates[0].text.endsWith('。'), '入库文本应去掉句末标点')
+  assert.equal(explicit.candidates[0]!.kind, 'user_profile')
+  assert.equal(explicit.candidates[0]!.origin, 'user_explicit')
+  assert.match(explicit.candidates[0]!.text, /pnpm/)
+  assert.ok(!explicit.candidates[0]!.text.endsWith('。'), '入库文本应去掉句末标点')
 
   const selfDirective = extractCandidates('以后你要先给结论再解释。', cfg)
-  assert.equal(selfDirective.candidates[0].kind, 'agent_self')
-  assert.equal(selfDirective.candidates[0].origin, 'user_explicit')
+  assert.equal(selfDirective.candidates[0]!.kind, 'agent_self')
+  assert.equal(selfDirective.candidates[0]!.origin, 'user_explicit')
 
   const selfFix = extractCandidates('你搞错了，这里应该用 workspace 作用域。', cfg)
-  assert.equal(selfFix.candidates[0].kind, 'agent_self')
-  assert.equal(selfFix.candidates[0].origin, 'user_correction')
+  assert.equal(selfFix.candidates[0]!.kind, 'agent_self')
+  assert.equal(selfFix.candidates[0]!.origin, 'user_correction')
 
   // 排除规则
   assert.equal(extractCandidates('这个文件是干什么的？', cfg).candidates.length, 0)
@@ -224,14 +227,14 @@ test('shouldArchive：低有效重要度 + 长期未用才归档；pinned/自画
 })
 
 test('pickMergeGroups：同 subject 且文本近似才合并；摘要条目不参与', () => {
-  const base = { kind: 'semantic', subject: 'project.build', scope: { level: 'workspace', key: 'k' } }
+  const base: Omit<MakeRecordInput, 'text'> = { kind: 'semantic', subject: 'project.build', scope: { level: 'workspace', key: 'k' } }
   const a = makeRecord({ ...base, text: '构建用 pnpm build 跑。' })
   const b = makeRecord({ ...base, text: '构建用 pnpm build 执行。' })
   const c = makeRecord({ ...base, text: '完全不同的另一件事，讲的是部署流程。' })
   const summary = makeRecord({ ...base, text: '构建用 pnpm build 跑。', tags: ['summary'] })
   const groups = pickMergeGroups([a, b, c, summary], cfg)
   assert.equal(groups.length, 1)
-  assert.equal(groups[0].length, 2)
+  assert.equal(groups[0]!.length, 2)
   assert.ok(!groups.flat().some((record) => (record.tags ?? []).includes('summary')))
 })
 
@@ -242,13 +245,13 @@ test('findConflicts：同 (subject, field) 不同 value 判为冲突；模型自
   const conflicts = findConflicts([user, model])
   assert.equal(conflicts.length, 1)
   // winner 是更新的 model_proposed，但用户侧条目更强 → blocked
-  assert.equal(conflicts[0].blocked, true)
+  assert.equal(conflicts[0]!.blocked, true)
 
   const newer = makeRecord({ kind: 'user_profile', subject: 'editor.theme', field: 'theme', value: 'light', text: '改成浅色主题。', origin: 'user_correction', observedAt: 3000 })
   const conflicts2 = findConflicts([user, newer])
   assert.equal(conflicts2.length, 1)
-  assert.equal(conflicts2[0].blocked, false)
-  assert.equal(conflicts2[0].winner.id, newer.id)
+  assert.equal(conflicts2[0]!.blocked, false)
+  assert.equal(conflicts2[0]!.winner.id, newer.id)
 })
 
 test('composeSubjectSummary：单一 subject 条目过多时产出摘要', () => {
@@ -257,8 +260,8 @@ test('composeSubjectSummary：单一 subject 条目过多时产出摘要', () =>
   }))
   const summaries = composeSubjectSummary(records, { ...cfg, summarizeAbove: 5 })
   assert.equal(summaries.length, 1)
-  assert.match(summaries[0].text, /关于 project.release 的既有记录（7 条）/)
-  assert.equal(summaries[0].absorbed.length, 7)
+  assert.match(summaries[0]!.text, /关于 project.release 的既有记录（7 条）/)
+  assert.equal(summaries[0]!.absorbed.length, 7)
   assert.equal(composeSubjectSummary(records.slice(0, 3), { ...cfg, summarizeAbove: 5 }).length, 0)
 })
 
@@ -268,11 +271,12 @@ test('extractSummaryText：从 ContentBlock[] 取纯文本', () => {
   assert.equal(extractSummaryText(undefined), '')
 })
 
-test('renderContextBlock：workspace 印象只取当前 workspace，且单独成块并声明模糊', () => {  const currentKey = workspaceKeyOf('C:/proj/a')
+test('renderContextBlock：workspace 印象只取当前 workspace，且单独成块并声明模糊', () => {
+  const currentKey = workspaceKeyOf('C:/proj/a')!
   const records = [
     makeRecord({ kind: 'user_profile', text: '偏好中文。', importance: 0.9 }),
     makeRecord({ kind: 'project_gist', text: '这是 A 项目。', scope: { level: 'workspace', key: currentKey } }),
-    makeRecord({ kind: 'project_gist', text: '这是 B 项目。', scope: { level: 'workspace', key: workspaceKeyOf('C:/proj/b') } }),
+    makeRecord({ kind: 'project_gist', text: '这是 B 项目。', scope: { level: 'workspace', key: workspaceKeyOf('C:/proj/b')! } }),
   ]
   const block = renderContextBlock(records, cfg, currentKey)
   assert.match(block.text, /长期记忆/)
@@ -288,7 +292,7 @@ test('renderContextBlock：空库不产生任何注入（冷启动不注入空�
 })
 
 test('renderContextBlock：常驻层排除 episodic 与整合摘要（设计稿 §4.4：episodic 常驻上限 0）', () => {
-  const workspaceKey = workspaceKeyOf('C:/proj/a')
+  const workspaceKey = workspaceKeyOf('C:/proj/a')!
   const records = [
     makeRecord({ kind: 'user_profile', text: '常驻画像。', importance: 0.9 }),
     makeRecord({ kind: 'episodic', text: '情景记忆不该常驻。', scope: { level: 'profile', key: '*' }, importance: 0.9 }),
@@ -388,7 +392,7 @@ test('recallRecords：相关性排序、过滤、limit 与空查询回退', () =
   ]
   const hits = recallRecords(records, { query: 'pnpm 发布', limit: 5 })
   assert.ok(hits.length >= 1)
-  assert.match(hits[0].record.text, /pnpm/)
+  assert.match(hits[0]!.record.text, /pnpm/)
 
   assert.equal(recallRecords(records, { query: '', kind: 'procedural' }).length, 1)
   assert.equal(recallRecords(records, { query: '', tag: 'release' }).length, 1)
@@ -423,7 +427,7 @@ test('recallRecords：归档条目仍可被检索（设计稿 §4.4），invalid
 // ---------------- 用量追踪（lastUsedAt / useCount） ----------------
 
 test('renderContextBlock / renderSelfBlock：返回被选中的记录（记用量的唯一真源）', () => {
-  const workspaceKey = workspaceKeyOf('C:/proj/a')
+  const workspaceKey = workspaceKeyOf('C:/proj/a')!
   const records = [
     makeRecord({ kind: 'user_profile', text: '偏好中文。', importance: 0.9 }),
     makeRecord({ kind: 'agent_self', text: '先给结论。', origin: 'user_explicit', confidence: 0.9, pinned: true }),
@@ -440,7 +444,7 @@ test('renderContextBlock / renderSelfBlock：返回被选中的记录（记用�
 
   const self = renderSelfBlock(records, cfg)
   assert.equal(self.selected.length, 1)
-  assert.equal(self.selected[0].kind, 'agent_self')
+  assert.equal(self.selected[0]!.kind, 'agent_self')
 })
 
 test('effectiveImportance：lastUsedAt 更近则衰减更少（用量真的参与排序与归档判定）', () => {

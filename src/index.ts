@@ -14,15 +14,26 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join } from 'node:path'
 
-// 设置页表单需要 schemastery（DSH 用它把 Config 投影成表单）。但它对第三方包是**可选**的：
-// profile 的 pnpm 配置是 autoInstallPeers: false，能否解析取决于宿主 loader 的 peer 映射。
-// 因此用动态 import + 顶层 await：解析不到就退化为「没有表单」，绝不让插件加载失败。
-let Schema = null
-try {
-  Schema = (await import('@deepseek-ai/schemastery')).default ?? null
-} catch {
-  Schema = null
-}
+import type {
+  DshAgent,
+  DshCommandResult,
+  DshDomain,
+  DshPluginContext,
+  DshSession,
+  DshSettings,
+  DshStorageDomain,
+  DshToolDefinition,
+  DshTurnStoppingPayload,
+  MemoryConfig,
+  MemoryKind,
+  MemoryOrigin,
+  MemoryPrecision,
+  MemoryRecord,
+  MemoryScope,
+  MemorySource,
+  RecallOptions,
+  ScopeLevel,
+} from './types.js'
 import {
   DEFAULTS,
   clampText,
@@ -56,6 +67,353 @@ import {
   workspaceKeyOf,
 } from './lib.js'
 
+// 设置页表单需要 schemastery（DSH 用它把 Config 投影成表单）。但它对第三方包是**可选**的：
+// profile 的 pnpm 配置是 autoInstallPeers: false，能否解析取决于宿主 loader 的 peer 映射。
+// 因此用动态 import + 顶层 await：解析不到就退化为「没有表单」，绝不让插件加载失败。
+type SchemaFactory = (typeof import('@deepseek-ai/schemastery'))['default']
+
+let Schema: SchemaFactory | null = null
+try {
+  Schema = (await import('@deepseek-ai/schemastery')).default ?? null
+} catch {
+  Schema = null
+}
+
+// ---------------------------------------------------------------- 本地结构类型
+//
+// 下面这些接缝 types.ts 只声明了「本插件实际调用到的那一小块」，而运行版宿主比发布版多出
+// 一些成员（settings 作用域属性、ctx.provide、工具 execute 的第二实参、事件载荷的具体字段）。
+// 按实测运行契约在这里补最小结构视图，避免 any 逃逸。
+
+/** `ctx.inject(['settings'], cb)` 的回调实参：被注入的服务会作为属性挂上来。 */
+interface DshSettingsScope extends DshPluginContext {
+  settings: DshSettings
+}
+
+/** `ctx.provide(name, service)` 是运行版宿主提供的可选接缝，types.ts 未声明。 */
+interface DshPluginContextWithProvide extends DshPluginContext {
+  provide(name: string, service: unknown): unknown
+}
+
+/** 工具 execute 的会话视图：运行版多一个 `deriveMessages()`。 */
+interface DshToolSession extends DshSession {
+  deriveMessages?: () => unknown
+}
+
+/** 工具 execute 的第二实参（types.ts 的 DshToolDefinition 只声明了 args）。 */
+interface DshToolExecContext {
+  agent?: { session?: DshToolSession }
+}
+
+/** 工具定义：`execute` 多接一个可选 `exec`，运行时由宿主传入。 */
+interface MemoryToolDefinition {
+  name: string
+  description: string
+  parameters: Record<string, unknown>
+  execute: (args: Record<string, unknown>, exec?: DshToolExecContext) => Promise<unknown> | unknown
+}
+
+/** `session/event` 的载荷视图（types.ts 只声明了 type，其余按实测契约取用）。 */
+interface DshSessionEventData {
+  source?: { kind?: string } | null
+  content?: unknown
+  message?: { content?: unknown } | null
+  name?: unknown
+  arguments?: unknown
+  summary?: unknown
+  shadowedSeqs?: unknown
+}
+
+interface DshSessionEvent {
+  type?: string
+  data?: DshSessionEventData
+  seq?: unknown
+}
+
+/** `agent/pre-step` 的载荷与决策视图。 */
+interface DshPreStepPayload {
+  turn?: unknown
+  signal?: { aborted?: boolean } | null
+  agent?: { session?: DshSession }
+}
+
+interface DshPreStepDecision {
+  kind?: unknown
+  messages?: unknown[]
+  [key: string]: unknown
+}
+
+/** `memory_write` 的实参视图（JSON Schema 已约束形状，这里只做一次结构化收窄）。 */
+interface MemoryWriteArgs {
+  kind?: MemoryKind
+  text?: string
+  subject?: string | null
+  field?: string | null
+  value?: string | null
+  tags?: string[]
+  scopeLevel?: ScopeLevel
+  importance?: number
+  pinned?: boolean
+}
+
+interface MemoryRecallArgs {
+  query?: string
+  kind?: MemoryKind
+  scopeLevel?: ScopeLevel
+  tag?: string
+  limit?: number
+}
+
+interface MemoryListArgs {
+  kind?: MemoryKind
+  status?: MemoryStatus
+  limit?: number
+}
+
+interface MemoryForgetArgs {
+  id?: string
+  query?: string
+  confirm?: boolean
+}
+
+interface MemoryExplainArgs {
+  text?: string
+  apply?: boolean
+}
+
+/** `MemoryStatus` + 命令层的 `all`（`/memory list --archived` 与 memory_list 共用）。 */
+type MemoryStatus = MemoryRecord['status'] | 'all'
+
+// ---------------------------------------------------------------- 内部状态
+
+interface MemoryWrites {
+  created: number
+  merged: number
+  rejected: number
+  deleted: number
+}
+
+interface MemoryRenders {
+  context: number
+  section: number
+}
+
+interface RenderMs {
+  last: number
+  max: number
+}
+
+interface InjectedLines {
+  context: string[]
+  section: string[]
+}
+
+interface TurnStoppingState {
+  plain: number
+  last: { channel: string; at: string } | null
+}
+
+interface CaptureLast {
+  at: string
+  ms?: number
+  error?: string
+}
+
+interface CaptureState {
+  turns: number
+  written: number
+  skipped: Record<string, number>
+  last: CaptureLast | null
+  hourWindow: number[]
+  lastWriteByHash: Map<string, number>
+  gistRefreshed: number
+}
+
+interface ConsolidateSummary {
+  at: string
+  reason: string
+  merged: number
+  archived: number
+  invalidated: number
+  summarized: number
+  usageFlushed?: number
+  ms?: number
+  error?: string
+  /** 历史遗留读数：runConsolidate 第 6 步用它算冷却表 cutoff。 */
+  turn?: number
+}
+
+interface ConsolidateState {
+  runs: number
+  merged: number
+  archived: number
+  invalidated: number
+  summarized: number
+  solidified: number
+  skipped: number
+  last: ConsolidateSummary | null
+}
+
+interface RecallLast {
+  at: string
+  turn?: number
+  queryChars?: number
+  hits?: number
+  skipped?: string
+  mode?: string
+  ms?: number
+  error?: string
+  budgetSkipped?: number
+  droppedByBudget?: number
+  tokens?: number
+  preview?: string
+  detail?: Array<{ id: string; match: number; score: number }>
+}
+
+interface RecallState {
+  injected: number
+  turns: number
+  last: RecallLast | null
+}
+
+/**
+ * 领域 global 句柄：types.ts 只声明了 `get()` / `put()`，而运行版（以及原实现）的写入口叫 `set()`。
+ * 保留原调用名，这里按实测契约补上（见交付报告）。
+ */
+type DshDomainGlobal = DshDomain['global'] & { set(value: unknown): Promise<void> | void }
+
+/** 领域 global 水位（`domain.global.get()/set()`）。 */
+interface MemoryMeta {
+  schemaVersion?: number
+  collectionVersion?: number
+  lastConsolidatedAt?: number
+}
+
+interface BudgetCheck {
+  chars: number
+  estimated: number
+  meterTokens: number | null
+  meterError: string | null
+  at: string
+}
+
+interface TurnBuffer {
+  user: string[]
+  assistant: string[]
+  tools: string[]
+  lastAt: number
+  closedAt: number
+}
+
+/** apply 期间的内部状态：字段名与运行时结构一一对应（openErrorDetail 只在使用时才出现）。 */
+interface PluginState {
+  opened: boolean
+  openError: string | null
+  openErrorDetail?: Record<string, unknown> | null
+  records: Map<string, MemoryRecord>
+  collectionVersion: number
+  seeded: number
+  writes: MemoryWrites
+  renders: MemoryRenders
+  renderMs: RenderMs
+  injected: InjectedLines
+  turnStopping: TurnStoppingState
+  toolCalls: Record<string, number>
+  // M2 自动捕获
+  capture: CaptureState
+  consolidate: ConsolidateState
+  consolidating: boolean
+  rejectedHashes: Set<string>
+  recall: RecallState
+  recallTurnById: Map<string, number>
+  // 用量：注入/召回只在内存累加（每次写盘会产生大量 IO），由整合或卸载时统一落盘。
+  usageDirty: Set<string>
+  injectedIds: InjectedLines
+  settingsPage: string
+  settingsDetail: Record<string, unknown> | null
+  meta: MemoryMeta | null
+  lastSession: { id: string; cwd: string | null }
+  budget: BudgetCheck | null
+  turnBuffer: TurnBuffer
+  recentEvents: Array<string | undefined>
+}
+
+/** 自报告文档（写盘给开发期诊断用）。 */
+interface SelfReport {
+  plugin: string
+  stage: string
+  revision: number | null
+  startedAt: string
+  domain: string
+  volatileKeys: string[]
+  state?: Record<string, unknown>
+}
+
+/** `writeMemory` 的入参：工具、捕获、导入三条路径共用。 */
+interface WriteMemoryInput {
+  kind?: MemoryKind
+  text?: unknown
+  precision?: MemoryPrecision
+  origin?: MemoryOrigin
+  scope?: MemoryScope
+  subject?: string | null
+  field?: string | null
+  value?: string | null
+  tags?: string[]
+  source?: MemorySource | null
+  confidence?: number
+  importance?: number
+  pinned?: boolean
+  sessionId?: string
+}
+
+/** `writeMemory` 的返回：工具与命令共用（成功带 status，失败带 error）。 */
+interface WriteMemoryResult {
+  ok: boolean
+  status?: 'created' | 'merged'
+  id?: string
+  record?: MemoryRecord
+  boosted?: boolean
+  error?: string
+}
+
+/** `/memory` 子命令处理器。 */
+type CommandHandler = (args: string[]) => DshCommandResult | Promise<DshCommandResult>
+
+interface MemoryCommandHandlers extends Record<string, CommandHandler> {
+  list(args: string[]): DshCommandResult
+  show(args: string[]): DshCommandResult
+  forget(args: string[]): Promise<DshCommandResult>
+  restore(args: string[]): Promise<DshCommandResult>
+  pin(args: string[]): Promise<DshCommandResult>
+  archive(args: string[]): Promise<DshCommandResult>
+  export(args: string[]): DshCommandResult
+  search(args: string[]): DshCommandResult
+  refresh(args: string[]): Promise<DshCommandResult>
+  confirm(args: string[]): Promise<DshCommandResult>
+  reject(args: string[]): Promise<DshCommandResult>
+  clear(args: string[]): Promise<DshCommandResult>
+  import(args: string[]): Promise<DshCommandResult>
+  stats(): DshCommandResult
+  consolidate(): Promise<DshCommandResult>
+  help(): DshCommandResult
+}
+
+/** types.ts 的 MemoryConfig 尚未收录这两个只走 patch 行的字段（见交付报告）。 */
+interface MemoryConfigExtras {
+  exportDir?: string
+  simulateCaptureError?: boolean
+}
+
+/**
+ * 统一的错误文本：`String(error?.message ?? error)` 的类型安全版本。
+ * 与运行期表达式逐字等价（普通对象上的 `message` 也会被取到）。
+ */
+function errorText(error: unknown): string {
+  const message = (error as { message?: unknown } | null | undefined)?.message
+  return String(message ?? error)
+}
+
 export const name = 'dsh-memory'
 
 // compaction 在本 profile 不可达（spike 实测），故不 inject；M3 走 session/event 的 compaction/summary。
@@ -66,27 +424,32 @@ export const inject = ['agents', 'systemPrompt', 'storageDomain', 'tools', 'comm
  * 其余字段只能通过 patch 行设置。整块构造做了防御：schemastery 不可用或缺 `volatile`
  * 时降级为「不带 volatile」甚至「不导出 schema」，绝不让插件因为 UI 面而加载失败。
  */
-function buildConfig(useVolatile) {
-  const field = (schema) => (useVolatile && typeof schema.volatile === 'function' ? schema.volatile() : schema)
-  return Schema.object({
-    domainName: field(Schema.string().default('dsh_memory')),
-    maxInjectedTokens: field(Schema.number().default(300)),
-    maxItemTokens: field(Schema.number().default(60)),
-    selfPortraitMaxTokens: field(Schema.number().default(120)),
-    recallMode: field(Schema.union(['off', 'dry', 'inject']).default('inject')),
-    recallTopK: field(Schema.number().default(8)),
-    captureMode: field(Schema.union(['off', 'rule']).default('rule')),
-    captureMaxPerTurn: field(Schema.number().default(3)),
-    consolidateEnabled: field(Schema.boolean().default(true)),
-    consolidateIntervalMinutes: field(Schema.number().default(30)),
+function buildConfig(useVolatile: boolean): ReturnType<SchemaFactory['object']> {
+  // 类型层面按「原样返回同一 schema」标注；运行期在 volatile 可用时换成 volatile 句柄。
+  const field = <N>(schema: N): N => {
+    if (!useVolatile) return schema
+    const volatile = (schema as { volatile?: () => unknown }).volatile
+    return typeof volatile === 'function' ? (volatile.call(schema) as N) : schema
+  }
+  return Schema!.object({
+    domainName: field(Schema!.string().default('dsh_memory')),
+    maxInjectedTokens: field(Schema!.number().default(300)),
+    maxItemTokens: field(Schema!.number().default(60)),
+    selfPortraitMaxTokens: field(Schema!.number().default(120)),
+    recallMode: field(Schema!.union(['off', 'dry', 'inject']).default('inject')),
+    recallTopK: field(Schema!.number().default(8)),
+    captureMode: field(Schema!.union(['off', 'rule']).default('rule')),
+    captureMaxPerTurn: field(Schema!.number().default(3)),
+    consolidateEnabled: field(Schema!.boolean().default(true)),
+    consolidateIntervalMinutes: field(Schema!.number().default(30)),
     // 非 volatile：仅供 patch 行/诊断使用，不进表单
-    reportPath: Schema.string(),
+    reportPath: Schema!.string(),
     // 出厂**不播种**（与 lib.js 的 DEFAULTS.seed 保持一致）：播种的演示记忆会进真实用户上下文
-    seed: Schema.boolean().default(false),
+    seed: Schema!.boolean().default(false),
   })
 }
 
-let Config
+let Config: ReturnType<typeof buildConfig> | undefined
 try {
   Config = Schema ? buildConfig(true) : undefined
 } catch {
@@ -99,11 +462,11 @@ try {
 export { Config }
 
 const passthroughSchema = {
-  parse: (value) => value,
-  safeParse: (value) => ({ success: true, data: value }),
+  parse: (value: unknown): unknown => value,
+  safeParse: (value: unknown): { success: true; data: unknown } => ({ success: true, data: value }),
 }
 
-const ORIGIN_RANK = { observed: 0, model_proposed: 1, user_correction: 2, user_explicit: 3 }
+const ORIGIN_RANK: Record<MemoryOrigin, number> = { observed: 0, model_proposed: 1, user_correction: 2, user_explicit: 3 }
 
 /**
  * 归一化宿主下发的配置。
@@ -112,24 +475,24 @@ const ORIGIN_RANK = { observed: 0, model_proposed: 1, user_correction: 2, user_e
  * **访问器对象**（`Volatile<T>`，用 `.get()` 读）下发，而不是普通标量；非 volatile 字段仍是普通值。
  * 直接把 volatile 字段当标量用会把对象塞进领域名，得到 `malformed-medium: invalid unit name '[object Object]'`。
  */
-function unwrapConfig(config) {
+function unwrapConfig(config: unknown): Record<string, unknown> {
   if (config === null || typeof config !== 'object') return {}
-  const out = {}
-  for (const [key, value] of Object.entries(config)) {
-    const isVolatile = value !== null && typeof value === 'object' && typeof value.get === 'function'
-    out[key] = isVolatile ? value.get() : value
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(config as Record<string, unknown>)) {
+    const isVolatile = value !== null && typeof value === 'object' && typeof (value as { get?: unknown }).get === 'function'
+    out[key] = isVolatile ? (value as { get: () => unknown }).get() : value
   }
   return out
 }
 
-export function apply(ctx, config = {}) {
-  const cfg = { ...DEFAULTS, ...unwrapConfig(config) }
+export function apply(ctx: DshPluginContext, config: unknown = {}): void {
+  const cfg: MemoryConfig & MemoryConfigExtras = { ...DEFAULTS, ...unwrapConfig(config) }
   const volatileKeys = config && typeof config === 'object'
-    ? Object.entries(config).filter(([, value]) => value !== null && typeof value === 'object' && typeof value.get === 'function').map(([key]) => key)
+    ? Object.entries(config as Record<string, unknown>).filter(([, value]) => value !== null && typeof value === 'object' && typeof (value as { get?: unknown }).get === 'function').map(([key]) => key)
     : []
   const startedAt = new Date().toISOString()
 
-  const state = {
+  const state: PluginState = {
     opened: false,
     openError: null,
     records: new Map(),
@@ -160,7 +523,7 @@ export function apply(ctx, config = {}) {
     recentEvents: [],
   }
 
-  let domain = null
+  let domain: DshDomain | null = null
   let disposed = false
 
   // 领域句柄的归属权在调用方（storage.zh.md：Domain.close() 由 consumer 负责）。
@@ -182,17 +545,17 @@ export function apply(ctx, config = {}) {
    * 描述符可能在配置变化之后才建立，apply 时查会得到时序假阴性。
    * 同时把「被投影的命名空间有哪些」打出来——这是没有 GUI 时定位「表单为什么没出现」的关键证据。
    */
-  const settingsLine = () => {
+  const settingsLine = (): string => {
     const base = state.settingsPage
     try {
-      const forms = ctx.get('settings')
+      const forms = ctx.get<DshSettings>('settings')
       if (!forms?.describe) return `${base}（settings 服务不可用）`
       const list = forms.describe() ?? []
       const names = list.map((form) => form?.ns).filter(Boolean)
       const ours = names.includes('dsh-memory')
       return `${base}｜describe ${names.length} 个，ours=${ours}｜${names.slice(0, 24).join(', ')}`
     } catch (error) {
-      return `${base}｜describe 失败：${String(error?.message ?? error)}`
+      return `${base}｜describe 失败：${errorText(error)}`
     }
   }
 
@@ -205,9 +568,9 @@ export function apply(ctx, config = {}) {
   //      也不会像顶层 `inject` 那样让 fiber 永久 PENDING；服务变化时会自动重跑；
   //   2) 整段 try/catch（configure 在「本实例已有页面策略」时会抛错）；
   //   3) 结果写进 state，由 `memory_stats` 暴露 —— 这样没有 GUI 也能验证是否注册成功。
-  ctx.inject(['settings'], (scope) => {
+  ctx.inject(['settings'], (scope: DshPluginContext): void => {
     try {
-      const forms = scope.settings
+      const forms = (scope as DshSettingsScope).settings
       const dispose = forms.configure({ auto: true })
       scope.effect(() => () => {
         try { dispose?.() } catch { /* 卸载时忽略 */ }
@@ -217,32 +580,33 @@ export function apply(ctx, config = {}) {
       try {
         const list = forms.describe?.()
         if (Array.isArray(list)) {
+          const first = list[0]
           const names = list.map((form) => form?.ns ?? form?.id ?? form?.namespace ?? form?.entry ?? null)
           state.settingsDetail = {
             count: list.length,
-            keys: list[0] ? Object.keys(list[0]) : [],
+            keys: first ? Object.keys(first) : [],
             ours: names.includes('dsh-memory'),
           }
         }
       } catch (error) {
-        state.settingsDetail = { error: String(error?.message ?? error) }
+        state.settingsDetail = { error: errorText(error) }
       }
     } catch (error) {
-      state.settingsPage = `failed: ${String(error?.message ?? error)}`
+      state.settingsPage = `failed: ${errorText(error)}`
     }
   })
 
   // ---------------- 自报告（开发期可观测性） ----------------
-  const report = { plugin: name, stage: 'M1', revision: cfg.revision ?? null, startedAt, domain: cfg.domainName, volatileKeys }
+  const report: SelfReport = { plugin: name, stage: 'M1', revision: cfg.revision ?? null, startedAt, domain: cfg.domainName, volatileKeys }
   let lastFlushAt = 0
   /** 渲染路径每个 step 都会走，同步 writeFileSync 太贵 —— 这里按 2s 节流。 */
-  const flushThrottled = (minMs = 2000) => {
+  const flushThrottled = (minMs: number = 2000): void => {
     const now = Date.now()
     if (now - lastFlushAt < minMs) return
     lastFlushAt = now
     flush()
   }
-  const flush = () => {
+  const flush = (): void => {
     if (!cfg.reportPath) return
     try {
       report.state = {
@@ -286,39 +650,39 @@ export function apply(ctx, config = {}) {
   }
 
   // ---------------- 存储 ----------------
-  const persist = async (record) => {
+  const persist = async (record: MemoryRecord): Promise<boolean> => {
     if (!state.opened) return false
     state.records.set(record.id, record)
     state.collectionVersion += 1
     try {
-      await domain.table('memories').put(record.id, record)
+      await domain!.table<MemoryRecord>('memories').put(record.id, record)
       return true
     } catch (error) {
-      state.openError = `put failed: ${String(error?.message ?? error)}`
+      state.openError = `put failed: ${errorText(error)}`
       return false
     }
   }
 
-  const remove = async (id) => {
+  const remove = async (id: string): Promise<boolean> => {
     if (!state.opened) return false
     const existed = state.records.delete(id)
     if (!existed) return false
     state.collectionVersion += 1
     try {
-      await domain.table('memories').delete(id)
+      await domain!.table<MemoryRecord>('memories').delete(id)
     } catch (error) {
-      state.openError = `delete failed: ${String(error?.message ?? error)}`
+      state.openError = `delete failed: ${errorText(error)}`
     }
     return true
   }
 
-  const findByHash = (hash) => [...state.records.values()].find((record) => record.status === 'active' && record.hash === hash)
+  const findByHash = (hash: string): MemoryRecord | undefined => [...state.records.values()].find((record) => record.status === 'active' && record.hash === hash)
 
   /**
    * 记用量（设计稿 §4.1 / §4.4 / §6.2）：`lastUsedAt` 参与时间衰减，`useCount` 参与排序加成。
    * 只改内存 + 标脏，落盘交给整合或卸载，避免每步写盘。
    */
-  const markUsed = (records) => {
+  const markUsed = (records: Iterable<MemoryRecord | undefined | null>): number => {
     const now = Date.now()
     let changed = 0
     for (const record of records) {
@@ -332,7 +696,7 @@ export function apply(ctx, config = {}) {
   }
 
   /** 把标脏的用量落盘（整合与卸载时调用）。 */
-  const flushUsage = async () => {
+  const flushUsage = async (): Promise<number> => {
     let flushed = 0
     for (const id of [...state.usageDirty]) {
       const record = state.records.get(id)
@@ -345,7 +709,7 @@ export function apply(ctx, config = {}) {
   }
 
   /** 写入：敏感过滤 → PII 脱敏 → 回声剔除 → hash 去重合并 → 落盘。返回结果对象（供工具与命令共用）。 */
-  const writeMemory = async (input) => {
+  const writeMemory = async (input: WriteMemoryInput): Promise<WriteMemoryResult> => {
     let text = String(input.text ?? '')
     const sensitive = scanSensitive(text)
     if (sensitive) {
@@ -362,7 +726,7 @@ export function apply(ctx, config = {}) {
       flush()
       return { ok: false, error: 'rejected_echo: 与刚注入的记忆高度相似（疑似复述），不作为新观察' }
     }
-    const record = makeRecord({ ...input, text, origin })
+    const record = makeRecord({ ...input, kind: input.kind as MemoryKind, text, origin })
     if (!record.text) return { ok: false, error: 'rejected_invalid: text 不能为空' }
     // 用户明确拒绝过的自我观察不再重复产生（/memory reject 会登记指纹）
     if (origin === 'model_proposed' && state.rejectedHashes.has(record.hash)) {
@@ -381,7 +745,7 @@ export function apply(ctx, config = {}) {
       const incomingSession = input.sessionId ? String(input.sessionId) : null
       const isNewSession = incomingSession !== null && !(existing.reinforcement?.sessions ?? []).includes(incomingSession)
       const base = Math.max(existing.importance, record.importance)
-      const merged = {
+      const merged: MemoryRecord = {
         ...existing,
         confidence: Math.max(existing.confidence, record.confidence),
         importance: isNewSession ? Math.min(1, base + (cfg.repeatMentionBoost ?? 0.1)) : base,
@@ -403,8 +767,8 @@ export function apply(ctx, config = {}) {
   }
 
   // ---------------- 领域打开 + 播种 ----------------
-  const openDomain = async () => {
-    const storageDomain = ctx.get('storageDomain')
+  const openDomain = async (): Promise<void> => {
+    const storageDomain = ctx.get<DshStorageDomain>('storageDomain')
     if (!storageDomain) {
       state.openError = 'storageDomain service absent'
       flush()
@@ -428,9 +792,9 @@ export function apply(ctx, config = {}) {
       }
       state.opened = true
       try {
-        state.meta = domain.global.get() ?? null
+        state.meta = (domain.global.get() ?? null) as MemoryMeta | null
       } catch { /* 水位读取失败不影响加载 */ }
-      for (const entry of domain.table('memories').entries()) {
+      for (const entry of domain.table<MemoryRecord>('memories').entries()) {
         const value = Array.isArray(entry) ? entry[1] : entry
         if (value && typeof value === 'object' && typeof value.id === 'string') state.records.set(value.id, value)
       }
@@ -457,7 +821,8 @@ export function apply(ctx, config = {}) {
         }
       }
     } catch (error) {
-      state.openError = `${error?.code ? `${error.code}: ` : ''}${String(error?.message ?? error)}`
+      const code = (error as { code?: unknown } | null | undefined)?.code
+      state.openError = `${code ? `${String(code)}: ` : ''}${errorText(error)}`
       // 诊断：`malformed-medium: invalid unit name '[object Object]'` 说明有对象被当成 unit 名，
       // 把实际入参记录下来，避免再靠猜。
       state.openErrorDetail = {
@@ -470,9 +835,14 @@ export function apply(ctx, config = {}) {
           try { return JSON.stringify(config)?.slice(0, 400) ?? String(config) } catch { return 'unserializable' }
         })(),
         domainNameShape: (() => {
-          try { return `${typeof config?.domainName}:${JSON.stringify(config?.domainName)?.slice(0, 200)}` } catch { return typeof config?.domainName }
+          try {
+            const raw = (config as { domainName?: unknown } | null | undefined)?.domainName
+            return `${typeof raw}:${JSON.stringify(raw)?.slice(0, 200)}`
+          } catch { return typeof (config as { domainName?: unknown } | null | undefined)?.domainName }
         })(),
-        detail: error?.detail === undefined ? null : String(JSON.stringify(error.detail)).slice(0, 300),
+        detail: (error as { detail?: unknown } | null | undefined)?.detail === undefined
+          ? null
+          : String(JSON.stringify((error as { detail?: unknown }).detail)).slice(0, 300),
       }
     }
     flush()
@@ -480,17 +850,17 @@ export function apply(ctx, config = {}) {
   // 注意：openDomain 的调用放在文件末尾（consolidate 定义之后），避免 TDZ。
 
   /** 预算核对（设计稿 §7.2 步骤 4）：用自己的估算渲染，再用 tokenMeter 复核；核对结果只观测不阻断。 */
-  const crossCheckTokens = (text) => {
+  const crossCheckTokens = (text: string): string => {
     const estimated = estimateTokens(text, cfg.charsPerToken)
-    let meterTokens = null
-    let meterError = null
+    let meterTokens: number | null = null
+    let meterError: string | null = null
     try {
-      const meter = ctx.get('tokenMeter')
+      const meter = ctx.get<{ estimateMessage?: (message: unknown) => number }>('tokenMeter')
       if (meter && typeof meter.estimateMessage === 'function') {
         meterTokens = meter.estimateMessage({ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] })
       }
     } catch (error) {
-      meterError = String(error?.message ?? error)
+      meterError = errorText(error)
     }
     state.budget = { chars: text.length, estimated, meterTokens, meterError, at: new Date().toISOString() }
     return text
@@ -518,7 +888,7 @@ export function apply(ctx, config = {}) {
       },
     })
   } catch (error) {
-    state.openError = `section register failed: ${String(error?.message ?? error)}`
+    state.openError = `section register failed: ${errorText(error)}`
   }
 
   try {
@@ -543,19 +913,20 @@ export function apply(ctx, config = {}) {
       },
     })
   } catch (error) {
-    state.openError = `context register failed: ${String(error?.message ?? error)}`
+    state.openError = `context register failed: ${errorText(error)}`
   }
 
   // ---------------- M2：回合缓冲 + 回合边界规则捕获 ----------------
   // M1 实测：agent/turn-stopping 在根作用域**两种注册都收到**（plain 与 {global:true} 各 1 次），
   // 所以这里只注册一次，避免重复捕获。
-  const textOfContent = (content) => {
-    if (Array.isArray(content)) return content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n')
+  const textOfContent = (content: unknown): string => {
+    if (Array.isArray(content)) return (content as unknown[]).filter((block) => (block as { type?: unknown } | null | undefined)?.type === 'text').map((block) => (block as { text?: unknown } | null | undefined)?.text).join('\n')
     return String(content ?? '')
   }
 
   try {
-    ctx.on('session/event', (_session, event) => {
+    ctx.on('session/event', (_session, rawEvent) => {
+      const event = rawEvent as DshSessionEvent
       try {
         const type = event?.type
         state.lastSession = { id: String(_session?.id ?? ''), cwd: _session?.header?.cwd ?? null }
@@ -587,13 +958,13 @@ export function apply(ctx, config = {}) {
           return
         }
         if (type === 'tool/call') {
-          state.turnBuffer.tools.push(`${event.data?.name ?? ''} ${String(event.data?.arguments ?? '').slice(0, 400)}`)
+          state.turnBuffer.tools.push(`${String(event.data?.name ?? '')} ${String(event.data?.arguments ?? '').slice(0, 400)}`)
         }
       } catch { /* 观测失败绝不影响主流程 */ }
     })
   } catch { /* ignore */ }
 
-  const isRootAgent = (agent) => {
+  const isRootAgent = (agent: DshAgent | undefined): boolean => {
     try {
       return ctx.agents.roots().some((root) => root === agent)
     } catch {
@@ -601,16 +972,16 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  const mergeSkips = (target, extra) => {
+  const mergeSkips = (target: Record<string, number>, extra?: Record<string, number>): Record<string, number> => {
     for (const [key, value] of Object.entries(extra ?? {})) target[key] = (target[key] ?? 0) + value
     return target
   }
 
   /** 一次回合收尾的捕获：规则抽取 → 节流 → 落盘 → 项目印象刷新。任何异常都不得外抛。 */
-  const runCapture = async (agent) => {
+  const runCapture = async (agent: DshAgent | undefined): Promise<void> => {
     const began = Date.now()
     state.capture.turns += 1
-    const done = (payload) => {
+    const done = (payload: Record<string, unknown>): void => {
       state.capture.last = { at: new Date().toISOString(), ms: Date.now() - began, ...payload }
     }
     // 故障注入（设计稿 §11.2 用例 7）：验证捕获链路异常不会影响对话主流程。
@@ -640,9 +1011,9 @@ export function apply(ctx, config = {}) {
       // 主题键：让「同一件事的两种说法」能对齐，否则合并/冲突判定永远不会生效。
       // 纠正类信号直接继承被纠正条目的 subject/field/value —— 这样整合阶段
       // 「用户侧来源无条件推翻」这条链才真正闭环。
-      let subject = deriveSubject(candidate.text, candidate.signal)
-      let field = null
-      let value = null
+      let subject: string | null = deriveSubject(candidate.text, candidate.signal)
+      let field: string | null = null
+      let value: string | null = null
       if (candidate.origin === 'user_correction') {
         const best = recallRecords(state.records.values(), {
           query: candidate.text, mode: 'memory', minHits: 1, minMatch: 0.3, limit: 1,
@@ -665,20 +1036,20 @@ export function apply(ctx, config = {}) {
         value,
         sessionId,
         scope: { level, key: level === 'workspace' ? workspaceKey : '*' },
-        source: sessionId ? { sessionId, seqStart: Number(agent.session.seq ?? 0), seqEnd: Number(agent.session.seq ?? 0) } : null,
+        source: sessionId ? { sessionId, seqStart: Number(agent?.session?.seq ?? 0), seqEnd: Number(agent?.session?.seq ?? 0) } : null,
       })
       if (result.ok) {
         written += 1
         state.capture.hourWindow.push(now)
         state.capture.lastWriteByHash.set(candidate.hash, now)
       } else {
-        const reason = String(result.error ?? 'write-failed').split(':')[0]
+        const reason = String(result.error ?? 'write-failed').split(':')[0] as string
         skipped[reason] = (skipped[reason] ?? 0) + 1
       }
     }
 
     // 项目模糊印象：零模型调用，同身份只刷新不新增（设计稿 §4.3 / §5.5）。
-    let gist = null
+    let gist: string | null = null
     const markers = detectWorkspaceMarkers([userText, ...state.turnBuffer.tools].join('\n'))
     if (markers.length >= cfg.gistMinMarkers) {
       const existing = [...state.records.values()].find((record) =>
@@ -705,7 +1076,7 @@ export function apply(ctx, config = {}) {
           tags: ['gist'],
           sessionId,
           // 设计稿 I3：自动写入的记忆必须带来源，项目印象也不例外
-          source: sessionId ? { sessionId, seqStart: Number(agent.session.seq ?? 0), seqEnd: Number(agent.session.seq ?? 0) } : null,
+          source: sessionId ? { sessionId, seqStart: Number(agent?.session?.seq ?? 0), seqEnd: Number(agent?.session?.seq ?? 0) } : null,
           scope: { level: 'workspace', key: workspaceKey },
         })
         gist = created.ok ? 'created' : 'failed'
@@ -727,7 +1098,7 @@ export function apply(ctx, config = {}) {
   }
 
   try {
-    ctx.on('agent/turn-stopping', async (payload) => {
+    ctx.on('agent/turn-stopping', async (payload: DshTurnStoppingPayload): Promise<void> => {
       state.turnStopping.plain += 1
       state.turnStopping.last = { channel: 'plain', at: new Date().toISOString() }
       // R1 的用量按**回合**记一次：常驻块每个 step 都会渲染，按 step 记会虚高。
@@ -742,7 +1113,7 @@ export function apply(ctx, config = {}) {
           new Promise((resolve) => { setTimeout(resolve, cfg.captureTimeoutMs) }),
         ])
       } catch (error) {
-        state.capture.last = { at: new Date().toISOString(), error: String(error?.message ?? error) }
+        state.capture.last = { at: new Date().toISOString(), error: errorText(error) }
       }
       flush()
     })
@@ -752,14 +1123,15 @@ export function apply(ctx, config = {}) {
   // 与 R1（常驻块）互补：R1 放长期稳定的画像/印象，R2 只放「本轮这句话真的相关」的条目。
   // 注意：长查询必须用 memoryMatch（记忆侧覆盖率），用查询覆盖率会让任何长消息都趋近 0。
   try {
-    ctx.on('agent/pre-step', async (payload, next) => {
-      const decision = await next()
+    ctx.on('agent/pre-step', async (rawPayload, next) => {
+      const payload = rawPayload as DshPreStepPayload
+      const decision = (await next()) as DshPreStepDecision | null | undefined
       const recallBegan = Date.now()
       try {
         if (decision?.kind === 'reject' || payload?.signal?.aborted === true) return decision
         if (cfg.autoRecall === false || cfg.recallMode === 'off' || !state.opened) return decision
         const proposed = Array.isArray(decision?.messages) ? decision.messages : []
-        const query = proposed.map((message) => textOfContent(message?.content)).join('\n')
+        const query = proposed.map((message) => textOfContent((message as { content?: unknown } | null | undefined)?.content)).join('\n')
         if (query.trim().length < (cfg.recallMinQueryChars ?? 12)) return decision
 
         const turn = Number(payload?.turn ?? 0)
@@ -843,7 +1215,7 @@ export function apply(ctx, config = {}) {
           }],
         }
       } catch (error) {
-        state.recall.last = { at: new Date().toISOString(), error: String(error?.message ?? error) }
+        state.recall.last = { at: new Date().toISOString(), error: errorText(error) }
         flush()
         return decision
       }
@@ -851,7 +1223,7 @@ export function apply(ctx, config = {}) {
   } catch { /* ignore */ }
 
   // ---------------- M3：整合治理（合并 / 冲突 / 衰减归档 / 摘要） ----------------
-  const consolidate = async (reason) => {
+  const consolidate = async (reason: string): Promise<void> => {
     const began = Date.now()
     if (!state.opened) return
     // 重入锁：定时器与 /memory consolidate（或 memory_maintain）可能重叠，
@@ -868,15 +1240,15 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  const runConsolidate = async (reason, began) => {
+  const runConsolidate = async (reason: string, began: number): Promise<void> => {
     const now = Date.now()
-    const summary = { at: new Date().toISOString(), reason, merged: 0, archived: 0, invalidated: 0, summarized: 0 }
+    const summary: ConsolidateSummary = { at: new Date().toISOString(), reason, merged: 0, archived: 0, invalidated: 0, summarized: 0 }
     const budget = cfg.consolidateMaxRecords ?? 200
     try {
       // 1) 合并同 subject 的近似条目：保留最优者，其余归档（不删除）
       for (const group of pickMergeGroups(state.records.values(), cfg)) {
         if (summary.merged >= budget) break
-        const [lead, ...rest] = [...group].sort(compareRecords)
+        const [lead, ...rest] = [...group].sort(compareRecords) as [MemoryRecord, ...MemoryRecord[]]
         for (const extra of rest) {
           lead.useCount = (lead.useCount ?? 0) + (extra.useCount ?? 0)
           lead.importance = Math.max(lead.importance, extra.importance)
@@ -941,10 +1313,10 @@ export function apply(ctx, config = {}) {
         lastConsolidatedAt: now,
       }
       try {
-        await domain.global.set(state.meta)
+        await (domain!.global as DshDomainGlobal).set(state.meta)
       } catch { /* 水位写失败不影响本轮整合结果 */ }
     } catch (error) {
-      summary.error = String(error?.message ?? error)
+      summary.error = errorText(error)
     }
     summary.ms = Date.now() - began
     state.consolidate.runs += 1
@@ -957,11 +1329,11 @@ export function apply(ctx, config = {}) {
   }
 
   /** 压缩固化：把压缩摘要里的要点落成 episodic 记忆，防「压缩即丢失」。 */
-  const solidifyCompaction = async (event) => {
+  const solidifyCompaction = async (event: DshSessionEvent | null | undefined): Promise<void> => {
     try {
       const text = extractSummaryText(event?.data?.summary)
       if (!text) return
-      const shadowed = Array.isArray(event?.data?.shadowedSeqs) ? event.data.shadowedSeqs : []
+      const shadowed: unknown[] = Array.isArray(event?.data?.shadowedSeqs) ? (event.data.shadowedSeqs as unknown[]) : []
       const seqStart = shadowed.length > 0 ? Number(shadowed[0]) : Number(event?.seq ?? 0)
       const seqEnd = shadowed.length > 0 ? Number(shadowed[shadowed.length - 1]) : Number(event?.seq ?? 0)
       const sessionId = state.lastSession?.id ?? ''
@@ -1000,11 +1372,11 @@ export function apply(ctx, config = {}) {
   // ---------------- 模型工具（原生 JSON Schema） ----------------
   const toolOutput = {
     schema: { type: 'string' },
-    render: (_args, value) => [{ type: 'text', text: String(value) }],
+    render: (_args: unknown, value: unknown): Array<{ type: string; text: string }> => [{ type: 'text', text: String(value) }],
   }
-  const json = (value) => JSON.stringify(value, null, 2).slice(0, 8000)
+  const json = (value: unknown): string => JSON.stringify(value, null, 2).slice(0, 8000)
 
-  const toolMessages = (exec) => {
+  const toolMessages = (exec: DshToolExecContext | undefined): unknown => {
     try {
       return exec?.agent?.session?.deriveMessages?.() ?? []
     } catch {
@@ -1012,7 +1384,7 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  const tools = [
+  const tools: MemoryToolDefinition[] = [
     {
       name: 'memory_write',
       description: '写入一条长期记忆（用户偏好、项目约定、结论、做法）。写入来源由插件判定，不由本参数指定。',
@@ -1032,10 +1404,11 @@ export function apply(ctx, config = {}) {
         required: ['kind', 'text'],
         additionalProperties: false,
       },
-      execute: async (args, exec) => {
+      execute: async (rawArgs, exec) => {
+        const args = rawArgs as MemoryWriteArgs
         state.toolCalls.memory_write = (state.toolCalls.memory_write ?? 0) + 1
         const origin = cfg.trustToolWrites ? 'user_explicit' : deriveOriginFromMessages(toolMessages(exec))
-        const scopeLevel = args.scopeLevel ?? defaultScopeFor(args.kind)
+        const scopeLevel = args.scopeLevel ?? defaultScopeFor(args.kind as MemoryKind)
         const scopeKey = scopeLevel === 'workspace' ? (workspaceKeyOf(exec?.agent?.session?.header?.cwd) ?? '*') : '*'
         const result = await writeMemory({
           kind: args.kind,
@@ -1068,7 +1441,8 @@ export function apply(ctx, config = {}) {
         },
         additionalProperties: false,
       },
-      execute: async (args) => {
+      execute: async (rawArgs) => {
+        const args = rawArgs as MemoryRecallArgs
         state.toolCalls.memory_recall = (state.toolCalls.memory_recall ?? 0) + 1
         // 归档条目（设计稿 §4.4）只是不常驻注入，模型主动检索时应当可见
         const hits = recallRecords(state.records.values(), { ...(args ?? {}), includeArchived: true })
@@ -1092,7 +1466,8 @@ export function apply(ctx, config = {}) {
         },
         additionalProperties: false,
       },
-      execute: async (args) => {
+      execute: async (rawArgs) => {
+        const args = rawArgs as MemoryListArgs
         state.toolCalls.memory_list = (state.toolCalls.memory_list ?? 0) + 1
         const status = args?.status ?? 'active'
         const rows = [...state.records.values()]
@@ -1118,10 +1493,11 @@ export function apply(ctx, config = {}) {
         },
         additionalProperties: false,
       },
-      execute: async (args) => {
+      execute: async (rawArgs) => {
+        const args = rawArgs as MemoryForgetArgs
         state.toolCalls.memory_forget = (state.toolCalls.memory_forget ?? 0) + 1
         if (args?.id) {
-          const target = [...state.records.values()].find((record) => record.id === args.id || record.id.startsWith(args.id))
+          const target = [...state.records.values()].find((record) => record.id === args.id || record.id.startsWith(args.id as string))
           if (!target) return json({ ok: false, error: 'not_found' })
           await remove(target.id)
           state.writes.deleted += 1
@@ -1134,7 +1510,7 @@ export function apply(ctx, config = {}) {
           if (!args.confirm) {
             return json({ ok: false, needsConfirm: true, matches: hits.map(({ record }) => ({ id: record.id, text: record.text })) })
           }
-          const deleted = []
+          const deleted: string[] = []
           for (const { record } of hits) {
             if (await remove(record.id)) deleted.push(record.id)
           }
@@ -1186,7 +1562,8 @@ export function apply(ctx, config = {}) {
         required: ['text'],
         additionalProperties: false,
       },
-      execute: async (args, exec) => {
+      execute: async (rawArgs, exec) => {
+        const args = rawArgs as MemoryExplainArgs
         state.toolCalls.memory_explain = (state.toolCalls.memory_explain ?? 0) + 1
         const { candidates, skipped } = extractCandidates(String(args?.text ?? ''), cfg)
         const report0 = { skipped, candidates: candidates.map((candidate) => ({
@@ -1195,7 +1572,7 @@ export function apply(ctx, config = {}) {
         })) }
         if (args?.apply !== true) return json(report0)
         const origin = cfg.trustToolWrites ? 'user_explicit' : deriveOriginFromMessages(toolMessages(exec))
-        const written = []
+        const written: Array<{ ok: boolean; status?: string; id?: string; error?: string }> = []
         for (const candidate of candidates) {
           const level = defaultScopeFor(candidate.kind)
           const result = await writeMemory({
@@ -1218,16 +1595,16 @@ export function apply(ctx, config = {}) {
     try {
       ctx.tools.register({ ...tool, output: toolOutput })
     } catch (error) {
-      state.openError = `tool ${tool.name} register failed: ${String(error?.message ?? error)}`
+      state.openError = `tool ${tool.name} register failed: ${errorText(error)}`
     }
   }
   flush()
 
   // ---------------- /memory 治理命令 ----------------
-  const listLine = (record) =>
+  const listLine = (record: MemoryRecord): string =>
     `${record.id.slice(0, 8)}  ${record.kind.padEnd(13)} ${record.scope.level.padEnd(9)}${record.pinned ? '★' : ' '} ${record.text}`
 
-  const exportRecords = (targetPath) => {
+  const exportRecords = (targetPath?: string): string => {
     const dir = cfg.exportDir ?? (cfg.reportPath ? dirname(cfg.reportPath) : process.cwd())
     const file = targetPath && isAbsolute(targetPath) ? targetPath : join(dir, targetPath ?? `memory-export-${Date.now()}.json`)
     mkdirSync(dirname(file), { recursive: true })
@@ -1235,13 +1612,13 @@ export function apply(ctx, config = {}) {
       schemaVersion: 1,
       exportedAt: new Date().toISOString(),
       domain: cfg.domainName,
-      items: [...state.records.values()].filter((record) => record.status !== 'deleted'),
+      items: [...state.records.values()].filter((record) => record.status !== ('deleted' as MemoryRecord['status'])),
     }, null, 2))
     return file
   }
 
-  const handlers = {
-    list(args) {
+  const handlers: MemoryCommandHandlers = {
+    list(args: string[]): DshCommandResult {
       const kind = args.find((part) => part.startsWith('--kind='))?.slice(7)
       const includeArchived = args.includes('--archived')
       const rows = [...state.records.values()]
@@ -1251,14 +1628,14 @@ export function apply(ctx, config = {}) {
       if (rows.length === 0) return { kind: 'success', text: includeArchived ? '长期记忆为空。' : '没有 active 记忆（试试 /memory list --archived）。' }
       return { kind: 'success', text: `${rows.length} 条记忆：\n${rows.map((record) => `${listLine(record)}${record.status === 'archived' ? ' [archived]' : ''}`).join('\n')}` }
     },
-    show(args) {
+    show(args: string[]): DshCommandResult {
       const id = args[0]
       if (!id) return { kind: 'error', text: '用法：/memory show <id 前缀>' }
       const record = [...state.records.values()].find((candidate) => candidate.id.startsWith(id))
       if (!record) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       return { kind: 'success', text: JSON.stringify(record, null, 2) }
     },
-    async forget(args) {
+    async forget(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
       if (!id) return { kind: 'error', text: '用法：/memory forget <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
@@ -1268,7 +1645,7 @@ export function apply(ctx, config = {}) {
       flush()
       return { kind: 'success', text: `已删除 ${target.id}\n${target.text}` }
     },
-    async restore(args) {
+    async restore(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
       if (!id) return { kind: 'error', text: '用法：/memory restore <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
@@ -1289,7 +1666,7 @@ export function apply(ctx, config = {}) {
         text: `已恢复 ${target.id}${superseders.length > 0 ? `（同时失效 ${superseders.length} 条推翻它的记录）` : ''}`,
       }
     },
-    async pin(args) {
+    async pin(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
       if (!id) return { kind: 'error', text: '用法：/memory pin <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
@@ -1298,7 +1675,7 @@ export function apply(ctx, config = {}) {
       await persist(target)
       return { kind: 'success', text: `${target.pinned ? '已固定' : '已取消固定'} ${target.id}` }
     },
-    async archive(args) {
+    async archive(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
       if (!id) return { kind: 'error', text: '用法：/memory archive <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
@@ -1307,22 +1684,22 @@ export function apply(ctx, config = {}) {
       await persist(target)
       return { kind: 'success', text: `已归档 ${target.id}（不再注入，但仍可检索）` }
     },
-    export(args) {
+    export(args: string[]): DshCommandResult {
       try {
         const file = exportRecords(args[0])
         return { kind: 'success', text: `已导出 ${listActive(state.records.values()).length} 条到 ${file}` }
       } catch (error) {
-        return { kind: 'error', text: `导出失败：${String(error?.message ?? error)}` }
+        return { kind: 'error', text: `导出失败：${errorText(error)}` }
       }
     },
-    search(args) {
+    search(args: string[]): DshCommandResult {
       const query = args.join(' ')
       if (query.length === 0) return { kind: 'error', text: '用法：/memory search <关键词>' }
       const hits = recallRecords(state.records.values(), { query, limit: 10, includeArchived: true })
       if (hits.length === 0) return { kind: 'success', text: `没有匹配「${query}」的记忆。` }
       return { kind: 'success', text: hits.map(({ record, score }) => `${record.id.slice(0, 8)}  ${score.toFixed(2)}  ${record.text}`).join('\n') }
     },
-    async refresh(args) {
+    async refresh(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
       if (!id) return { kind: 'error', text: '用法：/memory refresh <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
@@ -1332,7 +1709,7 @@ export function apply(ctx, config = {}) {
       await persist(target)
       return { kind: 'success', text: `已刷新 ${target.id}（衰减重新计时）` }
     },
-    async confirm(args) {
+    async confirm(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
       if (!id) return { kind: 'error', text: '用法：/memory confirm <id 前缀>（把模型自评升级为用户确认）' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
@@ -1342,7 +1719,7 @@ export function apply(ctx, config = {}) {
       await persist(target)
       return { kind: 'success', text: `已确认 ${target.id}（origin → user_explicit，confidence ≥ 0.9）` }
     },
-    async reject(args) {
+    async reject(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
       if (!id) return { kind: 'error', text: '用法：/memory reject <id 前缀>（拒绝一条自我观察）' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
@@ -1353,7 +1730,7 @@ export function apply(ctx, config = {}) {
       await persist(target)
       return { kind: 'success', text: `已拒绝 ${target.id}（同类自我观察不会再产生）` }
     },
-    async clear(args) {
+    async clear(args: string[]): Promise<DshCommandResult> {
       const all = args.includes('--all')
       const confirmed = args.includes('--yes')
       const kind = args.find((part) => part.startsWith('--kind='))?.slice(7)
@@ -1367,39 +1744,40 @@ export function apply(ctx, config = {}) {
       flush()
       return { kind: 'success', text: `已永久删除 ${victims.length} 条记忆（不可恢复）。` }
     },
-    async import(args) {
+    async import(args: string[]): Promise<DshCommandResult> {
       const path = args[0]
       if (!path) return { kind: 'error', text: '用法：/memory import <导出文件路径>' }
       try {
-        const doc = JSON.parse(readFileSync(path, 'utf8'))
+        const doc = JSON.parse(readFileSync(path, 'utf8')) as { items?: unknown } | null
         const items = Array.isArray(doc?.items) ? doc.items : []
         let created = 0
         let skipped = 0
         for (const item of items) {
-          if (!item || typeof item.kind !== 'string' || typeof item.text !== 'string') { skipped += 1; continue }
+          const row = item as { kind?: unknown; text?: unknown; subject?: string | null; field?: string | null; value?: string | null; tags?: string[]; scope?: MemoryScope; origin?: MemoryOrigin; confidence?: number; importance?: number; pinned?: boolean } | null
+          if (!row || typeof row.kind !== 'string' || typeof row.text !== 'string') { skipped += 1; continue }
           const result = await writeMemory({
-            kind: item.kind,
-            text: item.text,
-            subject: item.subject ?? null,
-            field: item.field ?? null,
-            value: item.value ?? null,
-            tags: item.tags ?? [],
-            scope: item.scope,
-            origin: item.origin ?? 'observed',
-            confidence: item.confidence,
-            importance: item.importance,
-            pinned: item.pinned === true,
+            kind: row.kind as MemoryKind,
+            text: row.text,
+            subject: row.subject ?? null,
+            field: row.field ?? null,
+            value: row.value ?? null,
+            tags: row.tags ?? [],
+            scope: row.scope,
+            origin: row.origin ?? 'observed',
+            confidence: row.confidence,
+            importance: row.importance,
+            pinned: row.pinned === true,
           })
           if (result.ok && result.status === 'created') created += 1
           else skipped += 1
         }
         return { kind: 'success', text: `导入完成：新建 ${created} 条，跳过/合并 ${skipped} 条（文件 ${path}）` }
       } catch (error) {
-        return { kind: 'error', text: `导入失败：${String(error?.message ?? error)}` }
+        return { kind: 'error', text: `导入失败：${errorText(error)}` }
       }
     },
-    stats() {
-      const byKind = {}
+    stats(): DshCommandResult {
+      const byKind: Record<string, number> = {}
       for (const record of state.records.values()) byKind[record.kind] = (byKind[record.kind] ?? 0) + 1
       return {
         kind: 'success',
@@ -1416,15 +1794,15 @@ export function apply(ctx, config = {}) {
         ].join('\n'),
       }
     },
-    async consolidate() {
+    async consolidate(): Promise<DshCommandResult> {
       await consolidate('manual')
-      const last = state.consolidate.last ?? {}
+      const last: Partial<ConsolidateSummary> = state.consolidate.last ?? {}
       return {
         kind: 'success',
         text: `整合完成：合并 ${last.merged ?? 0}，冲突失效 ${last.invalidated ?? 0}，归档 ${last.archived ?? 0}，摘要 ${last.summarized ?? 0}，耗时 ${last.ms ?? 0}ms${last.error ? `（错误：${last.error}）` : ''}`,
       }
     },
-    help() {
+    help(): DshCommandResult {
       return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | export [path] | import <path> | clear --all --yes | consolidate | stats | help' }
     },
   }
@@ -1441,22 +1819,22 @@ export function apply(ctx, config = {}) {
         try {
           return await handler(parts)
         } catch (error) {
-          return { kind: 'error', text: `记忆命令失败：${String(error?.message ?? error)}` }
+          return { kind: 'error', text: `记忆命令失败：${errorText(error)}` }
         }
       },
     })
   } catch (error) {
-    state.openError = `command register failed: ${String(error?.message ?? error)}`
+    state.openError = `command register failed: ${errorText(error)}`
   }
 
   // 供其他插件/调试使用的最小服务面（不导出类型，M4 再考虑正式 seam）
   try {
-    ctx.provide('memory', {
-      list: () => [...state.records.values()],
-      stats: () => ({ records: state.records.size, version: state.collectionVersion, opened: state.opened }),
-      recall: (options) => recallRecords(state.records.values(), options),
-      write: (input) => writeMemory(input),
-      consolidate: (reason) => consolidate(reason ?? 'manual'),
+    ;(ctx as DshPluginContextWithProvide).provide('memory', {
+      list: (): MemoryRecord[] => [...state.records.values()],
+      stats: (): { records: number; version: number; opened: boolean } => ({ records: state.records.size, version: state.collectionVersion, opened: state.opened }),
+      recall: (options: RecallOptions) => recallRecords(state.records.values(), options),
+      write: (input: WriteMemoryInput) => writeMemory(input),
+      consolidate: (reason?: string) => consolidate(reason ?? 'manual'),
     })
   } catch { /* 可选 */ }
 
