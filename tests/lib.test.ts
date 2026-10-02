@@ -361,7 +361,7 @@ test('tokenize：CJK bigram、拉丁词干、路径拆分', () => {
 
 test('lexicalMatch：覆盖率而非「前两字」误命中', () => {
   const semantic = makeRecord({ kind: 'semantic', text: '记忆数据落在 ~/.dsh/storages/ 下。' })
-  const unrelated = makeRecord({ kind: 'procedural', text: '记忆插件的开发迭代流程是跑 deploy-dev.ps1。' })
+  const unrelated = makeRecord({ kind: 'procedural', text: '记忆插件的开发迭代流程是跑 deploy-dev.ts。' })
   assert.ok(lexicalMatch(semantic, '记忆数据落在') > 0.6)
   assert.ok(lexicalMatch(unrelated, '记忆数据落在') < 0.4, '只含「记忆」两字不应算作高覆盖')
   assert.equal(lexicalMatch(semantic, ''), 1)

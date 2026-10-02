@@ -9,7 +9,7 @@
 //
 // 格式：本文件只写「模块体」。客户端模块系统要求的 lazy-CJS 外壳
 //   （`window.__ModuleLoader__.load({ id, factory: (require) => {...} })`）
-// 由 tools/build-client.mjs 在 tsc（CommonJS）产出 build/client/client.js 之后自动包上，见 lib/client.js。
+// 由 tools/build-client.ts 在 tsc（CommonJS）产出 build/client/client.js 之后自动包上，见 lib/client.js。
 // 因此这里正常写 ESM import / export：import 会被编译成 `require(...)`，而 `require` 由外层 factory 提供。
 
 // 单独编译本文件（`tsc src/client.ts`）时，同目录的 shims.d.ts 不会被自动纳入程序，

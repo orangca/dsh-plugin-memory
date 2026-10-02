@@ -1,13 +1,29 @@
 // 从会话日志里取最近一条 runtime-context 的 user/message，打印其完整形状。
 // 用途：确认 pre-step 注入的 user 消息对象应该长什么样（本地无法读 llm 源码时的取证手段）。
 import { readdirSync, readFileSync, statSync } from 'node:fs'
+import type { Dirent } from 'node:fs'
 import { join } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
 
+/** 会话日志里的一行（只声明本工具读到的字段）。 */
+interface SessionLogEvent {
+  type?: string
+  data?: {
+    source?: { kind?: string } | null
+    content?: unknown
+  } | null
+}
+
+/** 命中的一条消息及其所在文件。 */
+interface MessageSample {
+  file: string
+  event: SessionLogEvent
+}
+
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 
-function decompressAllFrames(buffer) {
-  const offsets = []
+function decompressAllFrames(buffer: Buffer): string {
+  const offsets: number[] = []
   let cursor = 0
   while (cursor >= 0) {
     const found = buffer.indexOf(ZSTD_MAGIC, cursor)
@@ -26,12 +42,13 @@ function decompressAllFrames(buffer) {
 
 const root = process.argv[2]
 const wanted = process.argv[3] ?? 'runtime-context'
-let found = null
-let userSample = null
+// 显式断言初始值类型：两者由下面的 walk 闭包赋值，TS 的控制流分析看不到这一点
+let found: MessageSample | null = null as MessageSample | null
+let userSample: MessageSample | null = null as MessageSample | null
 
-const walk = (dir, depth) => {
+const walk = (dir: string, depth: number): void => {
   if (depth > 3 || found) return
-  let entries = []
+  let entries: Dirent[] = []
   try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
   for (const entry of entries) {
     if (found && userSample) return
@@ -42,8 +59,8 @@ const walk = (dir, depth) => {
     const text = decompressAllFrames(readFileSync(full))
     for (const line of text.split('\n')) {
       if (!line.startsWith('{')) continue
-      let event
-      try { event = JSON.parse(line) } catch { continue }
+      let event: SessionLogEvent
+      try { event = JSON.parse(line) as SessionLogEvent } catch { continue }
       if (event?.type !== 'user/message') continue
       const kind = event.data?.source?.kind
       if (kind === wanted && !found) found = { file: full, event }

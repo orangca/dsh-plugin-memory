@@ -10,10 +10,15 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+/** 本工具从 package.json 里实际读到的字段。 */
+interface PackageManifest {
+  name: string
+}
+
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const source = join(root, 'build', 'client', 'client.js')
 const target = join(root, 'lib', 'client.js')
-const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+const packageJson = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as PackageManifest
 
 const body = readFileSync(source, 'utf8')
   // 去掉 tsc 的 sourceMappingURL（源映射指向 build/ 目录，发布包里没有）

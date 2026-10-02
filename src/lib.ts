@@ -122,7 +122,7 @@ export const DEFAULTS: MemoryConfig = {
   sectionOrder: 9000,
   contextOrder: 60,
   // 出厂默认**不播种**：播种的演示记忆会被注入到真实用户的上下文里。
-  // 开发期由 tools/deploy-dev.ps1 显式传 seed: true。
+  // 开发期由 tools/deploy-dev.ts 显式传 seed: true。
   seed: false,
   reportPath: null,
   trustToolWrites: false,

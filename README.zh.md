@@ -166,18 +166,19 @@ $DSH_HOME/storages/dsh_memory/
 
 ## 开发
 
-TypeScript 编写、`tsc` 构建、pnpm 管理。
+TypeScript 编写、`tsc` 构建、pnpm 管理。开发工具也是 TypeScript —— Node 22.6+（24 默认开启）原生剥离类型，
+所以 `node tools/<name>.ts` 直接可跑，工具链不需要构建步骤。
 
 ```sh
-pnpm install                                    # 只装开发依赖：typescript、@types/node、schemastery 类型
-pnpm build                                      # src/*.ts → lib/*.js（并给客户端半边套上 lazy-CJS 包装）
-pnpm test                                       # 先构建，再对构建产物跑单测
-pnpm typecheck                                  # 宿主半边与客户端半边分别检查，不产出文件
-node tools/eval-recall.mjs                      # 离线召回评测（读真实会话日志）
-pwsh -File tools/deploy-dev.ps1                 # 把 lib/ 挂成新的开发修订版（需先 pnpm build）
-pwsh -File tools/deploy-dev.ps1 -Set "recallMode='dry';maxInjectedTokens=200"
-node tools/extract-asar.cjs                     # 提取 DSH 客户端产物（排查界面问题）
-node tools/scan-asar.cjs settingsNumberField    # 定位某个符号在 app.asar 里的位置
+pnpm install                                      # 只装开发依赖：typescript、@types/node、schemastery 类型
+pnpm build                                        # src/*.ts → lib/*.js（并给客户端半边套上 lazy-CJS 包装）
+pnpm test                                         # 先构建，再对构建产物跑单测
+pnpm typecheck                                    # 宿主半边、客户端半边、工具，分别检查，不产出文件
+node tools/eval-recall.ts                         # 离线召回评测（读真实会话日志）
+node tools/deploy-dev.ts                          # 把 lib/ 挂成新的开发修订版（需先 pnpm build）
+node tools/deploy-dev.ts --set "recallMode='dry';maxInjectedTokens=200"
+node tools/extract-asar.ts                        # 提取 DSH 客户端产物（排查界面问题）
+node tools/scan-asar.ts settingsNumberField       # 定位某个符号在 app.asar 里的位置
 ```
 
 目录职责：
@@ -189,7 +190,7 @@ node tools/scan-asar.cjs settingsNumberField    # 定位某个符号在 app.asar
 | `src/client.ts` | 浏览器半边：设置表单（编成 CommonJS 后再被包装） |
 | `src/types.ts`、`src/shims.d.ts` | 领域类型 + 本插件实际依赖的 DSH 接缝子集 |
 | `lib/` | 构建产物：**刻意提交进仓库**（见下），并通过 `files` 进发布包 |
-| `tools/build-client.mjs` | 把编译后的客户端包成 `window.__ModuleLoader__.load({ id, factory })` |
+| `tools/build-client.ts` | 把编译后的客户端包成 `window.__ModuleLoader__.load({ id, factory })` |
 
 为什么把构建产物也提交：`dsh plugin add github:<owner>/<repo>` 拉的是**源码而不是产物**，也**不会**跑构建脚本。
 如果 `lib/` 被 git 忽略，GitHub 安装下来的包 `main` 会指向不存在的文件。提交它可以让安装保持「零构建步骤」——
@@ -198,7 +199,7 @@ node tools/scan-asar.cjs settingsNumberField    # 定位某个符号在 app.asar
 三条用真实调试时间换来的经验：
 
 - **条目要能在 profile patch 里被定位**，settings 服务才会为它投影表单；只存在于 bundle 层的行可能不出现。
-- `deploy-dev.ps1` **永不重用修订号**：Node 的 ESM 缓存按解析后的真实路径命中，复用路径会拿到缓存里的旧模块。
+- `deploy-dev.ts` **永不重用修订号**：Node 的 ESM 缓存按解析后的真实路径命中，复用路径会拿到缓存里的旧模块。
 - **npm 上的 `@deepseek-ai/*` 包比你正在运行的 DSH 旧**——发布版 `dsh-client-ui-primitives` 甚至不导出 settings API。
   因此按 `src/types.ts` / `src/shims.d.ts` 里**实测验证过的子集**打类型，而不是导入不匹配的发布版类型。
 

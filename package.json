@@ -43,10 +43,10 @@
     "local-first"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node tools/build-client.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
-    "test": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node tools/build-client.mjs && node --test tests/lib.test.ts tests/client.test.ts tests/module.test.ts",
-    "eval": "node tools/eval-recall.mjs",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node tools/build-client.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit && tsc -p tsconfig.tools.json",
+    "test": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node tools/build-client.ts && node --test tests/lib.test.ts tests/client.test.ts tests/module.test.ts",
+    "eval": "node tools/eval-recall.ts",
     "clean": "node -e \"fs.rmSync('lib',{recursive:true,force:true});fs.rmSync('build',{recursive:true,force:true})\""
   },
   "dsh": {

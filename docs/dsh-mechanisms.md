@@ -105,12 +105,12 @@ Slot semantics that matter:
 ## 7. Reading DSH's own browser code
 
 Undocumented client APIs (slot kinds, prop shapes) can be read straight out of the installed client bundles.
-`tools/extract-asar.cjs` unpacks `app.asar` entries and `tools/scan-asar.cjs` finds where a symbol appears and
+`tools/extract-asar.ts` unpacks `app.asar` entries and `tools/scan-asar.ts` finds where a symbol appears and
 maps it back to its owning file:
 
 ```sh
-node tools/extract-asar.cjs                     # extracts every lib/client.js
-node tools/scan-asar.cjs settingsNumberField    # which bundle defines it, plus surrounding context
+node tools/extract-asar.ts                     # extracts every lib/client.js
+node tools/scan-asar.ts settingsNumberField    # which bundle defines it, plus surrounding context
 ```
 
 This is how the slot kinds and the `SettingsFormModel` contract used by this plugin were confirmed rather than

@@ -1,4 +1,4 @@
-// eval-recall.mjs — 长期记忆召回自检（M4）
+// eval-recall.ts — 长期记忆召回自检（M4）
 //
 // 为什么离线：`ctx.sessionQuery` 只能在宿主内调用，但会话日志与记忆库都落在磁盘上，
 // 直接读盘就能用真实数据评测，不需要模型、不需要联网。
@@ -12,9 +12,10 @@
 //
 // 指标：自检索准确率 / 触发率（按消息长度分桶）/ 召回延迟 p50·p95 / 注入 token 预算。
 //
-// 用法：node tools/eval-recall.mjs [--domain dsh_memory] [--limit 400] [--minHits 2] [--minMatch 0.4]
+// 用法：node tools/eval-recall.ts [--domain dsh_memory] [--limit 400] [--minHits 2] [--minMatch 0.4]
 
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import type { Dirent } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { zstdDecompressSync } from 'node:zlib'
@@ -28,9 +29,74 @@ import {
   renderSelfBlock,
   workspaceKeyOf,
 } from '../lib/lib.js'
+import type { MemoryConfig, MemoryRecord } from '../lib/lib.js'
+
+/** 会话日志里的一行（只声明本工具读到的字段）。 */
+interface SessionLogEvent {
+  type?: string
+  cwd?: string
+  data?: {
+    source?: { kind?: string } | null
+    content?: unknown
+  } | null
+}
+
+/** 消息内容块视图（只读 type/text）。 */
+interface ContentBlock {
+  type?: string
+  text?: string
+}
+
+/** 一个会话的样本：文件、会话头 cwd、截断后的真实用户消息。 */
+interface SessionSample {
+  file: string
+  cwd: string | null
+  messages: string[]
+}
+
+/** 触发率分桶。 */
+interface TriggerBucket {
+  total: number
+  triggered: number
+}
+
+/** 每个会话的召回池统计。 */
+interface PoolStat {
+  cwd: string | null
+  messages: number
+  recallable: number
+  active: number
+}
+
+/** 触发示例。 */
+interface TriggerExample {
+  cwd: string | null
+  queryChars: number
+  query: string
+  hit: string
+  score: number
+}
+
+/** 评测报告（写进 reports/eval-*.json 的结构）。 */
+interface RecallReport {
+  domain: string
+  at: string
+  sessions: number
+  memories: { total: number; active: number; byKind: Record<string, number> }
+  selfRetrieval: { top1: number; top3: number; total: number; misses: string[] }
+  triggerRate: {
+    messages: number
+    triggered: number
+    byLength: { short: TriggerBucket; long: TriggerBucket }
+    examples: TriggerExample[]
+    pools: PoolStat[]
+  }
+  latency: { samples: number; p50: number; p95: number; max: number }
+  injection: { recallTokens: number; selfTokens: number; lines: number; primaryCwd?: string | null }
+}
 
 const args = process.argv.slice(2)
-const argOf = (name, fallback) => {
+const argOf = (name: string, fallback: string): string => {
   const index = args.indexOf(`--${name}`)
   return index >= 0 && args[index + 1] ? args[index + 1] : fallback
 }
@@ -40,13 +106,13 @@ const domain = argOf('domain', 'dsh_memory')
 const perSessionLimit = Number(argOf('limit', '400'))
 const minHits = Number(argOf('minHits', String(DEFAULTS.recallMinHits)))
 const minMatch = Number(argOf('minMatch', String(DEFAULTS.recallMinMatch)))
-const cfg = { ...DEFAULTS, reportPath: null }
+const cfg: MemoryConfig = { ...DEFAULTS, reportPath: null }
 
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
 
 /** 逐帧解压（DSH 的会话日志是多个 zstd 帧顺序追加的，zstdDecompressSync 只解第一帧）。 */
-function decompressAllFrames(buffer) {
-  const offsets = []
+function decompressAllFrames(buffer: Buffer): string {
+  const offsets: number[] = []
   let cursor = 0
   while (cursor >= 0) {
     const found = buffer.indexOf(ZSTD_MAGIC, cursor)
@@ -67,23 +133,24 @@ function decompressAllFrames(buffer) {
 }
 
 /** 读一个会话日志：返回该会话的 cwd 与真实用户消息（按会话分桶，绝不跨会话混合）。 */
-function readSession(file) {
-  let text
+function readSession(file: string): SessionSample | null {
+  let text: string
   try { text = decompressAllFrames(readFileSync(file)) } catch { return null }
-  let cwd = null
-  const messages = []
+  let cwd: string | null = null
+  const messages: string[] = []
   for (const line of text.split('\n')) {
     if (!line.startsWith('{')) continue
-    let event
-    try { event = JSON.parse(line) } catch { continue }
+    let event: SessionLogEvent
+    try { event = JSON.parse(line) as SessionLogEvent } catch { continue }
     if (event.type === 'session') {
       if (typeof event.cwd === 'string') cwd = event.cwd
       continue
     }
     if (event.type !== 'user/message') continue
     if (event.data?.source?.kind !== 'user') continue
-    const content = Array.isArray(event.data?.content)
-      ? event.data.content.filter((block) => block?.type === 'text').map((block) => block.text).join('\n')
+    const rawContent = event.data?.content
+    const content = Array.isArray(rawContent)
+      ? rawContent.filter((block: ContentBlock) => block?.type === 'text').map((block: ContentBlock) => block.text).join('\n')
       : ''
     const trimmed = content.trim()
     // 过滤空消息与 XML 包装（子代理提示词常以标签开头），它们不代表真实人类输入
@@ -93,11 +160,11 @@ function readSession(file) {
   return { file, cwd, messages: messages.slice(-perSessionLimit) }
 }
 
-function loadSessions(root) {
-  const sessions = []
-  const walk = (dir, depth) => {
+function loadSessions(root: string): SessionSample[] {
+  const sessions: SessionSample[] = []
+  const walk = (dir: string, depth: number): void => {
     if (depth > 3) return
-    let entries = []
+    let entries: Dirent[] = []
     try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
     for (const entry of entries) {
       const full = join(dir, entry.name)
@@ -112,24 +179,24 @@ function loadSessions(root) {
   return sessions
 }
 
-function loadMemories(domainName) {
+function loadMemories(domainName: string): MemoryRecord[] {
   const dir = join(dshHome, 'storages', domainName, 'memories')
-  let files = []
+  let files: string[] = []
   try { files = readdirSync(dir).filter((name) => name.endsWith('.json')) } catch { return [] }
-  const records = []
+  const records: MemoryRecord[] = []
   for (const file of files) {
     try {
-      const doc = JSON.parse(readFileSync(join(dir, file), 'utf8'))
+      const doc = JSON.parse(readFileSync(join(dir, file), 'utf8')) as { record?: MemoryRecord } | null
       if (doc?.record?.id) records.push(doc.record)
     } catch { /* 坏文档跳过 */ }
   }
   return records
 }
 
-const normalizeLine = (line) => line.replace(/^[-*\s]+/u, '').replace(/^\([a-z]+\)\s*/u, '').trim()
+const normalizeLine = (line: string): string => line.replace(/^[-*\s]+/u, '').replace(/^\([a-z]+\)\s*/u, '').trim()
 
 /** 某会话的 R2 召回池 = 全部 active − 已由 R1 常驻块注入的条目。 */
-function recallPoolFor(records, workspaceKey) {
+function recallPoolFor(records: MemoryRecord[], workspaceKey: string | null): MemoryRecord[] {
   const resident = new Set([
     ...renderContextBlock(records, cfg, workspaceKey).lines,
     ...renderSelfBlock(records, cfg).lines,
@@ -142,7 +209,7 @@ const memories = loadMemories(domain)
 const active = listActive(memories)
 const sessions = loadSessions(join(dshHome, 'sessions'))
 
-const report = {
+const report: RecallReport = {
   domain,
   at: new Date().toISOString(),
   sessions: sessions.length,
@@ -191,7 +258,7 @@ for (const session of sessions) {
 
 // 3) 延迟
 const allMessages = sessions.flatMap((session) => session.messages)
-const timings = []
+const timings: number[] = []
 for (let index = 0; index < 200; index += 1) {
   const query = allMessages[index % Math.max(1, allMessages.length)] ?? '记忆'
   const began = process.hrtime.bigint()
@@ -224,7 +291,7 @@ const outFile = join(outDir, `eval-${Date.now()}.json`)
 writeFileSync(outFile, JSON.stringify(report, null, 2))
 
 // ---------- 输出 ----------
-const percent = (part, whole) => (whole === 0 ? 'n/a' : `${((part / whole) * 100).toFixed(1)}%`)
+const percent = (part: number, whole: number): string => (whole === 0 ? 'n/a' : `${((part / whole) * 100).toFixed(1)}%`)
 console.log(`记忆库 ${domain}：${report.memories.active}/${report.memories.total} 条 active，${JSON.stringify(report.memories.byKind)}`)
 console.log(`会话样本：${report.sessions} 个（主会话 cwd：${report.injection.primaryCwd ?? '未知'}）`)
 console.log(`自检索 Top1 ${percent(report.selfRetrieval.top1, report.selfRetrieval.total)}，Top3 ${percent(report.selfRetrieval.top3, report.selfRetrieval.total)}（${report.selfRetrieval.total} 条）`)

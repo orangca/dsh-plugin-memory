@@ -174,18 +174,19 @@ $DSH_HOME/storages/dsh_memory/
 
 ## Development
 
-Written in TypeScript, built with `tsc`, managed with pnpm.
+Written in TypeScript, built with `tsc`, managed with pnpm. The dev tools are TypeScript too — Node 22.6+ (24 by
+default) strips types natively, so `node tools/<name>.ts` runs them without a build step.
 
 ```sh
-pnpm install                                    # devDependencies: typescript, @types/node, schemastery types
-pnpm build                                      # src/*.ts -> lib/*.js (+ the client half's lazy-CJS wrapper)
-pnpm test                                       # builds, then runs the unit tests on the built output
-pnpm typecheck                                  # host half and client half, no emit
-node tools/eval-recall.mjs                      # offline recall eval over real session logs
-pwsh -File tools/deploy-dev.ps1                 # mount lib/ as a new dev revision (run pnpm build first)
-pwsh -File tools/deploy-dev.ps1 -Set "recallMode='dry';maxInjectedTokens=200"
-node tools/extract-asar.cjs                     # extract DSH client bundles (UI debugging)
-node tools/scan-asar.cjs settingsNumberField    # find where a symbol lives in app.asar
+pnpm install                                      # devDependencies: typescript, @types/node, schemastery types
+pnpm build                                        # src/*.ts -> lib/*.js (+ the client half's lazy-CJS wrapper)
+pnpm test                                         # builds, then runs the unit tests on the built output
+pnpm typecheck                                    # host half, client half and tools — no emit
+node tools/eval-recall.ts                         # offline recall eval over real session logs
+node tools/deploy-dev.ts                          # mount lib/ as a new dev revision (run pnpm build first)
+node tools/deploy-dev.ts --set "recallMode='dry';maxInjectedTokens=200"
+node tools/extract-asar.ts                        # extract DSH client bundles (UI debugging)
+node tools/scan-asar.ts settingsNumberField       # find where a symbol lives in app.asar
 ```
 
 Layout:
@@ -197,7 +198,8 @@ Layout:
 | `src/client.ts` | Browser half: the settings form (compiled to CommonJS, then wrapped) |
 | `src/types.ts`, `src/shims.d.ts` | Domain types plus the DSH seam subset this plugin relies on |
 | `lib/` | Build output — **committed on purpose** (see below), shipped in the package (`files`) |
-| `tools/build-client.mjs` | Wraps the compiled client into `window.__ModuleLoader__.load({ id, factory })` |
+| `tools/build-client.ts` | Wraps the compiled client into `window.__ModuleLoader__.load({ id, factory })` |
+| `tools/deploy-dev.ts` | Copies `lib/` into a fresh dev revision and rewrites the profile patch |
 
 Why the build output is committed: `dsh plugin add github:<owner>/<repo>` fetches **source, not artifacts** and
 runs no build script. If `lib/` were gitignored, a GitHub install would end up with a `main` pointing at a file that
@@ -208,7 +210,7 @@ Three development notes that cost real debugging time and are worth knowing:
 
 - DSH resolves configuration from the profile patch, and a plugin row may need to be **locatable in that file** for
   the settings service to project its form — a bundle-layer-only row may not appear.
-- `deploy-dev.ps1` never reuses a revision number, because Node's ESM cache is keyed by resolved path: reusing a
+- `deploy-dev.ts` never reuses a revision number, because Node's ESM cache is keyed by resolved path: reusing a
   path hands you the previously cached module.
 - The `@deepseek-ai/*` packages on npm are **older than the DSH you are running** — the published
   `dsh-client-ui-primitives` does not even export the settings API. Type against the empirically verified subset in
