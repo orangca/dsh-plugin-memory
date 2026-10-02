@@ -48,6 +48,7 @@ import {
   estimateTokens,
   extractCandidates,
   extractSummaryText,
+  facetOf,
   fillWithinBudget,
   findConflicts,
   fnv1a,
@@ -56,16 +57,25 @@ import {
   listActive,
   makeRecord,
   maskPii,
+  normalizeFacet,
   pickMergeGroups,
+  planPortraitUpdate,
+  portraitHistory,
+  portraitSubjectFor,
   recallRecords,
   recordHash,
+  REFLECT_NOTICE,
   renderContextBlock,
   renderSelfBlock,
   scanSensitive,
   shouldArchive,
+  shouldReflect,
   splitSentences,
   workspaceKeyOf,
 } from './lib.js'
+// 自画像 v2（M6-A）新增的纯函数与类型：签名冻结在 docs/self-portrait.md 第 3 节。
+// 类型用 `import type` 引入（verbatimModuleSyntax）：它们只参与编译期检查，运行期不存在。
+import type { PortraitAction, PortraitCandidate, PortraitDecision, SelfFacet } from './lib.js'
 
 // 设置页表单需要 schemastery（DSH 用它把 Config 投影成表单）。但它对第三方包是**可选**的：
 // profile 的 pnpm 配置是 autoInstallPeers: false，能否解析取决于宿主 loader 的 peer 映射。
@@ -154,6 +164,8 @@ interface MemoryWriteArgs {
   scopeLevel?: ScopeLevel
   importance?: number
   pinned?: boolean
+  /** 仅 `kind === 'agent_self'` 有意义：'persona' | 'work'，缺省按 'work'（存量兼容）。 */
+  facet?: string
 }
 
 interface MemoryRecallArgs {
@@ -303,6 +315,67 @@ interface TurnBuffer {
   closedAt: number
 }
 
+/**
+ * 自画像 v2 在 `MemoryRecord` 上新增的字段（契约 2.1）。
+ * `supersedes` 是既有必需字段，这里只补两个可选项；把它们单列成视图类型，
+ * 是为了让宿主代码在 lib/types 的落地过程中都能稳定读写（运行期就是同一条记录）。
+ */
+interface PortraitRecordFields {
+  facet?: SelfFacet
+  supersededBy?: string
+}
+
+type PortraitRecord = MemoryRecord & PortraitRecordFields
+
+/** 记录的自画像视图（不做拷贝：字段就是记录自身的字段）。 */
+const asPortrait = (record: MemoryRecord): PortraitRecord => record as PortraitRecord
+
+/**
+ * 自画像写入收敛的结果（进工具返回值，让模型/用户看得见「这次写入发生了什么」）。
+ * `action` 是契约第 3 节的五种决策；`reason` 是可读原因（如 'user-owned'、'too-short'）。
+ */
+interface PortraitOutcome {
+  action: PortraitAction
+  reason: string
+  facet: SelfFacet
+  subject: string
+  /** 被 reinforce/refine/supersede 命中的既有条目 id；add/skip 时为 null。 */
+  targetId: string | null
+}
+
+/** 一次自画像写入的完整规划：候选 + 决策 + 对外的结果视图。 */
+interface PortraitPlan {
+  candidate: PortraitCandidate
+  decision: PortraitDecision
+  outcome: PortraitOutcome
+}
+
+/**
+ * 自画像在宿主侧的运行时状态（`state.self`，由 `memory_stats` 暴露）。
+ *
+ * 计数四个动作：add → added；reinforce/refine → refined（都不新建条目）；
+ * supersede → superseded（新建 + 旧条目归档）；skip → skipped（不写盘）。
+ * 反思提示的会话状态也放在这里：会话切换时整组重置。
+ */
+interface SelfState {
+  added: number
+  refined: number
+  superseded: number
+  skipped: number
+  /** 本会话上一次反思提醒的回合号；从未提醒过为 null。 */
+  lastReflectTurn: number | null
+  /** 本会话已提醒次数。 */
+  reflections: number
+  /** 本会话已提醒的回合号（只保留最近一批，避免无界增长）。 */
+  reflectTurns: number[]
+  /** 反思闸门用的会话身份：id 变化即视为新会话。 */
+  sessionId: string
+  /** 本会话已进行的回合数（由 pre-step 的回合号推进，单调不减）。 */
+  sessionTurns: number
+  /** 最近一次自画像/反思路径的异常文本（诊断用，绝不影响主流程）。 */
+  lastError: string | null
+}
+
 /** apply 期间的内部状态：字段名与运行时结构一一对应（openErrorDetail 只在使用时才出现）。 */
 interface PluginState {
   opened: boolean
@@ -330,6 +403,8 @@ interface PluginState {
   rejectedHashes: Set<string>
   recall: RecallState
   recallTurnById: Map<string, number>
+  /** M6：自画像 v2 的运行时状态（写入收敛计数 + 反思提示的会话闸门状态）。 */
+  self: SelfState
   // 用量：注入/召回只在内存累加（每次写盘会产生大量 IO），由整合或卸载时统一落盘。
   usageDirty: Set<string>
   injectedIds: InjectedLines
@@ -369,6 +444,12 @@ interface WriteMemoryInput {
   importance?: number
   pinned?: boolean
   sessionId?: string
+  /**
+   * 自画像面（契约 2.1/4.1）：**只有显式提供时**才让这次 `agent_self` 写入走
+   * `planPortraitUpdate` 收敛（`memory_write` 工具与 `/memory self set` 会补上缺省 'work'）。
+   * 捕获/导入/整合路径不带它，行为与 0.5.x 完全一致。
+   */
+  facet?: SelfFacet
 }
 
 /** `writeMemory` 的返回：工具与命令共用（成功带 status，失败带 error）。 */
@@ -379,6 +460,8 @@ interface WriteMemoryResult {
   record?: MemoryRecord
   boosted?: boolean
   error?: string
+  /** 仅自画像写入（agent_self + facet）带：本次执行的收敛决策。 */
+  portrait?: PortraitOutcome
 }
 
 /** `/memory` 子命令处理器。 */
@@ -400,6 +483,8 @@ interface MemoryCommandHandlers extends Record<string, CommandHandler> {
   import(args: string[]): Promise<DshCommandResult>
   stats(): DshCommandResult
   consolidate(): Promise<DshCommandResult>
+  /** `/memory self …`：查看/设定/查看修订链/重置自画像（契约 4.3）。 */
+  self(args: string[]): Promise<DshCommandResult>
   help(): DshCommandResult
 }
 
@@ -407,6 +492,18 @@ interface MemoryCommandHandlers extends Record<string, CommandHandler> {
 interface MemoryConfigExtras {
   exportDir?: string
   simulateCaptureError?: boolean
+  /**
+   * M6-A 在 `MemoryConfig` / `DEFAULTS` 里新增的 7 个自画像键（契约 3.1）。
+   * 这里同样声明一遍：`cfg` 是 `MemoryConfig & MemoryConfigExtras`，两边都声明时取交集，
+   * 因此无论 M6-A 是否已经改完 types.ts，宿主侧都能稳定读到这几个键。
+   */
+  selfPortraitEnabled?: boolean
+  selfPersonaMaxTokens?: number
+  selfPortraitMergeThreshold?: number
+  selfReflectEnabled?: boolean
+  selfReflectEveryTurns?: number
+  selfReflectMinTurn?: number
+  selfReflectMaxPerSession?: number
 }
 
 /**
@@ -440,6 +537,14 @@ function buildConfig(useVolatile: boolean): ReturnType<SchemaFactory['object']> 
     maxInjectedTokens: field(Schema!.number().default(300)),
     maxItemTokens: field(Schema!.number().default(60)),
     selfPortraitMaxTokens: field(Schema!.number().default(120)),
+    // M6：自画像 v2（契约 3.1）——类型与默认值必须与 lib.ts 的 DEFAULTS 逐字一致
+    selfPortraitEnabled: field(Schema!.boolean().default(true)),
+    selfPersonaMaxTokens: field(Schema!.number().default(80)),
+    selfPortraitMergeThreshold: field(Schema!.number().default(0.6)),
+    selfReflectEnabled: field(Schema!.boolean().default(true)),
+    selfReflectEveryTurns: field(Schema!.number().default(12)),
+    selfReflectMinTurn: field(Schema!.number().default(4)),
+    selfReflectMaxPerSession: field(Schema!.number().default(3)),
     recallMode: field(Schema!.union(['off', 'dry', 'inject']).default('inject')),
     recallTopK: field(Schema!.number().default(8)),
     captureMode: field(Schema!.union(['off', 'rule']).default('rule')),
@@ -545,6 +650,19 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     rejectedHashes: new Set(),
     recall: { injected: 0, turns: 0, last: null },
     recallTurnById: new Map(),
+    // M6：自画像 v2（写入收敛计数 + 反思提示的会话状态）
+    self: {
+      added: 0,
+      refined: 0,
+      superseded: 0,
+      skipped: 0,
+      lastReflectTurn: null,
+      reflections: 0,
+      reflectTurns: [],
+      sessionId: '',
+      sessionTurns: 0,
+      lastError: null,
+    },
     // 用量：注入/召回只在内存累加（每次写盘会产生大量 IO），由整合或卸载时统一落盘。
     usageDirty: new Set(),
     injectedIds: { context: [], section: [] },
@@ -670,6 +788,17 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         recentEvents: [...state.recentEvents],
         consolidate: state.consolidate,
         recall: state.recall,
+        self: {
+          added: state.self.added,
+          refined: state.self.refined,
+          superseded: state.self.superseded,
+          skipped: state.self.skipped,
+          lastReflectTurn: state.self.lastReflectTurn,
+          reflections: state.self.reflections,
+          reflectTurns: [...state.self.reflectTurns],
+          sessionTurns: state.self.sessionTurns,
+          lastError: state.self.lastError,
+        },
         usage: {
           dirty: state.usageDirty.size,
           injectedNow: state.injectedIds.context.length + state.injectedIds.section.length,
@@ -757,7 +886,140 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     return flushed
   }
 
-  /** 写入：敏感过滤 → PII 脱敏 → 回声剔除 → hash 去重合并 → 落盘。返回结果对象（供工具与命令共用）。 */
+  // ---------------- M6：自画像写入收敛（契约 §4.1） ----------------
+  //
+  // 收敛只发生在**显式带 facet 的 `agent_self` 写入**上：`memory_write` 工具与 `/memory self set`
+  // 会补上缺省 `'work'`；捕获/导入/整合路径不传 facet，行为与 0.5.x 完全一致（向后兼容）。
+  // 决策本身是纯函数（lib.ts 的 `planPortraitUpdate`），宿主只负责**如实执行**四种决策：
+  //   add → 正常新建；reinforce/refine → 更新既有条目不新建；
+  //   supersede → 旧条目 archived + supersededBy，再新建；skip → 不写盘，返回可读原因。
+
+  /** 反思提示的每会话回合号只留最近一批（无界数组会随会话增长）。 */
+  const REFLECT_TURNS_KEEP = 32
+
+  /** 自画像 subject 的 key 白名单：与 `portraitSubjectFor` 的校验一致（非法则回退 'general'）。 */
+  const PORTRAIT_KEY_RE = /^[a-z0-9_]+$/u
+
+  /**
+   * 把工具/命令给的 subject 收敛成 `portraitSubjectFor(facet, key)` 的 key：
+   * 接受 `voice` / `self.persona.voice` / `agent_self.work.style`，取最后一段做白名单校验，
+   * 缺省或非法时回退 `'general'`（与 portraitSubjectFor 自身的回退一致）。
+   */
+  const portraitKeyOf = (subject: unknown): string => {
+    const raw = String(subject ?? '').trim().toLowerCase()
+    if (raw.length === 0) return 'general'
+    const tail = raw.includes('.') ? raw.slice(raw.lastIndexOf('.') + 1) : raw
+    return PORTRAIT_KEY_RE.test(tail) ? tail : 'general'
+  }
+
+  /** 候选置信度：与 `makeRecord` 的缺省一致（0.6），并夹到 [0,1]。 */
+  const portraitConfidenceOf = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0.6
+
+  /**
+   * 规划一次自画像写入。**纯函数异常不得阻断写入**：出错时记诊断并返回 null，
+   * 调用方退回普通写入路径（宁可少一次收敛，也不能丢一条记忆）。
+   */
+  const planPortraitWrite = (input: WriteMemoryInput, text: string, origin: MemoryOrigin): PortraitPlan | null => {
+    try {
+      const facet = normalizeFacet(input.facet, 'work')
+      const subject = portraitSubjectFor(facet, portraitKeyOf(input.subject))
+      const candidate: PortraitCandidate = {
+        text,
+        facet,
+        subject,
+        origin,
+        confidence: portraitConfidenceOf(input.confidence),
+        observedAt: Date.now(),
+      }
+      const decision = planPortraitUpdate(candidate, state.records.values(), cfg)
+      return {
+        candidate,
+        decision,
+        outcome: { action: decision.action, reason: decision.reason, facet, subject, targetId: decision.targetId },
+      }
+    } catch (error) {
+      state.self.lastError = `portrait plan failed: ${errorText(error)}`
+      return null
+    }
+  }
+
+  /**
+   * 自画像字段通过**变量展开**传给 makeRecord：这样在 types.ts 尚未收录 `facet` 的中间修订里
+   * 也不会触发对象字面量的多余属性检查（运行期就是记录自身的字段）。
+   */
+  const portraitRecordFields = (facet: SelfFacet | undefined): PortraitRecordFields => ({ facet })
+
+  /**
+   * reinforce / refine：更新既有条目的正文、置信度与复现计数并落盘，**不新建**。
+   * 返回 null 表示目标已被并发删除 → 调用方退回 add（不能凭空丢一次写入）。
+   */
+  const applyPortraitUpdate = async (
+    plan: PortraitPlan,
+    input: WriteMemoryInput,
+    origin: MemoryOrigin,
+  ): Promise<WriteMemoryResult | null> => {
+    const targetId = plan.decision.targetId
+    const target = targetId ? state.records.get(targetId) : undefined
+    if (!target) return null
+    // 如实执行决策：用户所有物的保护在 `planPortraitUpdate`（lib 规则 4，含 reinforce 的收紧）里，
+    // 宿主这里不再二次判断 —— 否则同一规则会有两份实现、日后必然漂移。
+    target.text = plan.decision.text || target.text
+    target.confidence = plan.decision.confidence
+    target.observedAt = Date.now()
+    asPortrait(target).facet = plan.outcome.facet
+    // 用户侧写入命中模型侧条目时升级来源与固定位（与 hash 合并分支同一语义：用户侧只升不降）。
+    if (ORIGIN_RANK[origin] > ORIGIN_RANK[target.origin]) target.origin = origin
+    if (input.pinned === true) target.pinned = true
+    const nextImportance = clamp01(input.importance)
+    if (nextImportance !== undefined) target.importance = Math.max(target.importance, nextImportance)
+    const sessionId = input.sessionId ? String(input.sessionId) : ''
+    const sessions = new Set([...(target.reinforcement?.sessions ?? []), ...(sessionId ? [sessionId] : [])])
+    target.reinforcement = { sessions: [...sessions], count: (target.reinforcement?.count ?? 0) + 1 }
+    // 指纹必须重算：recordHash 覆盖 subject 与正文
+    target.hash = recordHash(target)
+    await persist(target)
+    state.writes.merged += 1
+    state.self.refined += 1
+    flush()
+    return { ok: true, status: 'merged', id: target.id, record: target, boosted: false, portrait: plan.outcome }
+  }
+
+  /**
+   * supersede：先把 target 置 `status:'archived'` + `supersededBy:<新 id>`，再新建候选条目。
+   * 顺序不能反 —— `supersededBy` 必须指向一个已经确定的 id（§2.1：旧条目归档且留痕）。
+   */
+  const applyPortraitSupersede = async (
+    plan: PortraitPlan,
+    input: WriteMemoryInput,
+    text: string,
+    origin: MemoryOrigin,
+  ): Promise<WriteMemoryResult> => {
+    const target = plan.decision.targetId ? state.records.get(plan.decision.targetId) : undefined
+    const record = makeRecord({
+      ...input,
+      ...portraitRecordFields(plan.outcome.facet),
+      kind: 'agent_self',
+      text: plan.decision.text || text,
+      origin,
+      confidence: plan.decision.confidence,
+      subject: plan.outcome.subject,
+      supersedes: target ? [target.id] : [],
+    })
+    asPortrait(record).facet = plan.outcome.facet
+    if (plan.decision.archiveTarget && target) {
+      target.status = 'archived'
+      asPortrait(target).supersededBy = record.id
+      await persist(target)
+    }
+    await persist(record)
+    state.writes.created += 1
+    state.self.superseded += 1
+    flush()
+    return { ok: true, status: 'created', id: record.id, record, portrait: plan.outcome }
+  }
+
+  /** 写入：敏感过滤 → PII 脱敏 → 回声剔除 → 自画像收敛 → hash 去重合并 → 落盘。（工具与命令共用） */
   const writeMemory = async (input: WriteMemoryInput): Promise<WriteMemoryResult> => {
     let text = String(input.text ?? '')
     const sensitive = scanSensitive(text)
@@ -775,7 +1037,36 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       flush()
       return { ok: false, error: 'rejected_echo: 与刚注入的记忆高度相似（疑似复述），不作为新观察' }
     }
-    const record = makeRecord({ ...input, kind: input.kind as MemoryKind, text, origin })
+
+    // ---- 自画像收敛（仅显式 facet 的 agent_self 写入）----
+    let portraitPlan: PortraitPlan | null = null
+    if (input.kind === 'agent_self' && input.facet !== undefined) {
+      const planned = planPortraitWrite(input, text, origin)
+      if (planned) {
+        if (planned.decision.action === 'skip') {
+          state.self.skipped += 1
+          flush()
+          return { ok: false, error: `portrait_skipped: ${planned.decision.reason}`, portrait: planned.outcome }
+        }
+        if (planned.decision.action === 'reinforce' || planned.decision.action === 'refine') {
+          const updated = await applyPortraitUpdate(planned, input, origin)
+          if (updated) return updated
+        } else if (planned.decision.action === 'supersede') {
+          return await applyPortraitSupersede(planned, input, text, origin)
+        }
+        portraitPlan = planned
+      }
+    }
+
+    const record = makeRecord({
+      ...input,
+      ...portraitRecordFields(portraitPlan ? portraitPlan.outcome.facet : input.facet),
+      kind: input.kind as MemoryKind,
+      text: portraitPlan ? (portraitPlan.decision.text || text) : text,
+      origin,
+      subject: portraitPlan ? portraitPlan.outcome.subject : input.subject,
+      confidence: portraitPlan ? portraitPlan.decision.confidence : input.confidence,
+    })
     if (!record.text) return { ok: false, error: 'rejected_invalid: text 不能为空' }
     // 用户明确拒绝过的自我观察不再重复产生（/memory reject 会登记指纹）
     if (origin === 'model_proposed' && state.rejectedHashes.has(record.hash)) {
@@ -811,8 +1102,15 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
 
     await persist(record)
     state.writes.created += 1
+    if (portraitPlan) state.self.added += 1
     flush()
-    return { ok: true, status: 'created', id: record.id, record }
+    return {
+      ok: true,
+      status: 'created',
+      id: record.id,
+      record,
+      ...(portraitPlan ? { portrait: portraitPlan.outcome } : {}),
+    }
   }
 
   // ---------------- 领域打开 + 播种 ----------------
@@ -1198,107 +1496,188 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   // ---------------- M4：R2 按轮相关召回（pre-step 追加一条带来源的 user 快照） ----------------
   // 与 R1（常驻块）互补：R1 放长期稳定的画像/印象，R2 只放「本轮这句话真的相关」的条目。
   // 注意：长查询必须用 memoryMatch（记忆侧覆盖率），用查询覆盖率会让任何长消息都趋近 0。
+  //
+  // M6 起这段逻辑改为一个局部函数：pre-step 需要「先 R2、后反思提示」两步独立追加
+  // （反思提示不能因为 R2 提前 return 而消失 —— 它的 gate 与 R2 不同）。
+  const injectRecallSnapshot = async (
+    decision: DshPreStepDecision | null | undefined,
+    payload: DshPreStepPayload,
+  ): Promise<DshPreStepDecision | null | undefined> => {
+    const recallBegan = Date.now()
+    try {
+      if (decision?.kind === 'reject' || payload?.signal?.aborted === true) return decision
+      if (cfg.autoRecall === false || cfg.recallMode === 'off' || !state.opened) return decision
+      const proposed = Array.isArray(decision?.messages) ? decision.messages : []
+      const query = proposed.map((message) => textOfContent((message as { content?: unknown } | null | undefined)?.content)).join('\n')
+      if (query.trim().length < (cfg.recallMinQueryChars ?? 12)) return decision
+
+      const turn = Number(payload?.turn ?? 0)
+      const workspaceKey = workspaceKeyOf(payload?.agent?.session?.header?.cwd)
+      const residentLines = new Set([...state.injected.context, ...state.injected.section]
+        .map((line) => line.replace(/^[-*\s]+/u, '').replace(/^\([a-z]+\)\s*/u, '').trim()))
+      const cooldownTurns = cfg.recallCooldownTurns ?? 3
+
+      // 候选池要**大于** topK：过滤发生在取前 K 条之前，否则刚注入过的条目
+      // （markUsed 给了 recency 加成，分数最高）会霸占前 K 个名额、随即被冷却过滤掉，
+      // 把它们后面的相关条目全挤走 —— 表现就是后续回合「0 命中」。
+      const topK = cfg.recallTopK ?? 8
+      const hits = recallRecords(state.records.values(), {
+        query,
+        mode: 'memory',
+        minHits: cfg.recallMinHits ?? 2,
+        minMatch: cfg.recallMinMatch ?? 0.4,
+        limit: Math.max(topK, Math.min(50, topK * 4)),
+      })
+        .filter((hit) => hit.record.kind !== 'agent_self')
+        .filter((hit) => hit.record.scope.level !== 'workspace' || hit.record.scope.key === workspaceKey)
+        .filter((hit) => !residentLines.has(hit.record.text.trim()))
+        .filter((hit) => turn - (state.recallTurnById.get(hit.record.id) ?? -999) >= cooldownTurns)
+        .slice(0, topK)
+
+      state.recall.turns += 1
+      // 超时保护（设计稿 §6.3：召回耗时上限 10ms，超时跳过本轮）
+      const recallBudgetMs = cfg.recallBudgetMs ?? 10
+      if (Date.now() - recallBegan > recallBudgetMs) {
+        state.recall.last = { at: new Date().toISOString(), turn, queryChars: query.length, hits: 0, skipped: 'over-budget', ms: Date.now() - recallBegan }
+        return decision
+      }
+      if (hits.length === 0) {
+        state.recall.last = { at: new Date().toISOString(), turn, queryChars: query.length, hits: 0, mode: cfg.recallMode }
+        return decision
+      }
+
+      // 硬预算（设计稿 §7.2）：块内固定文案先扣掉，再逐条填。不能像早期版本那样直接 map 全部命中，
+      // 否则 8 条 × 60 token 会突破 maxInjectedTokens。
+      const R2_HEADER = '[相关记忆 · 本轮召回]'
+      const R2_FOOTER = '以上为历史记录，可能与本轮任务相关；与当前对话冲突时以当前对话为准。'
+      const r2Budget = Math.max(0, cfg.maxInjectedTokens - estimateTokens(`${R2_HEADER}\n${R2_FOOTER}`, cfg.charsPerToken))
+      const filled = fillWithinBudget(
+        hits.map((hit) => hit.record),
+        r2Budget,
+        (record, text) => `- (${record.kind}) ${text}`,
+        cfg,
+      )
+      const keptIds = new Set(filled.selected.map((record) => record.id))
+      const keptHits = hits.filter((hit) => keptIds.has(hit.record.id))
+      if (filled.lines.length === 0) {
+        state.recall.last = { at: new Date().toISOString(), turn, queryChars: query.length, hits: 0, mode: cfg.recallMode, budgetSkipped: hits.length }
+        return decision
+      }
+      const lines = filled.lines
+      const text = [R2_HEADER, ...lines, R2_FOOTER].join('\n')
+      state.recall.injected += cfg.recallMode === 'inject' ? keptHits.length : 0
+      state.recall.last = {
+        at: new Date().toISOString(),
+        turn,
+        queryChars: query.length,
+        hits: keptHits.length,
+        droppedByBudget: hits.length - keptHits.length,
+        tokens: estimateTokens(text, cfg.charsPerToken),
+        mode: cfg.recallMode,
+        preview: text.slice(0, 300),
+        detail: keptHits.map((hit) => ({ id: hit.record.id, match: Number(hit.match.toFixed(2)), score: Number(hit.score.toFixed(2)) })),
+      }
+      for (const hit of keptHits) state.recallTurnById.set(hit.record.id, turn)
+      markUsed(keptHits.map((hit) => hit.record))
+      flush()
+      // dry：只算不注入（用于上线前验证打分与消息形状，不会改动对话）
+      if (cfg.recallMode === 'dry') return decision
+      // 形状必须与宿主自己注入的 runtime-context 消息完全一致（从会话日志取证）：
+      // { role:'user', id:<uuid>, content:[{type:'text',text}], source:{kind:'runtime-context',form:'snapshot',sections:[...]} }
+      // 自造 source.kind 有被运行时校验拒绝的风险，故沿用已注册的 runtime-context。
+      const messageId = globalThis.crypto?.randomUUID?.() ?? `mem-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      return {
+        ...decision,
+        messages: [...proposed, {
+          role: 'user',
+          id: messageId,
+          content: [{ type: 'text', text }],
+          source: { kind: 'runtime-context', form: 'snapshot', sections: [{ name: 'dsh-memory:recall', text }] },
+        }],
+      }
+    } catch (error) {
+      state.recall.last = { at: new Date().toISOString(), error: errorText(error) }
+      flush()
+      return decision
+    }
+  }
+
+  // ---------------- M6：低频反思提示（契约 §4.2） ----------------
+  /**
+   * 自画像反思提示：在 R2 **之后**追加**单独一条** runtime-context 消息（形状与 R2 完全一致，
+   * 只有 `sections[0].name` 改为 `dsh-memory:self-reflect`）。为什么不与 R2 合并：
+   * 两者语义不同，且 R2 可能因冷却/预算被跳过 —— 合并会让反思提示被顺带吞掉。
+   *
+   * 闸门与计数（严格要求）：
+   *   · `recallMode === 'dry'|'off'` 或 `autoRecall === false` → 不注入且**不推进计数**；
+   *   · reject / aborted / 域未打开 / 回合号非法 → 同样不注入、不推进（连「提醒过」都不算）；
+   *   · 只有真正把消息追加进 decision 之后，才更新 lastReflectTurn / reflections / reflectTurns。
+   * 任何异常都被 catch：pre-step 主流程绝不能因为提示注入而失败。
+   */
+  const injectReflectNotice = (
+    decision: DshPreStepDecision | null | undefined,
+    payload: DshPreStepPayload,
+  ): DshPreStepDecision | null | undefined => {
+    try {
+      if (!decision || typeof decision !== 'object') return decision
+      if (decision.kind === 'reject' || payload?.signal?.aborted === true) return decision
+      if (cfg.selfReflectEnabled === false) return decision
+      if (cfg.autoRecall === false || cfg.recallMode === 'off' || cfg.recallMode === 'dry' || !state.opened) return decision
+      const rawTurn = Number(payload?.turn ?? 0)
+      if (!Number.isFinite(rawTurn) || rawTurn < 0) return decision
+      const turn = Math.floor(rawTurn)
+
+      // 会话切换：反思配额按会话重置（回合号本来就是按会话重新计数的）
+      const sessionId = String(payload?.agent?.session?.id ?? '')
+      if (state.self.sessionId !== sessionId) {
+        state.self.sessionId = sessionId
+        state.self.lastReflectTurn = null
+        state.self.reflections = 0
+        state.self.reflectTurns = []
+        state.self.sessionTurns = 0
+      }
+      // 回合号按会话递增（实测宿主这样下发），因此它本身就是「已进行的回合数」。
+      // 取 max 保证单调不减：pre-step 每个 step 都会跑，回合号在极端情况下可能回退。
+      if (turn > state.self.sessionTurns) state.self.sessionTurns = turn
+
+      const due = shouldReflect({
+        turn,
+        lastReflectTurn: state.self.lastReflectTurn,
+        reflectionsThisSession: state.self.reflections,
+        sessionTurns: state.self.sessionTurns,
+      }, cfg)
+      if (!due) return decision
+
+      const proposed = Array.isArray(decision.messages) ? decision.messages : []
+      // 注入正文一律过 clampText：折平单行（防结构伪造），预算用整块注入预算（提示本身就是一条完整块）
+      const text = clampText(REFLECT_NOTICE, Math.max(1, cfg.maxInjectedTokens ?? DEFAULTS.maxInjectedTokens), cfg.charsPerToken)
+      const messageId = globalThis.crypto?.randomUUID?.() ?? `mem-reflect-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      const message = {
+        role: 'user',
+        id: messageId,
+        content: [{ type: 'text', text }],
+        source: { kind: 'runtime-context', form: 'snapshot', sections: [{ name: 'dsh-memory:self-reflect', text }] },
+      }
+      // 先构造好消息再推进计数：注入失败时不能留下「提醒过」的假账
+      state.self.lastReflectTurn = turn
+      state.self.reflections += 1
+      state.self.reflectTurns = [...state.self.reflectTurns, turn].slice(-REFLECT_TURNS_KEEP)
+      flush()
+      return { ...decision, messages: [...proposed, message] }
+    } catch (error) {
+      state.self.lastError = `reflect inject failed: ${errorText(error)}`
+      flush()
+      return decision
+    }
+  }
+
   try {
     ctx.on('agent/pre-step', async (rawPayload, next) => {
       const payload = rawPayload as DshPreStepPayload
-      const decision = (await next()) as DshPreStepDecision | null | undefined
-      const recallBegan = Date.now()
-      try {
-        if (decision?.kind === 'reject' || payload?.signal?.aborted === true) return decision
-        if (cfg.autoRecall === false || cfg.recallMode === 'off' || !state.opened) return decision
-        const proposed = Array.isArray(decision?.messages) ? decision.messages : []
-        const query = proposed.map((message) => textOfContent((message as { content?: unknown } | null | undefined)?.content)).join('\n')
-        if (query.trim().length < (cfg.recallMinQueryChars ?? 12)) return decision
-
-        const turn = Number(payload?.turn ?? 0)
-        const workspaceKey = workspaceKeyOf(payload?.agent?.session?.header?.cwd)
-        const residentLines = new Set([...state.injected.context, ...state.injected.section]
-          .map((line) => line.replace(/^[-*\s]+/u, '').replace(/^\([a-z]+\)\s*/u, '').trim()))
-        const cooldownTurns = cfg.recallCooldownTurns ?? 3
-
-        // 候选池要**大于** topK：过滤发生在取前 K 条之前，否则刚注入过的条目
-        // （markUsed 给了 recency 加成，分数最高）会霸占前 K 个名额、随即被冷却过滤掉，
-        // 把它们后面的相关条目全挤走 —— 表现就是后续回合「0 命中」。
-        const topK = cfg.recallTopK ?? 8
-        const hits = recallRecords(state.records.values(), {
-          query,
-          mode: 'memory',
-          minHits: cfg.recallMinHits ?? 2,
-          minMatch: cfg.recallMinMatch ?? 0.4,
-          limit: Math.max(topK, Math.min(50, topK * 4)),
-        })
-          .filter((hit) => hit.record.kind !== 'agent_self')
-          .filter((hit) => hit.record.scope.level !== 'workspace' || hit.record.scope.key === workspaceKey)
-          .filter((hit) => !residentLines.has(hit.record.text.trim()))
-          .filter((hit) => turn - (state.recallTurnById.get(hit.record.id) ?? -999) >= cooldownTurns)
-          .slice(0, topK)
-
-        state.recall.turns += 1
-        // 超时保护（设计稿 §6.3：召回耗时上限 10ms，超时跳过本轮）
-        const recallBudgetMs = cfg.recallBudgetMs ?? 10
-        if (Date.now() - recallBegan > recallBudgetMs) {
-          state.recall.last = { at: new Date().toISOString(), turn, queryChars: query.length, hits: 0, skipped: 'over-budget', ms: Date.now() - recallBegan }
-          return decision
-        }
-        if (hits.length === 0) {
-          state.recall.last = { at: new Date().toISOString(), turn, queryChars: query.length, hits: 0, mode: cfg.recallMode }
-          return decision
-        }
-
-        // 硬预算（设计稿 §7.2）：块内固定文案先扣掉，再逐条填。不能像早期版本那样直接 map 全部命中，
-        // 否则 8 条 × 60 token 会突破 maxInjectedTokens。
-        const R2_HEADER = '[相关记忆 · 本轮召回]'
-        const R2_FOOTER = '以上为历史记录，可能与本轮任务相关；与当前对话冲突时以当前对话为准。'
-        const r2Budget = Math.max(0, cfg.maxInjectedTokens - estimateTokens(`${R2_HEADER}\n${R2_FOOTER}`, cfg.charsPerToken))
-        const filled = fillWithinBudget(
-          hits.map((hit) => hit.record),
-          r2Budget,
-          (record, text) => `- (${record.kind}) ${text}`,
-          cfg,
-        )
-        const keptIds = new Set(filled.selected.map((record) => record.id))
-        const keptHits = hits.filter((hit) => keptIds.has(hit.record.id))
-        if (filled.lines.length === 0) {
-          state.recall.last = { at: new Date().toISOString(), turn, queryChars: query.length, hits: 0, mode: cfg.recallMode, budgetSkipped: hits.length }
-          return decision
-        }
-        const lines = filled.lines
-        const text = [R2_HEADER, ...lines, R2_FOOTER].join('\n')
-        state.recall.injected += cfg.recallMode === 'inject' ? keptHits.length : 0
-        state.recall.last = {
-          at: new Date().toISOString(),
-          turn,
-          queryChars: query.length,
-          hits: keptHits.length,
-          droppedByBudget: hits.length - keptHits.length,
-          tokens: estimateTokens(text, cfg.charsPerToken),
-          mode: cfg.recallMode,
-          preview: text.slice(0, 300),
-          detail: keptHits.map((hit) => ({ id: hit.record.id, match: Number(hit.match.toFixed(2)), score: Number(hit.score.toFixed(2)) })),
-        }
-        for (const hit of keptHits) state.recallTurnById.set(hit.record.id, turn)
-        markUsed(keptHits.map((hit) => hit.record))
-        flush()
-        // dry：只算不注入（用于上线前验证打分与消息形状，不会改动对话）
-        if (cfg.recallMode === 'dry') return decision
-        // 形状必须与宿主自己注入的 runtime-context 消息完全一致（从会话日志取证）：
-        // { role:'user', id:<uuid>, content:[{type:'text',text}], source:{kind:'runtime-context',form:'snapshot',sections:[...]} }
-        // 自造 source.kind 有被运行时校验拒绝的风险，故沿用已注册的 runtime-context。
-        const messageId = globalThis.crypto?.randomUUID?.() ?? `mem-${Date.now()}-${Math.random().toString(36).slice(2)}`
-        return {
-          ...decision,
-          messages: [...proposed, {
-            role: 'user',
-            id: messageId,
-            content: [{ type: 'text', text }],
-            source: { kind: 'runtime-context', form: 'snapshot', sections: [{ name: 'dsh-memory:recall', text }] },
-          }],
-        }
-      } catch (error) {
-        state.recall.last = { at: new Date().toISOString(), error: errorText(error) }
-        flush()
-        return decision
-      }
+      const decided = (await next()) as DshPreStepDecision | null | undefined
+      // 顺序固定：R2 快照在前、反思提示在后；两者各自独立追加、互不影响对方的闸门
+      const withRecall = await injectRecallSnapshot(decided, payload)
+      return injectReflectNotice(withRecall, payload)
     })
   } catch { /* ignore */ }
 
@@ -1494,6 +1873,50 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     }
   }
 
+  /**
+   * 自画像条目的诊断视图（契约 §4.5）：把 `facet` 与取代链（`supersededBy` / `supersedes`）亮出来。
+   * 记录本身存的就是这两个可选字段，运行期直接读；`facetOf` 负责存量兼容（无 facet → 'work'）。
+   */
+  const portraitRecordView = (record: MemoryRecord): Record<string, unknown> => {
+    const fields = asPortrait(record)
+    const view: Record<string, unknown> = {
+      id: record.id,
+      status: record.status,
+      facet: facetOf(record),
+      subject: record.subject,
+      origin: record.origin,
+      pinned: record.pinned,
+      confidence: record.confidence,
+      observedAt: new Date(record.observedAt).toISOString(),
+      text: record.text,
+    }
+    // 「若有」：只有被取代过的旧条目才有 supersededBy，只有取代过别人的条目才有 supersedes
+    if (fields.supersededBy) view.supersededBy = fields.supersededBy
+    if (Array.isArray(record.supersedes) && record.supersedes.length > 0) view.supersedes = [...record.supersedes]
+    return view
+  }
+
+  /** 自画像诊断：只读、绝不抛（memory_explain 的输出）。 */
+  const portraitDiagnostics = (): Record<string, unknown> => {
+    try {
+      return {
+        records: [...state.records.values()]
+          .filter((record) => record.kind === 'agent_self')
+          .sort(compareRecords)
+          .slice(0, 20)
+          .map(portraitRecordView),
+        totals: {
+          added: state.self.added,
+          refined: state.self.refined,
+          superseded: state.self.superseded,
+          skipped: state.self.skipped,
+        },
+      }
+    } catch (error) {
+      return { records: [], error: errorText(error) }
+    }
+  }
+
   const tools: MemoryToolDefinition[] = [
     {
       name: 'memory_write',
@@ -1510,6 +1933,11 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           scopeLevel: { type: 'string', enum: ['profile', 'workspace', 'session'] },
           importance: { type: 'number' },
           pinned: { type: 'boolean' },
+          facet: {
+            type: 'string',
+            enum: ['persona', 'work'],
+            description: '仅 kind=agent_self 有意义：自画像面（persona=人格/表达，work=工作倾向），缺省 work。',
+          },
         },
         required: ['kind', 'text'],
         additionalProperties: false,
@@ -1520,6 +1948,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         const origin = cfg.trustToolWrites ? 'user_explicit' : deriveOriginFromMessages(toolMessages(exec))
         const scopeLevel = args.scopeLevel ?? defaultScopeFor(args.kind as MemoryKind)
         const scopeKey = scopeLevel === 'workspace' ? (workspaceKeyOf(exec?.agent?.session?.header?.cwd) ?? '*') : '*'
+        // facet 只对 agent_self 有意义；其余类型一律不带（否则等于给普通记忆加了一个无意义的自画像字段）。
+        // 注意这里**总是**给 agent_self 补上缺省 'work'：正是这个显式 facet 让写入走自画像收敛（契约 §4.1）。
+        const facet = args.kind === 'agent_self' ? normalizeFacet(args.facet, 'work') : undefined
         const result = await writeMemory({
           kind: args.kind,
           text: args.text,
@@ -1530,6 +1961,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           importance: typeof args.importance === 'number' ? args.importance : undefined,
           pinned: args.pinned === true,
           origin,
+          facet,
           scope: { level: scopeLevel, key: scopeKey },
           sessionId: exec?.agent?.session ? String(exec.agent.session.id) : undefined,
           source: exec?.agent?.session ? { sessionId: String(exec.agent.session.id), seqStart: Number(exec.agent.session.seq ?? 0), seqEnd: Number(exec.agent.session.seq ?? 0) } : null,
@@ -1679,13 +2111,20 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         const args = rawArgs as MemoryExplainArgs
         state.toolCalls.memory_explain = (state.toolCalls.memory_explain ?? 0) + 1
         const { candidates, skipped } = extractCandidates(String(args?.text ?? ''), cfg)
-        const report0 = { skipped, candidates: candidates.map((candidate) => ({
-          signal: candidate.signal, kind: candidate.kind, origin: candidate.origin,
-          confidence: candidate.confidence, importance: candidate.importance, text: candidate.text,
-        })) }
-        if (args?.apply !== true) return jsonList('candidates', report0.candidates, { skipped: report0.skipped })
+        const candidateViews = candidates.map((candidate) => {
+          const view: Record<string, unknown> = {
+            signal: candidate.signal, kind: candidate.kind, origin: candidate.origin,
+            confidence: candidate.confidence, importance: candidate.importance, text: candidate.text,
+          }
+          // 契约 §4.5：输出带 facet。只有 agent_self 有意义；捕获候选不带 facet → 存量兼容按 'work'。
+          if (candidate.kind === 'agent_self') view.facet = normalizeFacet(undefined, 'work')
+          return view
+        })
+        if (args?.apply !== true) {
+          return jsonList('candidates', candidateViews, { skipped, portrait: portraitDiagnostics() })
+        }
         const origin = cfg.trustToolWrites ? 'user_explicit' : deriveOriginFromMessages(toolMessages(exec))
-        const written: Array<{ ok: boolean; status?: string; id?: string; error?: string }> = []
+        const written: Array<{ ok: boolean; status?: string; id?: string; error?: string; portrait?: PortraitOutcome }> = []
         for (const candidate of candidates) {
           const level = defaultScopeFor(candidate.kind)
           const result = await writeMemory({
@@ -1698,9 +2137,11 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
             sessionId: exec?.agent?.session ? String(exec.agent.session.id) : undefined,
             scope: { level, key: level === 'workspace' ? (workspaceKeyOf(exec?.agent?.session?.header?.cwd) ?? '*') : '*' },
           })
-          written.push({ ok: result.ok, status: result.status, id: result.id, error: result.error })
+          written.push({ ok: result.ok, status: result.status, id: result.id, error: result.error, portrait: result.portrait })
         }
-        return jsonList('candidates', report0.candidates, { skipped: report0.skipped, applied: true, written })
+        // 诊断是**应用之后**再取一次：这样输出里能直接看到 supersede 的结果
+        // （旧条目 status='archived' 且带 supersededBy，新条目带 facet）。
+        return jsonList('candidates', candidateViews, { skipped, applied: true, written, portrait: portraitDiagnostics() })
       },
     },
   ]
@@ -1948,6 +2389,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           `工具调用：${JSON.stringify(state.toolCalls)}`,
           `渲染：context=${state.renders.context} section=${state.renders.section}，耗时 last=${state.renderMs.last}ms max=${state.renderMs.max}ms`,
           `注入：context=${state.injected.context.length} 行 / section=${state.injected.section.length} 行`,
+          `自画像：新增 ${state.self.added} / 更新 ${state.self.refined} / 取代 ${state.self.superseded} / 跳过 ${state.self.skipped}`
+            + `；反思提醒 ${state.self.reflections} 次（最近回合 ${state.self.lastReflectTurn ?? '-'}）`,
           `turn-stopping：plain=${state.turnStopping.plain}${state.turnStopping.last ? `，last=${state.turnStopping.last.at}（${state.turnStopping.last.channel}）` : '，last=none'}`,
           `设置页：${settingsLine()}`,
         ].join('\n'),
@@ -1961,8 +2404,140 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         text: `整合完成：合并 ${last.merged ?? 0}，冲突失效 ${last.invalidated ?? 0}，归档 ${last.archived ?? 0}，摘要 ${last.summarized ?? 0}，耗时 ${last.ms ?? 0}ms${last.error ? `（错误：${last.error}）` : ''}`,
       }
     },
+    /**
+     * `/memory self …`（契约 §4.3）：自画像的查看/设定/修订历史/重置。
+     * 全部中文输出；`set` 走 `writeMemory`（因此同样经过自画像收敛与用户所有物保护）。
+     */
+    async self(args: string[]): Promise<DshCommandResult> {
+      const SELF_USAGE = '用法：/memory self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work]'
+      const sub = (args[0] ?? 'list').toLowerCase()
+
+      // 自画像条目：kind=agent_self，facet 走 facetOf（无 facet 的存量条目按 'work'）
+      const portraitRows = (facet?: SelfFacet, status: MemoryRecord['status'] = 'active'): MemoryRecord[] =>
+        [...state.records.values()]
+          .filter((record) => record.kind === 'agent_self' && record.status === status)
+          .filter((record) => (facet ? facetOf(record) === facet : true))
+          .sort(compareRecords)
+
+      const line = (record: MemoryRecord): string =>
+        `${record.id.slice(0, 8)}  ${record.origin.padEnd(15)}${record.pinned ? '★' : ' '} conf=${record.confidence.toFixed(2)}  ${clampText(record.text, cfg.maxItemTokens, cfg.charsPerToken)}`
+
+      if (sub === 'list' || sub === '' || args.length === 0) {
+        const persona = portraitRows('persona')
+        const work = portraitRows('work')
+        const archived = [...state.records.values()].filter((record) => record.kind === 'agent_self' && record.status !== 'active').length
+        if (persona.length === 0 && work.length === 0) {
+          return {
+            kind: 'success',
+            text: '自画像为空。\n'
+              + '模型可以随时用 memory_write（kind=agent_self, facet=persona|work）记录对自己的认识；\n'
+              + '你也可以直接设定：/memory self set persona <正文>。'
+              + (archived > 0 ? `\n（另有 ${archived} 条已归档，用 /memory self history 查看修订链。）` : ''),
+          }
+        }
+        const block = (title: string, rows: MemoryRecord[]): string =>
+          `[${title}]${rows.length === 0 ? '（空）' : ` ${rows.length} 条`}\n${rows.map(line).join('\n')}`
+        return {
+          kind: 'success',
+          text: [
+            block('人格 · 模型对自身的认知', persona),
+            block('工作倾向', work),
+            archived > 0 ? `（另有 ${archived} 条已归档：/memory self history）` : '',
+          ].filter(Boolean).join('\n'),
+        }
+      }
+
+      if (sub === 'set') {
+        const facetRaw = (args[1] ?? '').toLowerCase()
+        const text = args.slice(2).join(' ').trim()
+        if (facetRaw !== 'persona' && facetRaw !== 'work') {
+          return { kind: 'error', text: `facet 只能是 persona 或 work。${SELF_USAGE}` }
+        }
+        if (text.length === 0) return { kind: 'error', text: `缺少正文。${SELF_USAGE}` }
+        const facet: SelfFacet = facetRaw
+        // 用户直接设定：origin/pinned/confidence 按契约 §4.3 固定；收敛仍交给 planPortraitUpdate
+        // （用户侧可以覆盖用户侧；模型侧条目会被这次设定 refine/supersede）。
+        const result = await writeMemory({
+          kind: 'agent_self',
+          text,
+          facet,
+          subject: portraitSubjectFor(facet, 'general'),
+          origin: 'user_explicit',
+          pinned: true,
+          confidence: 1,
+          importance: 0.9,
+          tags: ['self-portrait', 'user-set'],
+        })
+        if (!result.ok) return { kind: 'error', text: `未写入自画像：${result.error ?? '未知原因'}` }
+        const action = result.portrait
+          ? `（${result.portrait.action}: ${result.portrait.reason}）`
+          : ''
+        return {
+          kind: 'success',
+          text: result.status === 'merged'
+            ? `已更新既有自画像条目 ${String(result.id).slice(0, 8)}${action}\n${result.record?.text ?? text}`
+            : `已写入自画像（${facet}）${String(result.id).slice(0, 8)}${action}\n${result.record?.text ?? text}`,
+        }
+      }
+
+      if (sub === 'history') {
+        const filter = (args[1] ?? '').trim().toLowerCase()
+        let revisions: ReturnType<typeof portraitHistory>
+        try {
+          revisions = portraitHistory(state.records.values())
+        } catch (error) {
+          return { kind: 'error', text: `读取修订链失败：${errorText(error)}` }
+        }
+        const matched = filter.length === 0
+          ? revisions
+          : revisions.filter((revision) => revision.subject.toLowerCase().includes(filter))
+        if (matched.length === 0) {
+          return { kind: 'success', text: filter.length === 0 ? '自画像还没有修订记录。' : `没有匹配「${filter}」的自画像修订链。` }
+        }
+        const blocks = matched.map((revision) => {
+          const lines = revision.chain.map((record, index) => {
+            // 归档时间：优先取「取代它的那条新记录」的 observedAt（真正发生取代的时刻），
+            // 其次 invalidAt；两者都没有（如 /memory self reset 直接归档）时标注为未知。
+            const successor = revision.chain.slice(index + 1).find((next) => (next.supersedes ?? []).includes(record.id))
+            const archivedAt = record.status === 'archived'
+              ? (successor ? new Date(successor.observedAt).toISOString() : (record.invalidAt ? new Date(record.invalidAt).toISOString() : null))
+              : null
+            const when = new Date(record.observedAt).toISOString()
+            const flag = record.status === 'archived' ? ` [archived${archivedAt ? ` @ ${archivedAt}` : ''}]` : ''
+            return `${index === revision.chain.length - 1 ? '→' : ' '} ${record.id.slice(0, 8)}  ${when}  ${record.origin}${flag}  ${clampText(record.text, cfg.maxItemTokens, cfg.charsPerToken)}`
+          })
+          return `[${revision.subject} · ${revision.facet}]\n${lines.join('\n')}`
+        })
+        return { kind: 'success', text: `共 ${matched.length} 条修订链（旧 → 新）：\n${blocks.join('\n')}` }
+      }
+
+      if (sub === 'reset') {
+        const facetRaw = (args[1] ?? '').toLowerCase()
+        if (facetRaw !== '' && facetRaw !== 'persona' && facetRaw !== 'work') {
+          return { kind: 'error', text: `facet 只能是 persona 或 work（省略则重置全部）。${SELF_USAGE}` }
+        }
+        const facet = facetRaw === '' ? undefined : (facetRaw as SelfFacet)
+        const victims = portraitRows(facet)
+        if (victims.length === 0) return { kind: 'success', text: '没有需要重置的自画像条目。' }
+        let archived = 0
+        for (const record of victims) {
+          // 归档而非删除：历史与检索都还在（契约 §4.3）。
+          record.status = 'archived'
+          await persist(record)
+          archived += 1
+        }
+        flush()
+        return {
+          kind: 'success',
+          text: `已重置${facet ? `（${facet}）` : ''} ${archived} 条自画像：条目已归档、历史保留。`
+            + '\n模型后续写入会重新开始（/memory self history 仍可查看旧条目）。',
+        }
+      }
+
+      return { kind: 'error', text: `未知的 self 子命令「${sub}」。${SELF_USAGE}` }
+    },
     help(): DshCommandResult {
-      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | consolidate | stats | help' }
+      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
     },
   }
 
@@ -1970,7 +2545,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     ctx.commands.register({
       name: 'memory',
       description: '查看与管理长期记忆',
-      input: { hint: 'list | show <id> | forget <id> | export | stats' },
+      input: { hint: 'list | show <id> | self | forget <id> | export | stats' },
       handler: async (invocation) => {
         const parts = String(invocation?.rawInput ?? '').trim().split(/\s+/u).filter(Boolean)
         const sub = parts.shift() ?? 'list'

@@ -178,6 +178,46 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
   assert.deepEqual(byName('consolidateEnabled').parse('true'), { kind: 'set', value: true })
   assert.equal(byName('consolidateEnabled').parse('yes'), undefined)
 
-  // 10 个字段都要有规格，且与 Host 侧 volatile 字段一一对应
-  assert.equal(specs.length, 10)
+  // 自画像 v2（0.5.4）：契约 3.1 的 7 个新键逐个都要有规格
+  const portraitV2Fields = [
+    'selfPortraitEnabled',
+    'selfPersonaMaxTokens',
+    'selfPortraitMergeThreshold',
+    'selfReflectEnabled',
+    'selfReflectEveryTurns',
+    'selfReflectMinTurn',
+    'selfReflectMaxPerSession',
+  ] as const
+  for (const name of portraitV2Fields) {
+    assert.ok(specs.some((spec) => spec.field === name), `缺少自画像 v2 字段规格: ${name}`)
+  }
+
+  // 其中两个开关在 Host 侧是 boolean：界面用 0/1，但**写回的必须是真布尔**
+  // （schemastery 的 Schema.boolean() 对 0/1 数字会抛 `expected boolean but got 0`）
+  for (const name of ['selfPortraitEnabled', 'selfReflectEnabled'] as const) {
+    assert.deepEqual(byName(name).parse('1'), { kind: 'set', value: true }, `${name}: 1 = 开`)
+    assert.deepEqual(byName(name).parse('0'), { kind: 'set', value: false }, `${name}: 0 = 关`)
+    assert.equal(byName(name).parse('2'), undefined, `${name}: 只接受 0/1`)
+    assert.equal(byName(name).parse('abc'), undefined, `${name}: 非数字为 invalid`)
+    assert.deepEqual(byName(name).parse(''), { kind: 'clear' }, `${name}: 空草稿 = 清除覆盖`)
+    assert.equal(byName(name).format(true), '1')
+    assert.equal(byName(name).format(false), '0')
+    assert.equal(byName(name).format(undefined), '')
+  }
+
+  // 其余 5 个键是普通数字字段（默认值见契约 3.1：80 / 0.6 / 12 / 4 / 3）
+  for (const name of [
+    'selfPersonaMaxTokens',
+    'selfPortraitMergeThreshold',
+    'selfReflectEveryTurns',
+    'selfReflectMinTurn',
+    'selfReflectMaxPerSession',
+  ] as const) {
+    assert.deepEqual(byName(name).parse('7'), { kind: 'set', value: 7 }, `${name} 应为数字字段`)
+    assert.equal(byName(name).parse('abc'), undefined, `${name}: 非法草稿应为 invalid`)
+    assert.deepEqual(byName(name).parse(''), { kind: 'clear' }, `${name}: 空草稿 = 清除覆盖`)
+  }
+
+  // 17 个字段都要有规格，且与 Host 侧 volatile 字段一一对应
+  assert.equal(specs.length, 17)
 })

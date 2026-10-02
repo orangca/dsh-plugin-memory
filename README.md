@@ -19,7 +19,7 @@ explainable and deletable.
 | Layer | Content | Scope | Injection |
 |---|---|---|---|
 | User profile | Preferences, environment, prohibitions | profile | Resident (user-role snapshot) |
-| Agent self-portrait | "How I should work": rules the user set, user corrections, model self-observations | profile | Resident (system-prompt section) |
+| Agent self-portrait | **Who I am, how I speak, how I work**: persona plus work tendencies | profile | Resident (system-prompt section) |
 | Project gist | Coarse impression of one workspace (stack / build / layout) | workspace | Resident, explicitly labelled *fuzzy and possibly stale* |
 | Episodic / semantic / procedural | Conclusions, facts, procedures | workspace | Retrieved on demand |
 
@@ -38,6 +38,39 @@ explainable and deletable.
    contradictions invalid (recoverable), decays/archives by per-kind half-life, and summarizes subjects that
    accumulate too many rows.
 
+## The self-portrait: persona + work tendencies
+
+The self-portrait (`agent_self`) is **the model's cognition about itself**. It is injected resident into the system
+prompt as two subsections:
+
+| Section | Content | Subject |
+|---|---|---|
+| Persona | Who I am, how I speak, what I value | `self.persona.*` |
+| Work tendencies | What I am good at and bad at, rules the user set, user corrections, model self-observations | `self.work.*` |
+
+- **Updated opportunistically**: the model writes as it goes — `memory_write` with `kind: 'agent_self'` may pass a
+  `facet` (`'persona'` / `'work'`, default `'work'`, meaningful only for that kind); users can set it directly with
+  `/memory self set`.
+- **Low-frequency reflection prompt**: every `selfReflectEveryTurns` turns (default 12) the plugin injects one
+  prompt (it says "write nothing if you learned nothing new"), at most `selfReflectMaxPerSession` times per session
+  (default 3) and never before turn `selfReflectMinTurn` (default 4). `selfReflectEnabled` turns it off entirely;
+  with `recallMode` set to `dry`/`off` it is not injected either, matching per-turn recall.
+- **Evolution, not accumulation**: a new insight on the same subject is merged into the existing row when
+  similarity is ≥ `selfPortraitMergeThreshold` (default 0.6); below it the model changed its mind — the old row is
+  **archived for the record** (`status: 'archived'` plus `supersededBy` pointing at the new row), and the revision
+  chain stays visible through `/memory self history`.
+- **User-owned rows are protected**: rows the user set or confirmed (`origin: 'user_explicit'` or `pinned: true`)
+  **cannot be overwritten by the model** — only a user-side write may supersede them.
+- **Priority**: the self-portrait is a **description, not an instruction** — when it conflicts with what the user
+  asks for right now, **the user always wins**.
+
+```
+/memory self                             list the persona and work subsections (id, origin, confidence each)
+/memory self set <persona|work> <text>   set/override directly (user-side, pinned, confidence 1)
+/memory self history [subject]           revision chain, old → new (with archival time)
+/memory self reset [persona|work]        archive the current self-portrait (history is kept, nothing is deleted)
+```
+
 ## Guarding against memory pollution / self-reinforcement
 
 - Capture reads **real user messages only** — the plugin's own injected context does not count.
@@ -45,6 +78,8 @@ explainable and deletable.
 - A model self-observation reaches the system-prompt channel only after it **recurs across ≥2 sessions**, and it
   is capped at 4 of 12 self-portrait rows.
 - **Non-user origins can never override user-side rows**; on conflict, the user wins.
+- Portrait convergence never touches user-side rows either: the model **cannot** overwrite a `user_explicit` /
+  `pinned` self-portrait row, only rows it wrote itself.
 - User-side origins do not decay and can only be revoked by the user.
 
 ---
@@ -92,7 +127,7 @@ Add this package to the profile's `dependencies`, append `dsh-plugin-memory` to
 
 ## The settings form
 
-The plugin exports a schemastery `Config` whose 10 tunable fields are declared `volatile()`, and ships a small
+The plugin exports a schemastery `Config` whose 17 tunable fields are declared `volatile()`, and ships a small
 browser half (`src/client.ts`, built to `lib/client.js`) that renders them as a form. Find it under **Plugins → `dsh-plugin-memory` →
 row `dsh-memory`** (the list card also shows a one-line summary).
 
@@ -113,6 +148,10 @@ whole Config through the settings service and persists it into the profile patch
 /memory refresh <id prefix>                      refresh (restart the decay clock)
 /memory confirm <id prefix>                      promote a model self-observation to user-confirmed
 /memory reject <id prefix>                       reject a self-observation (that kind is never re-created)
+/memory self                                     self-portrait: list the persona and work subsections
+/memory self set <persona|work> <text>            set/override it directly (user-side, pinned, confidence 1)
+/memory self history [subject]                   self-portrait revision chain (old → new, with archival time)
+/memory self reset [persona|work]                archive the current self-portrait (history kept, nothing deleted)
 /memory export [path]                            export JSON
 /memory import <path>                            import JSON (deduplicated by fingerprint; every field is validated, numbers are clamped, `pinned` is forced off and the origin is downgraded to `observed`)
 /memory clear --all --yes                        permanently clear everything (`--all` is mutually exclusive with the filters below)
@@ -126,17 +165,17 @@ whole Config through the settings service and persists it into the profile patch
 
 | Tool | Purpose |
 |---|---|
-| `memory_write` | Structured write (`kind` + `text`, optional `subject` / `field` / `value` / `scopeLevel`). **The origin is decided by the plugin — the model cannot claim "the user asked for this"** |
+| `memory_write` | Structured write (`kind` + `text`, optional `subject` / `field` / `value` / `scopeLevel`; with `kind='agent_self'` also an optional `facet: 'persona' | 'work'`). **The origin is decided by the plugin — the model cannot claim "the user asked for this"** |
 | `memory_recall` | Search by query / kind / scope / tag |
 | `memory_list` | List in deterministic order |
 | `memory_forget` | Delete by id; deleting by query needs `confirm: true` (stricter preview threshold) |
 | `memory_maintain` | Trigger consolidation manually (merge / invalidate / archive / summarize) |
 | `memory_stats` | Runtime observability: row counts, write/reject counters, injected lines, render time |
-| `memory_explain` | Diagnose which signal a text hits, which rule excludes it, and what would be written |
+| `memory_explain` | Diagnose which signal a text hits, which rule excludes it, and what would be written (self-portrait rows also show `facet` and `supersededBy`) |
 
 ## Configuration
 
-Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The ten fields exposed in
+Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 17 fields exposed in
 the settings form:
 
 | Field | Default | Meaning |
@@ -144,7 +183,14 @@ the settings form:
 | `domainName` | `dsh_memory` | Store name (also the on-disk directory) |
 | `maxInjectedTokens` | `300` | Hard token cap for resident injection |
 | `maxItemTokens` | `60` | Truncation length for one injected memory |
-| `selfPortraitMaxTokens` | `120` | Budget for the self-portrait block |
+| `selfPortraitMaxTokens` | `120` | Budget shared by the two work subsections |
+| `selfPortraitEnabled` | `true` | Switch for resident self-portrait injection (persona + work); in the form `0` = off, `1` = on |
+| `selfPersonaMaxTokens` | `80` | Separate budget for the persona subsection |
+| `selfPortraitMergeThreshold` | `0.6` | Similarity at or above which a new insight is merged into the existing row (below it the old row is archived and superseded) |
+| `selfReflectEnabled` | `true` | Low-frequency reflection prompt switch; in the form `0` = off, `1` = on |
+| `selfReflectEveryTurns` | `12` | Minimum turns between two reflection prompts |
+| `selfReflectMinTurn` | `4` | Earliest session turn (too early means nothing to reflect on) |
+| `selfReflectMaxPerSession` | `3` | Maximum reflection prompts per session |
 | `recallMode` | `inject` | `off` / `dry` (compute but do not inject) / `inject` |
 | `recallTopK` | `8` | Max memories recalled per turn |
 | `captureMode` | `rule` | `off` / `rule` |
@@ -232,7 +278,7 @@ plugin is built on — written for plugin authors, with no environment-specific 
 - **Retrieval is lexical** — CJK bigrams plus Latin stemming and memory-side coverage. Paraphrase-level recall
   needs vector retrieval and is future work.
 - **No graphical memory browser.** The GUI exposes configuration only; browsing, deleting and pinning memories go
-  through the 16 commands and 7 tools above.
+  through the `/memory` commands listed above and the 7 tools.
 - **Two design items are explicit degradations**: (1) the self-portrait is not de-duplicated against the
   deployment's persona text, and (2) if the deployment registers a `complete` persona section that displaces other
   prompt sections, the self-portrait section disappears with it — the plugin does not silently fall back to the

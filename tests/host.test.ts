@@ -20,6 +20,12 @@
 //   9. /memory import 的逐字段白名单校验与降级
 //  10. 工具结果按条目数截断（仍是完整 JSON）
 //  11. 落盘失败的删除不得报成功（forget / clear / memory_forget）
+//  12–16. M6 自画像 v2（契约 docs/self-portrait.md 第 4/6 节）：
+//    · memory_write 的 facet 可选（仅 agent_self 有意义）
+//    · 写入收敛的 add / reinforce / refine / supersede / skip（含 too-short）
+//    · 用户所有物保护：模型不能覆盖 user_explicit / pinned 的自画像
+//    · /memory self 的四个子命令（list / set / history / reset）与 help 同步
+//    · 反思提示：每会话次数上限、间隔与最小回合、dry/off 不注入也不推进计数、R2 之后单独一条
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -27,8 +33,8 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { apply as applyRaw } from '../lib/index.js'
-import { workspaceKeyOf } from '../lib/lib.js'
+import { apply as applyRaw, Config } from '../lib/index.js'
+import { REFLECT_NOTICE, workspaceKeyOf } from '../lib/lib.js'
 
 /** 假 ctx 只实现本插件实际用到的那一块；测试里不假装它是完整宿主类型。 */
 const apply = applyRaw as unknown as (ctx: Record<string, unknown>, config?: Record<string, unknown>) => void
@@ -760,4 +766,455 @@ test('host#13 pre-step：冷却过滤发生在 top-K 之前（刚注入过的条
   assert.match(text, /相关记忆 · 本轮召回/u, '冷却过滤不应把候选池挤空（旧实现这里 0 命中）')
   assert.doesNotMatch(text, /构建流程用 pnpm build/u, '被冷却的条目本轮不得重复注入')
   assert.match(text, /发布流程用 pnpm publish/u, '应改用候选池里的下一条')
+})
+
+// ================================================================ M6 自画像 v2
+// 契约：docs/self-portrait.md 第 4/6 节。以下用例全部走**构建产物**（../lib/*.js）。
+
+/** 表格里的 facet 断言要读原始记录（`memory` 服务返回完整 MemoryRecord）。 */
+const rowsOf = (harness: Harness): Json[] => harness.memory().list() as Json[]
+
+const writeSelf = async (harness: Harness, args: Json): Promise<Json> =>
+  JSON.parse(String(await harness.tool('memory_write').execute(args))) as Json
+
+/** 一次 pre-step：返回追加在末尾的消息（R2 与/或反思提示）。 */
+const stepTurn = async (
+  harness: Harness,
+  turn: number,
+  query = `轮次 ${turn}`,
+  sessionId = 'session-1',
+): Promise<Json[]> => {
+  const decision = { kind: 'continue', messages: [{ role: 'user', content: [{ type: 'text', text: query }] }] }
+  const result = await harness.preStep(
+    { turn, agent: { session: { id: sessionId, seq: turn, header: { cwd: 'C:\\work\\demo' } } }, signal: { aborted: false } },
+    async () => decision,
+  ) as Json
+  const messages = (result.messages ?? []) as Json[]
+  return messages.slice(1)
+}
+
+const sectionNameOf = (message: Json): string => {
+  const sections = (message.source as Json).sections as Json[]
+  return String(sections[0]!.name)
+}
+
+// ---------------------------------------------------------------- 14. 工具 schema
+
+test('host#14 memory_write 的 facet 可选：enum 为 persona|work，且仅对 kind=agent_self 有意义', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+
+  const parameters = harness.tool('memory_write').parameters as Json
+  const facet = (parameters.properties as Json).facet as Json
+  assert.ok(facet, 'memory_write 必须声明 facet')
+  assert.equal(facet.type, 'string')
+  assert.deepEqual(facet.enum, ['persona', 'work'])
+  assert.match(String(facet.description), /agent_self/u, '描述必须写明仅 kind=agent_self 有意义')
+  assert.deepEqual(parameters.required, ['kind', 'text'], 'facet 必须是可选参数（不得进 required）')
+
+  // 非 agent_self 的写入不得被塞上 facet 字段（避免给普通记忆加无意义的自画像面）
+  await harness.settle()
+  await harness.memory().write({ kind: 'semantic', text: '构建产物统一放在 dist 目录下' })
+  assert.equal(rowsOf(harness)[0]!.facet, undefined)
+})
+
+test('host#14b 配置 Schema：契约 3.1 的 7 个自画像键与默认值（无 schemastery 时跳过）', async () => {
+  if (Config === undefined) {
+    // 发布版 profile：schemastery 不可解析 → 没有设置页表单（模块级测试已覆盖这条降级路径）
+    assert.equal(Config, undefined)
+    return
+  }
+  const dict = (Config as { dict?: Record<string, { meta?: { default?: unknown } }> }).dict ?? {}
+  const expected: Array<[string, unknown]> = [
+    ['selfPortraitEnabled', true],
+    ['selfPersonaMaxTokens', 80],
+    ['selfPortraitMergeThreshold', 0.6],
+    ['selfReflectEnabled', true],
+    ['selfReflectEveryTurns', 12],
+    ['selfReflectMinTurn', 4],
+    ['selfReflectMaxPerSession', 3],
+  ]
+  for (const [key, value] of expected) {
+    const entry = dict[key]
+    assert.ok(entry, `Schema 必须声明 ${key}`)
+    assert.deepEqual(entry.meta?.default, value, `${key} 的默认值必须与契约 3.1 一致`)
+  }
+})
+
+// ---------------------------------------------------------------- 15. add / reinforce
+
+test('host#15 自画像收敛：add 新建、reinforce 落在同一条上且不新建', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const text = '我在写代码时会先跑通最小可验证路径，再逐步扩展功能。'
+  const first = await writeSelf(harness, { kind: 'agent_self', facet: 'work', subject: 'style', text })
+  assert.equal(first.ok, true)
+  assert.equal((first.portrait as Json).action, 'add')
+  assert.equal((first.portrait as Json).facet, 'work')
+  assert.equal((first.portrait as Json).subject, 'self.work.style', 'add 的 subject 必须来自 portraitSubjectFor')
+
+  const putsAfterFirst = harness.domain.puts.length
+  const second = await writeSelf(harness, { kind: 'agent_self', facet: 'work', subject: 'style', text })
+  assert.equal(second.ok, true)
+  assert.equal((second.portrait as Json).action, 'reinforce')
+  assert.equal(second.status, 'merged')
+  assert.equal(second.id, first.id, 'reinforce 必须更新既有条目')
+
+  const rows = rowsOf(harness)
+  assert.equal(rows.length, 1, 'reinforce 不得新建条目')
+  assert.equal(rows[0]!.kind, 'agent_self')
+  assert.equal(rows[0]!.facet, 'work')
+  assert.equal(rows[0]!.subject, 'self.work.style')
+  assert.equal(Number(rows[0]!.confidence), 0.65, 'reinforce 的 confidence 应在原值上 +0.05')
+  assert.ok(harness.domain.puts.length > putsAfterFirst, 'reinforce 必须落盘')
+
+  const self = harness.reportState().self as Json
+  assert.equal(Number(self.added), 1)
+  assert.equal(Number(self.refined), 1, 'reinforce 计入 refined（不新建条目）')
+  assert.equal(Number(self.superseded), 0)
+})
+
+// ---------------------------------------------------------------- 16. supersede
+
+test('host#16 supersede：旧条目 archived + supersededBy，新条目 facet/supersedes 正确（含 explain 与 stats）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const first = await writeSelf(harness, {
+    kind: 'agent_self', facet: 'persona', subject: 'voice',
+    text: '我在解释概念时会先给出结论，再补充理由。',
+  })
+  assert.equal((first.portrait as Json).action, 'add')
+
+  const second = await writeSelf(harness, {
+    kind: 'agent_self', facet: 'persona', subject: 'voice',
+    text: '深夜工作时我会把屏幕亮度调到最低，并且反复检查缩进宽度。',
+  })
+  assert.equal((second.portrait as Json).action, 'supersede', '认知变化时必须取代而不是合并')
+
+  const rows = rowsOf(harness)
+  assert.equal(rows.length, 2, 'supersede 会新建一条')
+  const old = rows.find((row) => row.id === first.id)!
+  const fresh = rows.find((row) => row.id === second.id)!
+  assert.equal(old.status, 'archived', '被取代的旧条目必须归档')
+  assert.equal(old.supersededBy, second.id, '旧条目必须写明被谁取代')
+  assert.equal(fresh.status, 'active')
+  assert.equal(fresh.facet, 'persona', '新条目的 facet 必须保留')
+  assert.equal(fresh.subject, 'self.persona.voice')
+  assert.deepEqual(fresh.supersedes, [first.id], '新条目必须记录它取代了谁')
+
+  // 计数：supersede 计 superseded，且创建计数仍然 +1
+  const self = harness.reportState().self as Json
+  assert.equal(Number(self.added), 1)
+  assert.equal(Number(self.superseded), 1)
+
+  const stats = await harness.runCommand('stats')
+  assert.match(stats.text, /自画像：新增 1 \/ 更新 0 \/ 取代 1 \/ 跳过 0/)
+
+  // memory_explain：输出带 facet 与（若有）supersededBy
+  const explain = JSON.parse(String(await harness.tool('memory_explain').execute({ text: '我回答问题的风格是什么' }))) as Json
+  const portrait = explain.portrait as Json
+  const records = portrait.records as Json[]
+  const archived = records.find((row) => row.status === 'archived')!
+  assert.ok(archived, 'explain 必须列出归档的自画像条目')
+  assert.equal(archived.facet, 'persona')
+  assert.equal(archived.supersededBy, second.id)
+  const active = records.find((row) => row.status === 'active')!
+  assert.equal(active.facet, 'persona')
+  assert.deepEqual(active.supersedes, [first.id])
+
+  // 修订链：旧 → 新，含归档时间
+  const history = await harness.runCommand('self history')
+  assert.match(history.text, /self\.persona\.voice/u)
+  assert.match(history.text, /archived/u)
+  assert.match(history.text, /旧 → 新/u)
+  // id 前缀只有 8 个字符（同一毫秒创建的两条会撞前缀），所以用正文片段定位链内顺序
+  const positions = ['解释概念', '深夜工作'].map((needle) => history.text.indexOf(needle))
+  assert.ok(positions[0]! >= 0 && positions[1]! >= 0, '两条都必须出现在修订链里')
+  assert.ok(positions[0]! < positions[1]!, '链内顺序必须由旧到新')
+  assert.match(history.text, /\[archived @ /u, '归档条目必须带归档时间')
+})
+
+// ---------------------------------------------------------------- 17. skip（用户所有物 + too-short）
+
+test('host#17 自画像保护：模型不能覆盖用户设定（skip + 不写盘），过短正文同样 skip', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 用户显式设定：origin=user_explicit、pinned=true、confidence=1
+  const set = await harness.runCommand('self set persona 我在回答时会先给结论再展开')
+  assert.equal(set.kind, 'success', set.text)
+  const userRow = rowsOf(harness)[0]!
+  assert.equal(userRow.origin, 'user_explicit')
+  assert.equal(userRow.pinned, true)
+  assert.equal(userRow.confidence, 1)
+  assert.equal(userRow.facet, 'persona')
+
+  // 模型侧完全不同的自我认知 → refine/supersede 被用户所有物保护挡下
+  const putsBefore = harness.domain.puts.length
+  const blocked = await writeSelf(harness, {
+    kind: 'agent_self', facet: 'persona',
+    text: '我倾向于用很长的铺垫来回答问题，很少直接给结论。',
+  })
+  assert.equal(blocked.ok, false, '模型不得覆盖用户侧自画像')
+  assert.match(String(blocked.error), /portrait_skipped/u)
+  assert.match(String(blocked.error), /user-owned/u, '必须返回可读原因')
+  assert.equal((blocked.portrait as Json).action, 'skip')
+  assert.equal(harness.domain.puts.length, putsBefore, 'skip 不得写盘')
+  assert.equal(rowsOf(harness).length, 1)
+  assert.equal(rowsOf(harness)[0]!.status, 'active', '用户条目必须原样保留')
+
+  // 过短正文：同样是 skip，且不写盘
+  const short = await writeSelf(harness, { kind: 'agent_self', facet: 'work', text: '太短' })
+  assert.equal(short.ok, false)
+  assert.match(String(short.error), /too-short/u)
+  assert.equal(harness.domain.puts.length, putsBefore, 'too-short 不得写盘')
+
+  const self = harness.reportState().self as Json
+  assert.equal(Number(self.skipped), 2, '两种 skip 都进 skipped 计数')
+  assert.equal(Number(self.added), 1, '用户设定本身是 add')
+
+  // 用户侧之间可以互相覆盖：同一 facet/subject、认知不同 → supersede
+  const override = await harness.runCommand('self set persona 深夜写东西时我会反复确认缩进与空行是否一致')
+  assert.equal(override.kind, 'success')
+  assert.match(override.text, /supersede/u, '用户侧可以覆盖用户侧')
+})
+
+// ---------------------------------------------------------------- 17b. 用户正文不被改写
+
+test('host#17b 端到端：模型无法用自己的措辞改写用户所有物的正文（包含关系也不行）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const original = '我在回答时会先给结论再展开'
+  assert.equal((await harness.runCommand(`self set persona ${original}`)).kind, 'success')
+
+  // 模型侧候选「包含」用户原话（规则 2a 本会判成 reinforce 并取更长的一条）：
+  // lib 的规则 4 收紧后这必须是 skip —— 宿主如实执行，不写盘、不改写正文。
+  const longer = `${original}，而且我还会补充三条以上的理由与边界条件`
+  const blocked = await writeSelf(harness, { kind: 'agent_self', facet: 'persona', text: longer })
+  assert.equal(blocked.ok, false, '模型不得把更长的话写进用户 pinned 的条目')
+  assert.match(String(blocked.error), /user-owned/u)
+  assert.equal((blocked.portrait as Json).action, 'skip')
+
+  const row = rowsOf(harness)[0]!
+  assert.equal(row.text, original, '用户原文必须逐字保留')
+  assert.equal(row.pinned, true)
+  assert.equal(row.origin, 'user_explicit', '来源不得被模型侧降级或改写')
+  assert.equal(rowsOf(harness).length, 1, 'skip 不新建、也不改写')
+
+  // 对照：模型侧条目之间仍按规则 2a 补长（保护只针对用户所有物）
+  const firstModel = await writeSelf(harness, { kind: 'agent_self', facet: 'work', text: '我写代码时会先跑通最小路径' })
+  assert.equal((firstModel.portrait as Json).action, 'add')
+  const longerModel = await writeSelf(harness, { kind: 'agent_self', facet: 'work', text: '我写代码时会先跑通最小路径，然后再补测试与文档' })
+  assert.equal((longerModel.portrait as Json).action, 'reinforce')
+  const modelRow = rowsOf(harness).find((candidate) => candidate.facet === 'work')!
+  assert.match(String(modelRow.text), /再补测试与文档/u, '模型侧条目仍按规则 2a 补长')
+})
+
+// ---------------------------------------------------------------- 18. /memory self 四个子命令
+
+test('host#18 /memory self：list / set / history / reset 四个子命令与 help 同步', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const empty = await harness.runCommand('self')
+  assert.equal(empty.kind, 'success')
+  assert.match(empty.text, /自画像为空/u)
+
+  // 参数校验
+  const badFacet = await harness.runCommand('self set mood 我今天心情不错')
+  assert.equal(badFacet.kind, 'error')
+  assert.match(badFacet.text, /persona 或 work/u)
+  const noText = await harness.runCommand('self set persona')
+  assert.equal(noText.kind, 'error')
+  assert.match(noText.text, /缺少正文/u)
+  const unknown = await harness.runCommand('self wat')
+  assert.equal(unknown.kind, 'error')
+  assert.match(unknown.text, /未知的 self 子命令/u)
+
+  // set：两小节各一条
+  assert.equal((await harness.runCommand('self set persona 我在解释复杂概念时会先给出结论再展开细节')).kind, 'success')
+  assert.equal((await harness.runCommand('self set work 我在动手改代码前会先跑通最小验证路径')).kind, 'success')
+  const rows = rowsOf(harness)
+  assert.equal(rows.length, 2)
+  const persona = rows.find((row) => row.facet === 'persona')!
+  const work = rows.find((row) => row.facet === 'work')!
+  assert.equal(persona.origin, 'user_explicit')
+  assert.equal(persona.pinned, true)
+  assert.equal(persona.confidence, 1, 'set 的 confidence 固定为 1')
+  assert.equal(persona.subject, 'self.persona.general')
+  assert.equal(work.subject, 'self.work.general')
+  assert.equal(work.confidence, 1)
+
+  // list：两小节都列，带 id 前缀 / origin / confidence
+  const list = await harness.runCommand('self')
+  assert.match(list.text, /人格 · 模型对自身的认知/u)
+  assert.match(list.text, /工作倾向/u)
+  assert.match(list.text, /user_explicit/u)
+  assert.match(list.text, /conf=1\.00/u)
+  assert.match(list.text, new RegExp(String(persona.id).slice(0, 8), 'u'))
+
+  // history：没有链长 ≥ 2 的修订 → 空
+  assert.match((await harness.runCommand('self history')).text, /还没有修订记录/u)
+  // 过滤参数：没有匹配的 subject
+  assert.match((await harness.runCommand('self history definitely.absent')).text, /没有匹配/u)
+
+  // 造一条修订链：同 subject 的新认知取代旧认知
+  const again = await harness.runCommand('self set persona 深夜写东西时我会反复确认缩进与空行是否一致')
+  assert.equal(again.kind, 'success')
+  assert.match(again.text, /supersede/u)
+  const history = await harness.runCommand('self history')
+  assert.match(history.text, /self\.persona\.general/u)
+  assert.match(history.text, /archived/u)
+  assert.match(history.text, /旧 → 新/u)
+  // 过滤到 work：只有 1 条 active，链长为 1，不算修订链
+  assert.match((await harness.runCommand('self history self.work')).text, /没有匹配/u)
+
+  // reset：归档不删除，历史保留
+  const before = rowsOf(harness).length
+  const reset = await harness.runCommand('self reset persona')
+  assert.equal(reset.kind, 'success')
+  assert.match(reset.text, /已重置（persona）/u)
+  const after = rowsOf(harness)
+  assert.equal(after.length, before, 'reset 只能归档，不得删除')
+  assert.equal(after.filter((row) => row.facet === 'persona' && row.status === 'active').length, 0)
+  assert.equal(after.filter((row) => row.facet === 'work' && row.status === 'active').length, 1, 'reset persona 不得影响 work')
+  const resetBad = await harness.runCommand('self reset mood')
+  assert.equal(resetBad.kind, 'error')
+  assert.match(resetBad.text, /persona 或 work/u)
+  // 重置后再 reset（同一 facet）→ 没有可重置的条目
+  assert.match((await harness.runCommand('self reset persona')).text, /没有需要重置/u)
+
+  // help 与用法串同步
+  const help = await harness.runCommand('help')
+  assert.match(help.text, /self \[list\]/u)
+  assert.match(help.text, /self set <persona\|work> <正文>/u)
+  assert.match(help.text, /self history \[subject\]/u)
+  assert.match(help.text, /self reset \[persona\|work\]/u)
+  const hint = String((harness.command() as unknown as { input?: { hint?: string } }).input?.hint ?? '')
+  assert.match(hint, /self/u, '命令的 input.hint 也要提到 self')
+})
+
+// ---------------------------------------------------------------- 19. 反思提示：上限
+
+test('host#19 反思提示：每会话次数上限（默认上限 3 时第 4 次起不再注入）', async (t) => {
+  const harness = makeHarness({
+    config: { selfReflectEveryTurns: 1, selfReflectMinTurn: 1, selfReflectMaxPerSession: 3 },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const injectedAt: number[] = []
+  const firstMessages: Json[] = []
+  for (let turn = 1; turn <= 6; turn += 1) {
+    for (const message of await stepTurn(harness, turn)) {
+      if (sectionNameOf(message) === 'dsh-memory:self-reflect') {
+        injectedAt.push(turn)
+        firstMessages.push(message)
+      }
+    }
+  }
+  assert.deepEqual(injectedAt, [1, 2, 3], '每会话最多 3 次反思提示')
+
+  // 形状必须与 R2 完全一致（只有 sections[0].name 不同），正文用 REFLECT_NOTICE
+  const message = firstMessages[0]!
+  assert.equal(message.role, 'user')
+  assert.ok(typeof message.id === 'string' && (message.id as string).length > 0)
+  const source = message.source as Json
+  assert.equal(source.kind, 'runtime-context')
+  assert.equal(source.form, 'snapshot')
+  const sections = source.sections as Json[]
+  assert.equal(sections.length, 1)
+  assert.equal(sections[0]!.name, 'dsh-memory:self-reflect')
+  const content = message.content as Json[]
+  assert.equal(content.length, 1)
+  assert.equal(content[0]!.type, 'text')
+  assert.equal(content[0]!.text, REFLECT_NOTICE, '注入正文必须是 REFLECT_NOTICE（过 clampText）')
+  assert.equal(sections[0]!.text, content[0]!.text)
+  assert.match(String(content[0]!.text), /没有新认识就不要写/u)
+  assert.doesNotMatch(String(content[0]!.text), /\n/u, '注入正文必须折平单行')
+
+  // 计数只在真正注入后推进
+  const self = harness.reportState().self as Json
+  assert.equal(Number(self.reflections), 3)
+  assert.deepEqual(self.reflectTurns, [1, 2, 3])
+  assert.equal(Number(self.lastReflectTurn), 3)
+
+  // 上限是「每会话」而不是全局：换会话后配额重置
+  for (const message of await stepTurn(harness, 1, '轮次 1', 'session-2')) {
+    if (sectionNameOf(message) === 'dsh-memory:self-reflect') injectedAt.push(1001)
+  }
+  assert.deepEqual(injectedAt, [1, 2, 3, 1001], '新会话必须重新获得反思配额')
+  const nextSession = harness.reportState().self as Json
+  assert.equal(Number(nextSession.reflections), 1)
+  assert.deepEqual(nextSession.reflectTurns, [1])
+})
+
+// ---------------------------------------------------------------- 20. 反思提示：间隔与最小回合
+
+test('host#20 反思提示：最小回合与间隔闸门（minTurn=4、everyTurns=2）', async (t) => {
+  const harness = makeHarness({
+    config: { selfReflectEveryTurns: 2, selfReflectMinTurn: 4, selfReflectMaxPerSession: 10 },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const injectedAt: number[] = []
+  for (let turn = 1; turn <= 6; turn += 1) {
+    for (const message of await stepTurn(harness, turn)) {
+      if (sectionNameOf(message) === 'dsh-memory:self-reflect') injectedAt.push(turn)
+    }
+  }
+  assert.deepEqual(injectedAt, [4, 6], '过早（<4 回合）与间隔不足（<2 回合）都不提醒')
+})
+
+// ---------------------------------------------------------------- 21. 反思提示：dry/off/autoRecall=false
+
+test('host#21 反思提示：dry / off / autoRecall=false 时不注入且不推进计数', async (t) => {
+  const configs: Json[] = [{ recallMode: 'dry' }, { recallMode: 'off' }, { autoRecall: false }]
+  for (const config of configs) {
+    const harness = makeHarness({
+      config: { ...config, selfReflectEveryTurns: 1, selfReflectMinTurn: 1, selfReflectMaxPerSession: 3 },
+    })
+    try {
+      await harness.settle()
+      for (let turn = 1; turn <= 4; turn += 1) {
+        const decision = { kind: 'continue', messages: [{ role: 'user', content: [{ type: 'text', text: `轮次 ${turn}` }] }] }
+        const result = await harness.preStep(
+          { turn, agent: agentWith('C:\\work\\demo'), signal: { aborted: false } },
+          async () => decision,
+        )
+        assert.equal(result, decision, `${JSON.stringify(config)} 下必须原样返回 decision（不注入）`)
+      }
+      const self = harness.reportState().self as Json
+      assert.equal(Number(self.reflections), 0, `${JSON.stringify(config)} 不得推进反思计数`)
+      assert.deepEqual(self.reflectTurns, [], `${JSON.stringify(config)} 不得记录已提醒回合`)
+      assert.equal(self.lastReflectTurn, null, `${JSON.stringify(config)} 不得推进 lastReflectTurn`)
+    } finally {
+      await harness.dispose()
+    }
+  }
+})
+
+// ---------------------------------------------------------------- 22. 反思提示与 R2 的顺序
+
+test('host#22 pre-step：R2 快照在前、反思提示在后，各自单独一条消息', async (t) => {
+  const harness = makeHarness({
+    config: { recallMode: 'inject', selfReflectEveryTurns: 1, selfReflectMinTurn: 1, selfReflectMaxPerSession: 3 },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  await harness.memory().write({ kind: 'user_profile', text: '构建流程统一用 pnpm，产物输出到 dist 目录' })
+
+  const extra = await stepTurn(harness, 1, '请继续按构建流程用 pnpm 输出 dist')
+  assert.equal(extra.length, 2, 'R2 与反思提示必须各自单独追加一条')
+  assert.equal(sectionNameOf(extra[0]!), 'dsh-memory:recall', 'R2 在前')
+  assert.equal(sectionNameOf(extra[1]!), 'dsh-memory:self-reflect', '反思提示在后')
 })

@@ -18,7 +18,7 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 | 层 | 内容 | 作用域 | 注入 |
 |---|---|---|---|
 | 用户画像 | 用户偏好、环境、禁忌 | profile | 常驻（user-role 快照） |
-| Agent 自画像 | 「我该怎么工作」：用户定下的规矩、用户纠正、模型自评 | profile | 常驻（system prompt 段） |
+| Agent 自画像 | **我是谁、我怎么说话、我怎么工作**：人格 + 工作倾向两小节 | profile | 常驻（system prompt 段） |
 | 项目模糊印象 | 对某个工作区的粗颗粒印象（技术栈 / 构建 / 目录） | workspace | 常驻，且显式标注「模糊且可能过时」 |
 | 情景 / 语义 / 程序性 | 结论、事实、做法 | workspace | 按需召回 |
 
@@ -34,12 +34,42 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 3. **整合**：默认每 30 分钟一次 + 启动补跑。合并重复、把矛盾条目标记为失效（可恢复）、
    按类型半衰期衰减归档、对单一主题过多的条目做规则式摘要。
 
+## 自画像：人格 + 工作倾向
+
+自画像（`agent_self`）是**模型对自身的认知**，常驻注入 system prompt，分两小节：
+
+| 小节 | 内容 | subject |
+|---|---|---|
+| 人格 | 我是谁、我怎么说话、我重视什么 | `self.persona.*` |
+| 工作倾向 | 我擅长与不擅长什么、用户定下的规矩、用户纠正、模型自评 | `self.work.*` |
+
+- **机会式更新**：模型在对话与工作中主动写 —— `memory_write` 的 `kind: 'agent_self'` 可带 `facet`
+  （`'persona'` / `'work'`，缺省 `'work'`，仅对该 kind 有意义）；用户也可以用 `/memory self set` 直接设定。
+- **低频反思提示**：每隔 `selfReflectEveryTurns` 个回合（默认 12）注入一句反思提示（提示里写明
+  「没有新认识就不要写」），每会话至多 `selfReflectMaxPerSession` 次（默认 3），且本会话至少进行到
+  `selfReflectMinTurn` 回合（默认 4）才可能出现。可用 `selfReflectEnabled` 整体关掉；
+  `recallMode` 为 `dry`/`off` 时不注入（与按轮召回一致）。
+- **演化，而不是只增不减**：同一主题的新认知与旧条目相似度 ≥ `selfPortraitMergeThreshold`（默认 0.6）时
+  合并改写；低于阈值则视为改主意 —— 旧条目**归档留痕**（`status: 'archived'`，并带 `supersededBy` 指向
+  新条目），修订链可用 `/memory self history` 查看。
+- **用户所有物保护**：用户设定/确认过的条目（`origin: 'user_explicit'` 或 `pinned: true`）**模型不可覆盖**，
+  只能由用户侧的写入取代。
+- **优先级**：自画像只是**描述**、不是指令 —— 与用户当场的要求冲突时，**一律以用户为准**。
+
+```
+/memory self                             列出人格与工作两小节（各条带 id、来源、置信度）
+/memory self set <persona|work> <正文>    用户直接设定/覆盖（记为用户侧、固定、置信度 1）
+/memory self history [subject]            修订链：由旧到新（含归档时间）
+/memory self reset [persona|work]         归档当前自画像（保留历史，不删除）
+```
+
 ## 防「记忆污染 / 自激」
 
 - 自动捕获**只读真实用户消息**（插件自己注入的上下文不算）；
 - 模型自评若只是复述刚注入的内容，会被**回声剔除**；
 - 模型自评要进 system prompt 通道，必须**跨 ≥2 个不同会话复现**，且自评配额 ≤4/12 条；
 - **非用户侧来源永远不能推翻用户侧条目**（冲突时用户胜）；
+- 自画像的收敛改写对用户侧条目无效：模型**不能**覆盖 `user_explicit` / `pinned` 的自画像，只能改写自己写的；
 - 用户侧来源不衰减，只能由用户撤销。
 
 ---
@@ -86,7 +116,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置表单在哪
 
-插件导出 schemastery `Config`，其中 10 个可调字段声明为 `volatile()`；同时附带一个小的浏览器半边
+插件导出 schemastery `Config`，其中 17 个可调字段声明为 `volatile()`；同时附带一个小的浏览器半边
 （`src/client.ts`，构建为 `lib/client.js`）把它们渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
 （列表里的行卡片上还有一行摘要）。
 
@@ -107,6 +137,10 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 /memory refresh <id 前缀>                        刷新（衰减重新计时）
 /memory confirm <id 前缀>                        把模型自评升级为用户确认
 /memory reject <id 前缀>                         拒绝一条自我观察（同类不再产生）
+/memory self                                     自画像：列出人格与工作两小节
+/memory self set <persona|work> <正文>            直接设定/覆盖自画像（用户侧、固定、置信度 1）
+/memory self history [subject]                   自画像修订链（旧 → 新，含归档时间）
+/memory self reset [persona|work]                归档当前自画像（保留历史，不删除）
 /memory export [path]                            导出 JSON
 /memory import <path>                            导入 JSON（按指纹去重；逐字段校验、数值夹取、`pinned` 强制关闭、来源一律降级为 `observed`）
 /memory clear --all --yes                        永久清空全部（`--all` 与下面的筛选条件互斥）
@@ -120,24 +154,31 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 | 工具 | 用途 |
 |---|---|
-| `memory_write` | 结构化写入（`kind` + `text`，可选 `subject` / `field` / `value` / `scopeLevel`）。**写入来源由插件判定，模型不能自称「用户要求的」** |
+| `memory_write` | 结构化写入（`kind` + `text`，可选 `subject` / `field` / `value` / `scopeLevel`；`kind='agent_self'` 时可选 `facet: 'persona' | 'work'`）。**写入来源由插件判定，模型不能自称「用户要求的」** |
 | `memory_recall` | 按查询 / 类型 / 作用域 / 标签检索 |
 | `memory_list` | 按确定性顺序列出 |
 | `memory_forget` | 按 id 删除；按 query 删除需 `confirm: true`（预览阈值更严） |
 | `memory_maintain` | 手动触发整合（合并 / 失效 / 归档 / 摘要） |
 | `memory_stats` | 运行时可观测：条数、写入 / 拒绝计数、注入行数、渲染耗时 |
-| `memory_explain` | 诊断：一段文本会命中哪条信号、被哪条规则排除、会写成什么 |
+| `memory_explain` | 诊断：一段文本会命中哪条信号、被哪条规则排除、会写成什么（自画像条目额外显示 `facet` 与 `supersededBy`） |
 
 ## 配置
 
-在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 10 个字段：
+在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 17 个字段：
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
 | `domainName` | `dsh_memory` | 领域名（兼作落盘目录名） |
 | `maxInjectedTokens` | `300` | 常驻注入的硬 token 上限 |
 | `maxItemTokens` | `60` | 单条记忆注入长度上限 |
-| `selfPortraitMaxTokens` | `120` | 自画像段预算 |
+| `selfPortraitMaxTokens` | `120` | 工作两小节共享的自画像段预算 |
+| `selfPortraitEnabled` | `true` | 自画像（人格 + 工作两小节）常驻注入的开关；表单里 `0`=关、`1`=开 |
+| `selfPersonaMaxTokens` | `80` | 人格小节的独立预算 |
+| `selfPortraitMergeThreshold` | `0.6` | 新认知与旧条目合并改写的相似度阈值（低于则归档旧条目并由新条目取代） |
+| `selfReflectEnabled` | `true` | 低频反思提示开关；表单里 `0`=关、`1`=开 |
+| `selfReflectEveryTurns` | `12` | 两次反思提示之间的最小回合间隔 |
+| `selfReflectMinTurn` | `4` | 本会话最小回合数（太早没有素材） |
+| `selfReflectMaxPerSession` | `3` | 每会话最多提醒几次 |
 | `recallMode` | `inject` | `off` / `dry`（只算不注入）/ `inject` |
 | `recallTopK` | `8` | 每轮最多召回几条 |
 | `captureMode` | `rule` | `off` / `rule` |
@@ -216,7 +257,7 @@ node tools/scan-asar.ts settingsNumberField       # 定位某个符号在 app.as
 - **跨会话全文检索通常不可用**：会话查询索引出厂是 `openAt: never`，因此本插件自建词面索引，
   历史回指只用精确读取。
 - **检索是词面匹配**：CJK bigram + 拉丁词干 + 记忆侧覆盖率；同义改写级别的召回需要向量检索，属后续工作。
-- **没有图形化的记忆浏览**：界面只提供配置；浏览、删除、固定记忆走上面 16 条命令与 7 个模型工具。
+- **没有图形化的记忆浏览**：界面只提供配置；浏览、删除、固定记忆走上面列出的 `/memory` 命令与 7 个模型工具。
 - **两项设计显式降级**：① 自画像不与部署的 persona 文本去重；② 若部署注册了会把其它 prompt 段挤掉的
   `complete` 段，自画像段会随之消失，插件**不会**自动改走 `context()` 通道。
 - **端到端增益（有记忆 vs 全上下文）未自动化**：离线评测只测召回链路本身；Δ 是文档化的手工流程

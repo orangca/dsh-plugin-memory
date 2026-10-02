@@ -3,6 +3,53 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.4 — 2026-10-02
+
+**Self-portrait v2: from work agreements to self-cognition — and it evolves.** `agent_self` no longer only records
+"how I should work"; it records who the model is, how it speaks, what it values and where it is strong or weak, and
+it converges as the model learns instead of only accumulating.
+
+### Added
+
+- **Persona + work tendencies.** Self-portrait rows now carry a `facet`: `self.persona.*` (persona) and
+  `self.work.*` (work tendencies). The persona subsection renders first; the two work subsections keep their
+  existing headers, and rows without a `facet` are read as `work`, so 0.5.x stores stay valid.
+- **Opportunistic updates.** `memory_write` takes an optional `facet` (meaningful only for `kind: 'agent_self'`),
+  and every self-portrait write goes through `planPortraitUpdate`, which decides add / reinforce / refine /
+  supersede / skip instead of blindly appending. `state.self` counters (`added`, `refined`, `superseded`,
+  `skipped`) are surfaced by `memory_stats`.
+- **Low-frequency reflection prompt.** From turn `selfReflectMinTurn` (default 4), at most every
+  `selfReflectEveryTurns` turns (default 12) and at most `selfReflectMaxPerSession` times per session (default 3),
+  the `agent/pre-step` hook appends one `runtime-context` message (`dsh-memory:self-reflect`) inviting the model to
+  reconsider its self-portrait — and telling it to write nothing when there is nothing new. With `recallMode` set to
+  `dry` or `off` it is never injected and the counters do not advance.
+- **`/memory self` commands**: `self` (list both subsections with id, origin and confidence), `set <persona|work>
+  <text>` (writes a user-side, pinned, confidence-1 row), `history [subject]` (the revision chain, old → new) and
+  `reset [persona|work]` (archive, never delete). `/memory help` and the usage line document them.
+- **Seven new tunable fields**, all `volatile()` and exposed in the settings form: `selfPortraitEnabled`,
+  `selfPersonaMaxTokens`, `selfPortraitMergeThreshold`, `selfReflectEnabled`, `selfReflectEveryTurns`,
+  `selfReflectMinTurn`, `selfReflectMaxPerSession`.
+- `memory_explain` shows `facet` and (when present) `supersededBy`.
+
+### Changed
+
+- **Conflicts converge, with a paper trail.** A same-subject insight at or above `selfPortraitMergeThreshold`
+  (default 0.6) is merged (`refine`) or, when the texts already overlap, reinforced; below the threshold the model
+  changed its mind, so the old row is archived with `supersededBy` pointing at its replacement. The revision chain
+  stays readable through `portraitHistory` and `/memory self history`.
+- **User-owned self-portrait rows are protected.** A candidate that does not itself come from the user side can no
+  longer refine or supersede a row that is `user_explicit` / `user_correction` or `pinned` — the decision degrades
+  to `skip` (`user-owned`). The model can only rewrite what it wrote itself.
+- **The persona subsection has its own budget** (`selfPersonaMaxTokens`, default 80) while the two work
+  subsections keep sharing `selfPortraitMaxTokens`; inside the persona subsection, user-side rows render before
+  model self-observations.
+- The settings form grows from 10 to 17 fields. The two boolean keys (`selfPortraitEnabled`, `selfReflectEnabled`)
+  are entered as `0`/`1` in the form but are still written as **real booleans** — the settings service validates
+  JSON shape only, so a number would reach the profile patch and then fail the `Schema.boolean()` re-parse.
+- Both READMEs rewrite the self-portrait chapter: persona + work, opportunistic updates, the reflection prompt, the
+  revision/archival semantics, the user-ownership guarantee, the priority rule (*the user's in-the-moment
+  instruction beats the self-portrait*) and the new commands and keys.
+
 ## 0.5.3 — 2026-10-02
 
 Performance pass on the hot paths, driven by a new benchmark (`pnpm bench`).

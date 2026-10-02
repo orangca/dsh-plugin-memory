@@ -1,5 +1,5 @@
-import type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel } from './types.js';
-export type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, } from './types.js';
+import type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet } from './types.js';
+export type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet, } from './types.js';
 /** `makeRecord` 的入参：`MakeRecordInput` 再加 `sessionId`（types.ts 目前缺这个字段）。 */
 export interface MakeRecordInputWithSession extends MakeRecordInput {
     sessionId?: string;
@@ -103,7 +103,14 @@ export declare function workspaceKeyOf(cwd: unknown): string | null;
 export declare function fillWithinBudget(records: Iterable<MemoryRecord>, budgetTokens: number, render: (record: MemoryRecord, text: string) => string, cfg: MemoryConfig): BudgetFill<MemoryRecord>;
 /** 自画像准入（设计稿 §7.3）：用户侧来源直接进；模型自评必须跨 ≥N 个不同会话复现。 */
 export declare function isSelfPortraitEligible(record: MemoryRecord, cfg: MemoryConfig): boolean;
-/** 自画像块（section 通道）：用户确认的约定与模型自评**必须分开成块**（设计稿 §7.3）。 */
+/** 自画像块（section 通道）：**人格小节在前**，工作两节在后（M6 §3）。
+ *
+ *  · 人格小节（`facet='persona'`）用独立预算 `cfg.selfPersonaMaxTokens`；块内**用户侧优先**，
+ *    模型自评只吃余额，两组的条数各自受 `cfg.selfPortraitMaxSelfObserved` 约束；
+ *    页脚是安全声明（描述而非指令），因此只要小节非空就必须带页脚。
+ *  · 工作两节（`facet` 缺失 → `'work'`，存量兼容）沿用 0.5.x 的文案与预算口径：
+ *    两节共享 `cfg.selfPortraitMaxTokens`，用户确认的约定优先，总长（含块头页脚）不超上限。
+ */
 export declare function renderSelfBlock(records: Iterable<MemoryRecord>, cfg: MemoryConfig): RenderedBlock;
 /** 召回块（context 通道）：用户画像/事实 + 当前 workspace 的项目模糊印象。
  *  常驻注入只收 profile 级与「当前 workspace」级；session 级属于临时上下文，永不常驻。 */
@@ -191,4 +198,122 @@ export declare function deriveSubject(text: unknown, prefix?: string): string | 
 export declare function composeSubjectSummary(records: Iterable<MemoryRecord>, cfg: MemoryConfig): SubjectSummary[];
 /** 从 compaction 摘要的 ContentBlock[] 里取纯文本（压缩固化用）。 */
 export declare function extractSummaryText(summaryBlocks: unknown): string;
+/** 人格小节的块头。 */
+export declare const PERSONA_HEADER: string;
+/**
+ * 人格小节的页脚：**安全声明**（契约 §6，不可妥协）。
+ * 自画像是模型对自己的**描述**，不是用户给的指令；它不能变成任何授权。
+ */
+export declare const PERSONA_FOOTER: string;
+/** 工作小节块头：0.5.x 既有文案，向后兼容。 */
+export declare const WORK_CONFIRMED_HEADER: string;
+/** 自我观察块头：0.5.x 既有文案。 */
+export declare const WORK_OBSERVED_HEADER: string;
+/** 自我观察块尾：0.5.x 既有文案。 */
+export declare const WORK_OBSERVED_FOOTER: string;
+/**
+ * 低频反思提示正文（约 60–90 token 的固定文案，契约 §3/§6）。
+ *
+ * 三条硬约束（§6）：
+ *  1. 必须写明「没有新认识就不要写」——反思是机会而不是任务，否则会变成自激式刷写；
+ *  2. 必须挡住模型改写用户的所有物（`user_profile`、用户设定或确认过的条目）；
+ *  3. 不得给出任何超越用户与安全边界的自我授权。
+ *
+ * 过 `clampText`：注入正文一律折平成单行，防止用换行伪造块结构（§6）。
+ * 预算用 120 token（而不是 `maxItemTokens`）：本提示按段落级注入，不该被条目级预算截断。
+ */
+export declare const REFLECT_NOTICE: string;
+/** 解析任意输入为 facet；无法识别时返回 `fallback`（默认 `'work'`，即 0.5.x 的存量语义）。 */
+export declare function normalizeFacet(value: unknown, fallback?: SelfFacet): SelfFacet;
+/** 记录的 facet：`agent_self` 且无 `facet` 字段 → `'work'`（0.5.x 的存量条目都是工作约定）。 */
+export declare function facetOf(record: MemoryRecord): SelfFacet;
+/** 规范 subject：`self.persona.voice` / `self.work.strengths`。 */
+export declare function portraitSubjectFor(facet: SelfFacet, key: string): string;
+/** 自画像收敛决策的输入（模型侧候选）。 */
+export interface PortraitCandidate {
+    text: string;
+    facet: SelfFacet;
+    subject: string;
+    origin: MemoryOrigin;
+    confidence: number;
+    observedAt?: number;
+}
+/** 收敛动作：新建 / 强化 / 合并改写 / 取代归档 / 不写。 */
+export type PortraitAction = 'add' | 'reinforce' | 'refine' | 'supersede' | 'skip';
+/** 收敛决策：宿主按它落盘（见契约 §4.1）。 */
+export interface PortraitDecision {
+    action: PortraitAction;
+    /** 被 reinforce/refine/supersede 命中的既有条目 id；add/skip 时为 null。 */
+    targetId: string | null;
+    /** 最终要写入的正文（已过 `clampText`：单行、条目预算内）。 */
+    text: string;
+    /** 最终置信度（已夹到 0–1）。 */
+    confidence: number;
+    /** 可读原因，写进工具返回值与 stats：`added` / `reinforced` / `refined` / `superseded` / `too-short` / `user-owned`。 */
+    reason: string;
+    /** supersede 时是否把 target 归档（并写 `supersededBy`）。 */
+    archiveTarget: boolean;
+}
+/** 自画像正文的最小长度（去空白后 < 8 字符没有信息量）。 */
+export declare const PORTRAIT_MIN_TEXT_CHARS = 8;
+/**
+ * 自画像收敛决策：**纯函数、确定性**（契约 §3 的规则，按顺序判定）。
+ *
+ *  1. 正文去空白后 < 8 字符 → `skip` / `'too-short'`
+ *  2. 同 subject + 同 facet 的 active 条目里：
+ *     a. 指纹相同（归一化文本相等）或一方包含另一方 → `reinforce`
+ *        （取更长文本；confidence 取两者较大者 +0.05，上限 1）
+ *     b. 相似度 ≥ `cfg.selfPortraitMergeThreshold`（默认 0.6）→ `refine`（合并文本；confidence 取较大者）
+ *     c. 否则 → 认知变化 → `supersede`（`archiveTarget: true`）
+ *  3. 无同 subject 条目 → `add`
+ *  4. **用户所有物保护**：target 的 origin 是 user_explicit/user_correction 或 pinned=true 时，
+ *     候选必须**同样来自用户侧**才允许 refine/supersede；否则：
+ *       · `refine` / `supersede` → `skip` / `'user-owned'`
+ *       · `reinforce` → **仅当双方归一化文本完全相同**时才允许（只累加 confidence，
+ *         正文逐字保留 target 原文）；只要候选文本与 target 不同（哪怕只是「包含」）→
+ *         `skip` / `'user-owned'`
+ *     ⚠ 为什么 reinforce 也要管：reinforce 在「一方包含另一方」时取更长的一条，模型只要写一句
+ *     包含 pinned 条目全部 token 的长句，就能把自己的话写进用户设定的条目——违反 §6 的意图。
+ *
+ * 实现细节（不改语义，只是把「选哪条」定死以便确定性）：
+ *  · 候选没有 scope，因此「指纹」以**归一化文本相等**判定；
+ *  · 同 subject 有多条 active 时按 指纹 > 包含 > 相似度 > `compareRecords` 排序取第一条；
+ *  · 正文一律过 `clampText`（单行 + 条目预算），防止结构伪造（契约 §6）。
+ */
+export declare function planPortraitUpdate(candidate: PortraitCandidate, existing: Iterable<MemoryRecord>, cfg: MemoryConfig): PortraitDecision;
+/** 一条修订链：同一 subject + facet 下由旧到新的自画像条目。 */
+export interface PortraitRevision {
+    subject: string;
+    facet: SelfFacet;
+    /** 由旧到新。 */
+    chain: MemoryRecord[];
+}
+/**
+ * 修订链：把 `supersededBy` / `supersedes` 互为反向的指针串起来（链内按 `observedAt` 升序 = 由旧到新）。
+ *
+ * 只返回**真的发生过修订**的组（链长 ≥ 2）：单条 active 条目不是历史，`/memory self` 已经会列出它。
+ * 返回值按「最新一条修订时间」倒序（新的修订在前），同刻按 subject 稳定排序。
+ */
+export declare function portraitHistory(records: Iterable<MemoryRecord>): PortraitRevision[];
+/** 反思提醒闸门的输入（契约 §3）。 */
+export interface ReflectInput {
+    /** 当前回合号。 */
+    turn: number;
+    /** 本会话上一次反思提醒的回合号；从未提醒过为 null。 */
+    lastReflectTurn: number | null;
+    /** 本会话已提醒次数。 */
+    reflectionsThisSession: number;
+    /** 本会话已进行的回合数。 */
+    sessionTurns: number;
+}
+/**
+ * 反思提醒闸门（纯函数）：`enabled=false` / 已达每会话上限 / 未到最小回合 / 未到间隔 → false。
+ *
+ * 口径：
+ *  · 「最小回合」看 `sessionTurns`（契约 §3.1 说的是**本会话**最小回合数，太早没素材）；
+ *    `sessionTurns` 缺失或非有限时退化为 `turn`，避免上游漏传时永远不提醒。
+ *  · 「间隔」看 `turn - lastReflectTurn`（两者都是回合号）；从未提醒过（null）不受间隔约束。
+ *  · `selfReflectMaxPerSession <= 0`（或 NaN）视为关闭；`Infinity` 视为不限次数。
+ */
+export declare function shouldReflect(input: ReflectInput, cfg: MemoryConfig): boolean;
 //# sourceMappingURL=lib.d.ts.map

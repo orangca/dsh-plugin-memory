@@ -87,11 +87,19 @@ const zh = {
   unavailable: '该插件当前未加载，暂时无法配置。',
   invalidNumber: '请填数字；留空表示使用默认值。',
   invalidValue: '取值不合法，请检查。',
+  invalidToggle: '只接受 0 或 1；留空表示使用默认值。',
   required: '必填',
   domainName: '记忆库名',
   maxInjectedTokens: '常驻注入预算（token）',
   maxItemTokens: '单条记忆长度上限',
   selfPortraitMaxTokens: '自画像段预算',
+  selfPortraitEnabled: '自画像开关',
+  selfPersonaMaxTokens: '人格小节预算（token）',
+  selfPortraitMergeThreshold: '自画像收敛阈值',
+  selfReflectEnabled: '反思提示开关',
+  selfReflectEveryTurns: '反思最小间隔（回合）',
+  selfReflectMinTurn: '反思起始回合',
+  selfReflectMaxPerSession: '每会话反思上限',
   recallMode: '按轮召回模式',
   recallTopK: '每轮召回条数',
   captureMode: '自动捕获',
@@ -102,6 +110,13 @@ const zh = {
   hintMaxInjectedTokens: '常驻注入的 token 硬上限；块头尾的固定文案也计入。',
   hintMaxItemTokens: '单条记忆注入时的截断长度。',
   hintSelfPortraitMaxTokens: '自画像段的独立预算。',
+  hintSelfPortraitEnabled: '0=关、1=开；默认 1（开）。关掉后人格与工作两小节不再常驻注入，已有条目仍可检索。',
+  hintSelfPersonaMaxTokens: '「人格」小节的独立 token 预算；默认 80。工作两小节共享上面的「自画像段预算」。',
+  hintSelfPortraitMergeThreshold: '0–1，默认 0.6。新认知与同主题旧条目相似度 ≥ 阈值时合并改写；低于阈值视为改主意：旧条目归档留痕、由新条目取代（用户设定的条目模型不可覆盖）。',
+  hintSelfReflectEnabled: '0=关、1=开；默认 1（开）。按下面的间隔注入一句低频反思提示，提醒模型自省要不要更新自画像。',
+  hintSelfReflectEveryTurns: '两次反思提示之间至少间隔多少回合；默认 12。',
+  hintSelfReflectMinTurn: '本会话至少进行到第几回合才允许提醒（太早没有素材）；默认 4。',
+  hintSelfReflectMaxPerSession: '每个会话最多提醒几次；默认 3，到达上限后本会话不再提醒。',
   hintRecallMode: 'off=关闭按轮召回；dry=只计算不注入（观察用）；inject=正常注入。注意它不影响常驻注入。',
   hintRecallTopK: '每轮最多召回几条。',
   hintCaptureMode: 'off=停止自动写入（模型工具仍可用）；rule=按规则自动捕获。',
@@ -126,11 +141,19 @@ const en = {
   unavailable: 'This plugin is not loaded, so it cannot be configured right now.',
   invalidNumber: 'Enter a number, or leave blank to use the default.',
   invalidValue: 'Invalid value; please check it.',
+  invalidToggle: 'Enter 0 or 1, or leave blank to use the default.',
   required: 'Required',
   domainName: 'Memory store name',
   maxInjectedTokens: 'Resident injection budget (tokens)',
   maxItemTokens: 'Per-memory length cap',
   selfPortraitMaxTokens: 'Self-portrait budget',
+  selfPortraitEnabled: 'Self-portrait switch',
+  selfPersonaMaxTokens: 'Persona section budget (tokens)',
+  selfPortraitMergeThreshold: 'Self-portrait merge threshold',
+  selfReflectEnabled: 'Reflection prompt switch',
+  selfReflectEveryTurns: 'Reflection interval (turns)',
+  selfReflectMinTurn: 'Earliest reflection turn',
+  selfReflectMaxPerSession: 'Reflections per session',
   recallMode: 'Per-turn recall mode',
   recallTopK: 'Recalled per turn',
   captureMode: 'Automatic capture',
@@ -141,6 +164,13 @@ const en = {
   hintMaxInjectedTokens: 'Hard token cap for resident injection; the fixed block header/footer counts too.',
   hintMaxItemTokens: 'Truncation length for one injected memory.',
   hintSelfPortraitMaxTokens: 'Separate budget for the self-portrait block.',
+  hintSelfPortraitEnabled: '0 = off, 1 = on; default 1 (on). When off, neither the persona nor the work sections are injected; existing rows stay searchable.',
+  hintSelfPersonaMaxTokens: 'Separate token budget for the persona section; default 80. The two work sections share the self-portrait budget above.',
+  hintSelfPortraitMergeThreshold: '0–1, default 0.6. A new insight is merged into the same-subject row when similarity is at or above this threshold; below it the model changed its mind — the old row is archived for the record and superseded (rows the user set are never overwritten by the model).',
+  hintSelfReflectEnabled: '0 = off, 1 = on; default 1 (on). Injects one low-frequency reflection prompt at the interval below, inviting the model to reconsider its self-portrait.',
+  hintSelfReflectEveryTurns: 'Minimum number of turns between two reflection prompts; default 12.',
+  hintSelfReflectMinTurn: 'Earliest session turn that may carry a prompt (too early means nothing to reflect on); default 4.',
+  hintSelfReflectMaxPerSession: 'Maximum reflection prompts per session; default 3 — once reached, the session stays quiet.',
   hintRecallMode: 'off = no per-turn recall; dry = compute but do not inject; inject = normal. Does not affect resident injection.',
   hintRecallTopK: 'Maximum recalled memories per turn.',
   hintCaptureMode: 'off = stop automatic writes (model tools still work); rule = rule-based capture.',
@@ -163,6 +193,11 @@ interface BaseField {
 
 interface NumberField extends BaseField {
   kind: 'number'
+  /**
+   * 这个字段在 Host 侧是**布尔**，界面上用 0/1 表达（见 `booleanZeroOneField`）。
+   * 只影响取哪条转换规格与非法文案，控件仍是原语的数字输入。
+   */
+  bool01?: boolean
 }
 interface TextField extends BaseField {
   kind: 'text'
@@ -180,12 +215,20 @@ type Field = NumberField | TextField | BooleanField | EnumField
 /**
  * 卡片编辑的字段：与 Host 侧 `Config` 里标了 `volatile()` 的字段一一对应。
  * kind 决定控件：number/text 用框架的 SettingsValueField；boolean/enum 用原生控件（避免依赖未确认的原语 API）。
+ * `bool01: true` 的 number 字段在 Host 侧其实是布尔，只是界面上按契约用 0/1 表达（见 `booleanZeroOneField`）。
  */
 const FIELDS: readonly Field[] = [
   { name: 'domainName', kind: 'text', group: 'groupStore' },
   { name: 'maxInjectedTokens', kind: 'number', group: 'groupRecall' },
   { name: 'maxItemTokens', kind: 'number', group: 'groupRecall' },
   { name: 'selfPortraitMaxTokens', kind: 'number', group: 'groupRecall' },
+  { name: 'selfPortraitEnabled', kind: 'number', bool01: true, group: 'groupRecall' },
+  { name: 'selfPersonaMaxTokens', kind: 'number', group: 'groupRecall' },
+  { name: 'selfPortraitMergeThreshold', kind: 'number', group: 'groupRecall' },
+  { name: 'selfReflectEnabled', kind: 'number', bool01: true, group: 'groupRecall' },
+  { name: 'selfReflectEveryTurns', kind: 'number', group: 'groupRecall' },
+  { name: 'selfReflectMinTurn', kind: 'number', group: 'groupRecall' },
+  { name: 'selfReflectMaxPerSession', kind: 'number', group: 'groupRecall' },
   { name: 'recallMode', kind: 'enum', options: ['off', 'dry', 'inject'], group: 'groupRecall' },
   { name: 'recallTopK', kind: 'number', group: 'groupRecall' },
   { name: 'captureMode', kind: 'enum', options: ['off', 'rule'], group: 'groupCapture' },
@@ -220,10 +263,38 @@ function customSpec(field: BooleanField | EnumField): SettingsFieldSpec {
   }
 }
 
+/**
+ * 布尔字段的「0/1」转换规格：控件复用原语的数字输入（`settingsNumberField` 的格式与数字校验），
+ * 但**写回的值是真布尔**。
+ *
+ * 为什么不能直接写 0/1 数字：Host 侧这两个键是 `Schema.boolean()`（契约 3.1），
+ * 而 settings 服务只做 JSON 形状校验（`cloneJsonShaped`）不做类型转换，数字会一路落进 profile patch，
+ * 再在 volatile 重解析时抛 `$.selfPortraitEnabled expected boolean but got 0`（schemastery 实测），
+ * 于是「关掉自画像」反而会把插件配置弄坏。所以 0/1 只作为**界面语义**，落盘仍是布尔。
+ *
+ * 空草稿 = 清除覆盖；0/1 之外的值返回 undefined，让框架标为 invalid。
+ */
+function booleanZeroOneField(field: string): SettingsFieldSpec {
+  const numeric = settingsNumberField(field)
+  return {
+    field,
+    format: (value: unknown): string => (value === true ? '1' : value === false ? '0' : ''),
+    parse: (text: string) => {
+      const write = numeric.parse(text)
+      if (!write || write.kind !== 'set') return write
+      if (write.value === 0) return { kind: 'set', value: false }
+      if (write.value === 1) return { kind: 'set', value: true }
+      return undefined
+    },
+  }
+}
+
 /** 字段 → 转换规格：数字与文本用原语，布尔与枚举用上面的自定义规格。 */
 function specs(): SettingsFieldSpec[] {
   return FIELDS.map((field) => {
-    if (field.kind === 'number') return settingsNumberField(field.name)
+    if (field.kind === 'number') {
+      return field.bool01 ? booleanZeroOneField(field.name) : settingsNumberField(field.name)
+    }
     if (field.kind === 'text') return settingsTextField(field.name)
     return customSpec(field)
   })
@@ -298,7 +369,7 @@ function renderField(field: Field, state: MemoryCardState, props: MemoryCardActi
       hint: t(`hint${field.name.charAt(0).toUpperCase()}${field.name.slice(1)}`),
       overriddenLabel: t('overridden'),
       resetLabel: t('reset'),
-      invalidLabel: field.kind === 'number' ? t('invalidNumber') : t('invalidValue'),
+      invalidLabel: field.kind === 'number' ? (field.bool01 ? t('invalidToggle') : t('invalidNumber')) : t('invalidValue'),
       numeric: field.kind === 'number',
       disabled: !state.writable,
       ...view,

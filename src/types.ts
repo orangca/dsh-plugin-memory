@@ -9,6 +9,13 @@
 
 export type MemoryKind = 'user_profile' | 'agent_self' | 'project_gist' | 'episodic' | 'semantic' | 'procedural'
 export type MemoryOrigin = 'user_explicit' | 'user_correction' | 'model_proposed' | 'observed'
+/**
+ * 自画像（M6）的两个小节：
+ *  · `persona` —— 「我是谁、我怎么说话、我重视什么」；
+ *  · `work`    —— 工作倾向（工作约定 + 自我观察）。
+ * 仅 `agent_self` 记录使用。
+ */
+export type SelfFacet = 'persona' | 'work'
 export type MemoryStatus = 'active' | 'invalid' | 'archived'
 export type MemoryPrecision = 'exact' | 'gist'
 export type ScopeLevel = 'profile' | 'workspace' | 'session'
@@ -49,6 +56,10 @@ export interface MemoryRecord {
   status: MemoryStatus
   invalidAt: number | null
   supersedes: string[]
+  /** 仅 `agent_self` 使用；缺失时按 `'work'` 处理（0.5.x 的存量条目都是工作约定）。 */
+  facet?: SelfFacet
+  /** 本条被谁取代（归档时写入；与 `supersedes` 互为反向指针）。 */
+  supersededBy?: string
   observedAt: number
   eventTime: number | null
   lastUsedAt: number | null
@@ -75,6 +86,10 @@ export interface MakeRecordInput {
   pinned?: boolean
   status?: MemoryStatus
   supersedes?: string[]
+  /** 自画像小节（仅 `kind: 'agent_self'` 有意义）；缺失即 `'work'`。 */
+  facet?: SelfFacet
+  /** 本条被谁取代（归档时写入）。 */
+  supersededBy?: string
   observedAt?: number
   eventTime?: number | null
   lastUsedAt?: number | null
@@ -125,6 +140,20 @@ export interface MemoryConfig {
   selfPortraitMaxTokens: number
   selfPortraitMaxItems: number
   selfPortraitMaxSelfObserved: number
+  /** M6：自画像三小节的开关（人格 + 工作两节）。 */
+  selfPortraitEnabled: boolean
+  /** M6：人格小节的 token 预算（工作两节仍共享 `selfPortraitMaxTokens`）。 */
+  selfPersonaMaxTokens: number
+  /** M6：自画像 refine（合并改写）的相似度阈值。 */
+  selfPortraitMergeThreshold: number
+  /** M6：低频反思提示开关。 */
+  selfReflectEnabled: boolean
+  /** M6：两次反思提醒之间的最小回合间隔。 */
+  selfReflectEveryTurns: number
+  /** M6：本会话最小回合数（太早没素材）。 */
+  selfReflectMinTurn: number
+  /** M6：每会话最多提醒几次。 */
+  selfReflectMaxPerSession: number
   gistBudgetRatio: number
   charsPerToken: number
   sectionOrder: number
