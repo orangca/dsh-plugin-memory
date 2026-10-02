@@ -154,6 +154,12 @@ export interface MemoryConfig {
   selfReflectMinTurn: number
   /** M6：每会话最多提醒几次。 */
   selfReflectMaxPerSession: number
+  /** M7：初次设定（称呼）开关。 */
+  selfIntroEnabled: boolean
+  /** M7：本会话至少几回合后再问称呼（别一上来就查户口）。 */
+  selfIntroMinTurn: number
+  /** M7：**跨会话**累计最多问几次称呼，问满即永久停手。 */
+  selfIntroMaxAsks: number
   gistBudgetRatio: number
   charsPerToken: number
   sectionOrder: number

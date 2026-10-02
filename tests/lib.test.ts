@@ -32,11 +32,14 @@ import {
   fnv1a,
   isEcho,
   isSelfPortraitEligible,
+  INTRO_NOTICE,
   lexicalMatch,
   listActive,
   makeRecord,
   maskPii,
   memoryMatch,
+  NAMING_SUBJECTS,
+  namingSettled,
   normalizeFacet,
   normalizeText,
   pickMergeGroups,
@@ -49,6 +52,7 @@ import {
   renderSelfBlock,
   scanSensitive,
   shouldArchive,
+  shouldIntroduce,
   shouldReflect,
   similarity,
   tokenCacheSize,
@@ -1065,4 +1069,82 @@ test('makeRecord：facet / supersedes / supersededBy 透传；缺失时不写键
   assert.equal('facet' in legacy, false)
   assert.equal('supersededBy' in legacy, false)
   assert.deepEqual(legacy.supersedes, [])
+})
+
+// ---------------------------------------------------------------- M7 初次设定（称呼）
+
+test('namingSettled：命名 subject 有过记录即算确定（archived 也算，invalid 不算）', () => {
+  assert.equal(namingSettled([]), false)
+  assert.equal(namingSettled([makeRecord({ kind: 'semantic', text: '构建产物在 dist 目录' })]), false)
+  assert.deepEqual([...NAMING_SUBJECTS], ['self.persona.name', 'self.persona.address_user', 'self.persona.address_self'])
+
+  const named = makeRecord({ kind: 'agent_self', facet: 'persona', subject: 'self.persona.name', text: '我叫小忆。' })
+  assert.equal(namingSettled([named]), true)
+  // archived 也算：谈过了就不再追问（反复问比名字不完美更烦人）
+  assert.equal(namingSettled([{ ...named, status: 'archived' }]), true)
+  // 被 reject（invalid）不算：允许再问一次
+  assert.equal(namingSettled([{ ...named, status: 'invalid' }]), false)
+  // 其它 subject 不算
+  assert.equal(namingSettled([
+    makeRecord({ kind: 'agent_self', facet: 'persona', subject: 'self.persona.voice', text: '我说话直接。' }),
+  ]), false)
+})
+
+test('shouldIntroduce：四道闸门（关闭 / 已确定 / 满次数 / 未到回合）', () => {
+  const testCfg: MemoryConfig = { ...cfg, selfIntroEnabled: true, selfIntroMinTurn: 2, selfIntroMaxAsks: 2 }
+  assert.equal(shouldIntroduce({ turn: 1, asks: 0, settled: false }, testCfg), false, '未到最小回合不问')
+  assert.equal(shouldIntroduce({ turn: 2, asks: 0, settled: false }, testCfg), true)
+  assert.equal(shouldIntroduce({ turn: 9, asks: 0, settled: true }, testCfg), false, '已确定不问')
+  assert.equal(shouldIntroduce({ turn: 9, asks: 2, settled: false }, testCfg), false, '问满两次停手')
+  assert.equal(shouldIntroduce({ turn: 9, asks: 1, settled: false }, testCfg), true)
+  assert.equal(shouldIntroduce({ turn: 9, asks: 0, settled: false }, { ...testCfg, selfIntroEnabled: false }), false)
+  assert.equal(shouldIntroduce({ turn: 9, asks: 0, settled: false }, { ...testCfg, selfIntroMaxAsks: 0 }), false, '0 视为关闭')
+  assert.equal(
+    shouldIntroduce({ turn: 9, asks: 0, settled: false }, { ...testCfg, selfIntroMaxAsks: Number.POSITIVE_INFINITY }),
+    true,
+    'Infinity 视为不限次数',
+  )
+  assert.equal(shouldIntroduce({ turn: Number.NaN, asks: Number.NaN, settled: false }, testCfg), false, '回合号非法时不问')
+})
+
+test('planPortraitUpdate：命名 subject 放宽 too-short 门槛（称呼天生很短）', () => {
+  const naming = (text: string) => planPortraitUpdate({
+    text,
+    facet: 'persona',
+    subject: portraitSubjectFor('persona', 'name'),
+    origin: 'user_explicit',
+    confidence: 1,
+  }, [], cfg)
+  // 「我叫小忆。」5 字符：通用门槛是 8 字符，会被静默跳过；命名 subject 必须放行
+  assert.equal(naming('我叫小忆。').action, 'add')
+  assert.equal(naming('用户叫我「忆」').action, 'add')
+  // 空/单字符仍然拒绝
+  assert.equal(naming('忆').action, 'skip')
+  assert.equal(naming('  ').action, 'skip')
+  // 非命名 subject 仍用 8 字符门槛（回归：别把通用规则一起放开）
+  const ordinary = planPortraitUpdate({
+    text: '我说话简短。',
+    facet: 'persona',
+    subject: portraitSubjectFor('persona', 'voice'),
+    origin: 'model_proposed',
+    confidence: 0.9,
+  }, [], cfg)
+  assert.equal(ordinary.action, 'skip')
+  assert.equal(ordinary.reason, 'too-short')
+})
+
+test('INTRO_NOTICE：单行、克制，且四条硬要求齐全', () => {
+  assert.equal(INTRO_NOTICE.includes('\n'), false, '必须折平单行')
+  assert.ok(INTRO_NOTICE.includes('一句话'), '要求只问一句，别长篇大论')
+  assert.ok(INTRO_NOTICE.includes('自己取名'), '用户让你自己取名时要提一个并确认')
+  assert.ok(INTRO_NOTICE.includes('memory_write'), '要写明用哪个工具落盘')
+  assert.ok(INTRO_NOTICE.includes('不要再问'), '用户拒绝后不得反复追问')
+  const tokens = estimateTokens(INTRO_NOTICE, cfg.charsPerToken)
+  assert.ok(tokens >= 40 && tokens <= 95, `初次设定提示 ${tokens} token 应落在契约的 40–95`)
+})
+
+test('DEFAULTS：M7 新增 3 个配置键与默认值（契约 7.4）', () => {
+  assert.equal(DEFAULTS.selfIntroEnabled, true)
+  assert.equal(DEFAULTS.selfIntroMinTurn, 2)
+  assert.equal(DEFAULTS.selfIntroMaxAsks, 2)
 })

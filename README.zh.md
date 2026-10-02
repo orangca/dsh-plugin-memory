@@ -57,9 +57,38 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 - **优先级**：自画像只是**描述**、不是指令 —— 但它也不是顺从的理由。注入的页脚写明同一原则：**以事实为准**。
   用户的要求先看是否合理、是否可行；不合理或办不到就直说并给替代方案，不为迎合而附和。
 
+### 初次设定：称呼（一次性，首次使用）
+
+自画像里最先该定下来的其实是「我们怎么互相称呼」，这件事插件不猜 —— 由**模型主动问**。第一次使用时，
+从本会话第 `selfIntroMinTurn` 回合起（默认 2）、同一会话最多问一次，且**跨会话**累计至多问
+`selfIntroMaxAsks` 次（默认 2）；`agent/pre-step` 会注入一句提示（`dsh-memory:self-intro`），要求模型用**一句话**问：想给我取什么名字、
+我该怎么称呼你；你把取名交给它时，它提一个并确认。结果按普通人格条目存进三个 subject：
+
+| subject | 含义 |
+|---|---|
+| `self.persona.name` | 我（模型）的名字 / 自称 |
+| `self.persona.address_user` | 我如何称呼用户 |
+| `self.persona.address_self` | 用户如何称呼我 |
+
+- **拒绝也算谈过了**：你说「不用了 / 随便」时，模型改为记一条「保持默认称呼」，之后**不再追问**。
+- **一次性**：只要任一命名 subject 曾经有过记录（active 或 archived 都算），就算已确定 —— 名字被取代归档
+  也说明「这件事谈过了」，反复追问比名字不完美更烦人。也可以自己设定（**没有新增命令**，只是给
+  `/memory self set` 加了可选的命名 key）：
+
+  ```sh
+  /memory self set persona name 我叫小忆。                   # → self.persona.name
+  /memory self set persona address_user 我称呼你为「老板」。   # → self.persona.address_user
+  /memory self set persona address_self 用户叫我「忆」。       # → self.persona.address_self
+  /memory self set persona 我重视把事实和推测分开说。           # 不带 key：仍写 self.persona.general
+  ```
+
+  命名 key 只在 `persona` 面识别；写成别的 key、或用在 `work` 面，都按普通正文处理。
+- `selfIntroEnabled`（默认 `true`）整体关掉这个通道；`recallMode` 为 `dry`/`off`、或 `autoRecall: false` 时
+  不注入、也不推进询问计数；已问次数可以在 `memory_stats` 的输出里看到。
+
 ```
 /memory self                             列出人格与工作两小节（各条带 id、来源、置信度）
-/memory self set <persona|work> <正文>    用户直接设定/覆盖（记为用户侧、固定、置信度 1）
+/memory self set <persona|work> [name|address_user|address_self] <正文>    用户直接设定/覆盖（用户侧、固定、置信度 1）；带命名 key 时同时定下称呼
 /memory self history [subject]            修订链：由旧到新（含归档时间）
 /memory self reset [persona|work]         归档当前自画像（保留历史，不删除）
 ```
@@ -117,7 +146,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置表单在哪
 
-插件导出 schemastery `Config`，其中 17 个可调字段声明为 `volatile()`；同时附带一个小的浏览器半边
+插件导出 schemastery `Config`，其中 20 个可调字段声明为 `volatile()`；同时附带一个小的浏览器半边
 （`src/client.ts`，构建为 `lib/client.js`）把它们渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
 （列表里的行卡片上还有一行摘要）。
 
@@ -139,7 +168,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 /memory confirm <id 前缀>                        把模型自评升级为用户确认
 /memory reject <id 前缀>                         拒绝一条自我观察（同类不再产生）
 /memory self                                     自画像：列出人格与工作两小节
-/memory self set <persona|work> <正文>            直接设定/覆盖自画像（用户侧、固定、置信度 1）
+/memory self set <persona|work> [name|address_user|address_self] <正文>            直接设定/覆盖自画像（用户侧、固定、置信度 1）；带命名 key 时同时定下称呼
 /memory self history [subject]                   自画像修订链（旧 → 新，含归档时间）
 /memory self reset [persona|work]                归档当前自画像（保留历史，不删除）
 /memory export [path]                            导出 JSON
@@ -155,7 +184,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 | 工具 | 用途 |
 |---|---|
-| `memory_write` | 结构化写入（`kind` + `text`，可选 `subject` / `field` / `value` / `scopeLevel`；`kind='agent_self'` 时可选 `facet: 'persona' | 'work'`）。**写入来源由插件判定，模型不能自称「用户要求的」** |
+| `memory_write` | 结构化写入（`kind` + `text`，可选 `subject` / `field` / `value` / `scopeLevel`；`kind='agent_self'` 时可选 `facet: 'persona' \| 'work'`）。**写入来源由插件判定，模型不能自称「用户要求的」** |
 | `memory_recall` | 按查询 / 类型 / 作用域 / 标签检索 |
 | `memory_list` | 按确定性顺序列出 |
 | `memory_forget` | 按 id 删除；按 query 删除需 `confirm: true`（预览阈值更严） |
@@ -165,7 +194,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置
 
-在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 17 个字段：
+在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 20 个字段：
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -180,6 +209,9 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 | `selfReflectEveryTurns` | `12` | 两次反思提示之间的最小回合间隔 |
 | `selfReflectMinTurn` | `4` | 本会话最小回合数（太早没有素材） |
 | `selfReflectMaxPerSession` | `3` | 每会话最多提醒几次 |
+| `selfIntroEnabled` | `true` | 初次设定（一次性「怎么互相称呼」）提示开关；表单里 `0`=关、`1`=开 |
+| `selfIntroMinTurn` | `2` | 本会话最早在第几回合问称呼（别一上来就查户口） |
+| `selfIntroMaxAsks` | `2` | **跨会话**累计最多问几次，问满即永久停手 |
 | `recallMode` | `inject` | `off` / `dry`（只算不注入）/ `inject` |
 | `recallTopK` | `8` | 每轮最多召回几条 |
 | `captureMode` | `rule` | `off` / `rule` |

@@ -58,6 +58,8 @@ import {
   makeRecord,
   maskPii,
   normalizeFacet,
+  INTRO_NOTICE,
+  namingSettled,
   pickMergeGroups,
   planPortraitUpdate,
   portraitHistory,
@@ -69,6 +71,7 @@ import {
   renderSelfBlock,
   scanSensitive,
   shouldArchive,
+  shouldIntroduce,
   shouldReflect,
   splitSentences,
   workspaceKeyOf,
@@ -297,6 +300,8 @@ interface MemoryMeta {
   schemaVersion?: number
   collectionVersion?: number
   lastConsolidatedAt?: number
+  /** M7：初次设定（称呼）跨会话累计已问次数。 */
+  selfIntroAsks?: number
 }
 
 interface BudgetCheck {
@@ -372,6 +377,10 @@ interface SelfState {
   sessionId: string
   /** 本会话已进行的回合数（由 pre-step 的回合号推进，单调不减）。 */
   sessionTurns: number
+  /** M7：初次设定（称呼）**跨会话**累计已问次数（持久化在水位里）。 */
+  introAsks: number
+  /** M7：本会话已经问过称呼的会话 id（同一会话只问一次）。 */
+  introAskedSession: string | null
   /** 最近一次自画像/反思路径的异常文本（诊断用，绝不影响主流程）。 */
   lastError: string | null
 }
@@ -545,6 +554,10 @@ function buildConfig(useVolatile: boolean): ReturnType<SchemaFactory['object']> 
     selfReflectEveryTurns: field(Schema!.number().default(12)),
     selfReflectMinTurn: field(Schema!.number().default(4)),
     selfReflectMaxPerSession: field(Schema!.number().default(3)),
+    // M7：初次设定（称呼）——一次性，跨会话累计最多问 selfIntroMaxAsks 次
+    selfIntroEnabled: field(Schema!.boolean().default(true)),
+    selfIntroMinTurn: field(Schema!.number().default(2)),
+    selfIntroMaxAsks: field(Schema!.number().default(2)),
     recallMode: field(Schema!.union(['off', 'dry', 'inject']).default('inject')),
     recallTopK: field(Schema!.number().default(8)),
     captureMode: field(Schema!.union(['off', 'rule']).default('rule')),
@@ -661,6 +674,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       reflectTurns: [],
       sessionId: '',
       sessionTurns: 0,
+      // M7：初次设定的累计次数（跨会话，从水位恢复）
+      introAsks: 0,
+      introAskedSession: null,
       lastError: null,
     },
     // 用量：注入/召回只在内存累加（每次写盘会产生大量 IO），由整合或卸载时统一落盘。
@@ -797,6 +813,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           reflections: state.self.reflections,
           reflectTurns: [...state.self.reflectTurns],
           sessionTurns: state.self.sessionTurns,
+          // M7：初次设定的累计次数（跨会话，持久化在水位里）
+          introAsks: state.self.introAsks,
           lastError: state.self.lastError,
         },
         usage: {
@@ -899,6 +917,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
 
   /** 自画像 subject 的 key 白名单：与 `portraitSubjectFor` 的校验一致（非法则回退 'general'）。 */
   const PORTRAIT_KEY_RE = /^[a-z0-9_]+$/u
+  /** M7：命名 key 白名单（对应 lib 的 `self.persona.<key>`）—— 只有这三个能定称呼。 */
+  const NAMING_KEYS: ReadonlySet<string> = new Set(['name', 'address_user', 'address_self'])
 
   /**
    * 把工具/命令给的 subject 收敛成 `portraitSubjectFor(facet, key)` 的 key：
@@ -1143,6 +1163,10 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         // 不 await 会把一个 Thenable 存进 state.meta —— 之后 `state.meta?.lastConsolidatedAt`
         // 恒为 undefined，启动水位丢失，每次启动都白跑一整轮整合。
         state.meta = ((await domain.global.get()) ?? null) as MemoryMeta | null
+        // M7：初次设定的累计次数跟着水位走 —— 存量用户升级后水位里没有这个字段，
+        // 按 0 处理即「会问一次」，这正是期望行为。
+        const asks = Number(state.meta?.selfIntroAsks ?? 0)
+        state.self.introAsks = Number.isFinite(asks) && asks > 0 ? Math.floor(asks) : 0
       } catch { /* 水位读取失败不影响加载 */ }
       for (const entry of domain.table<MemoryRecord>('memories').entries()) {
         const value = Array.isArray(entry) ? entry[1] : entry
@@ -1673,13 +1697,78 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     }
   }
 
+  /**
+   * M7：初次设定（称呼）提示 —— 与反思提示同形的**一次性**通道（契约 §7.5）。
+   *
+   * 与反思的三点不同：
+   *  · 闸门限制的是**跨会话累计次数**（`selfIntroMaxAsks`，默认 2），问满即永久停手；
+   *  · 同一会话只问一次（`introAskedSession`）—— 别在一个会话里追着问；
+   *  · 一旦命名 subject 有过记录（`namingSettled`）立刻停手，包括用户说「不用」时
+   *    模型按提示记下的那条「保持默认称呼」。
+   *
+   * 计数要跨会话生效，所以成功后立刻尽力落盘（水位在整合时还会再写一次）。
+   * 任何异常都被 catch：pre-step 主流程绝不能因为提示注入而失败。
+   */
+  const injectIntroNotice = (
+    decision: DshPreStepDecision | null | undefined,
+    payload: DshPreStepPayload,
+  ): DshPreStepDecision | null | undefined => {
+    try {
+      if (!decision || typeof decision !== 'object') return decision
+      if (decision.kind === 'reject' || payload?.signal?.aborted === true) return decision
+      if (cfg.selfIntroEnabled === false) return decision
+      if (cfg.autoRecall === false || cfg.recallMode === 'off' || cfg.recallMode === 'dry' || !state.opened) return decision
+      const rawTurn = Number(payload?.turn ?? 0)
+      if (!Number.isFinite(rawTurn) || rawTurn < 0) return decision
+      const turn = Math.floor(rawTurn)
+
+      const sessionId = String(payload?.agent?.session?.id ?? '')
+      if (sessionId !== '' && state.self.introAskedSession === sessionId) return decision
+
+      const settled = namingSettled(state.records.values())
+      if (!shouldIntroduce({ turn, asks: state.self.introAsks, settled }, cfg)) return decision
+
+      const proposed = Array.isArray(decision.messages) ? decision.messages : []
+      const text = clampText(INTRO_NOTICE, Math.max(1, cfg.maxInjectedTokens ?? DEFAULTS.maxInjectedTokens), cfg.charsPerToken)
+      const messageId = globalThis.crypto?.randomUUID?.() ?? `mem-intro-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      const message = {
+        role: 'user',
+        id: messageId,
+        content: [{ type: 'text', text }],
+        source: { kind: 'runtime-context', form: 'snapshot', sections: [{ name: 'dsh-memory:self-intro', text }] },
+      }
+      // 先构造好消息再推进计数：注入失败时不能留下「问过」的假账
+      state.self.introAsks += 1
+      state.self.introAskedSession = sessionId === '' ? null : sessionId
+      const handle = domain
+      if (handle) {
+        state.meta = {
+          ...(state.meta ?? {}),
+          schemaVersion: 1,
+          collectionVersion: state.collectionVersion,
+          selfIntroAsks: state.self.introAsks,
+        }
+        try {
+          void Promise.resolve((handle.global as DshDomainGlobal).set(state.meta)).catch(() => { /* 落盘失败不影响本次注入 */ })
+        } catch { /* 同上 */ }
+      }
+      flush()
+      return { ...decision, messages: [...proposed, message] }
+    } catch (error) {
+      state.self.lastError = `intro inject failed: ${errorText(error)}`
+      flush()
+      return decision
+    }
+  }
+
   try {
     ctx.on('agent/pre-step', async (rawPayload, next) => {
       const payload = rawPayload as DshPreStepPayload
       const decided = (await next()) as DshPreStepDecision | null | undefined
-      // 顺序固定：R2 快照在前、反思提示在后；两者各自独立追加、互不影响对方的闸门
+      // 顺序固定：R2 快照 → 反思提示 → 初次设定；三者各自独立追加、互不影响对方的闸门
       const withRecall = await injectRecallSnapshot(decided, payload)
-      return injectReflectNotice(withRecall, payload)
+      const withReflect = injectReflectNotice(withRecall, payload)
+      return injectIntroNotice(withReflect, payload)
     })
   } catch { /* ignore */ }
 
@@ -1786,6 +1875,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         schemaVersion: 1,
         collectionVersion: state.collectionVersion,
         lastConsolidatedAt: now,
+        // M7：初次设定的累计次数随水位一起持久化
+        selfIntroAsks: state.self.introAsks,
       }
       try {
         await (domain!.global as DshDomainGlobal).set(state.meta)
@@ -2392,7 +2483,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           `渲染：context=${state.renders.context} section=${state.renders.section}，耗时 last=${state.renderMs.last}ms max=${state.renderMs.max}ms`,
           `注入：context=${state.injected.context.length} 行 / section=${state.injected.section.length} 行`,
           `自画像：新增 ${state.self.added} / 更新 ${state.self.refined} / 取代 ${state.self.superseded} / 跳过 ${state.self.skipped}`
-            + `；反思提醒 ${state.self.reflections} 次（最近回合 ${state.self.lastReflectTurn ?? '-'}）`,
+            + `；反思提醒 ${state.self.reflections} 次（最近回合 ${state.self.lastReflectTurn ?? '-'}）`
+            + `；初次设定已问 ${state.self.introAsks} 次`,
           `turn-stopping：plain=${state.turnStopping.plain}${state.turnStopping.last ? `，last=${state.turnStopping.last.at}（${state.turnStopping.last.channel}）` : '，last=none'}`,
           `设置页：${settingsLine()}`,
         ].join('\n'),
@@ -2411,7 +2503,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
      * 全部中文输出；`set` 走 `writeMemory`（因此同样经过自画像收敛与用户所有物保护）。
      */
     async self(args: string[]): Promise<DshCommandResult> {
-      const SELF_USAGE = '用法：/memory self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work]'
+      const SELF_USAGE = '用法：/memory self [list] | self set <persona|work> [<命名key>] <正文>'
+        + ' | self history [subject] | self reset [persona|work]'
+        + '（命名 key 仅 persona 可用：name / address_user / address_self）'
       const sub = (args[0] ?? 'list').toLowerCase()
 
       // 自画像条目：kind=agent_self，facet 走 facetOf（无 facet 的存量条目按 'work'）
@@ -2428,12 +2522,18 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         const persona = portraitRows('persona')
         const work = portraitRows('work')
         const archived = [...state.records.values()].filter((record) => record.kind === 'agent_self' && record.status !== 'active').length
+        // M7：还没定称呼时给一行提示（怎么让模型问、或自己直接设定）
+        const namingHint = namingSettled(state.records.values())
+          ? ''
+          : '\n（称呼还没定：等模型问，或自己设定 —— '
+            + '/memory self set persona name 我叫小忆 ｜ address_user 我称呼你为「…」｜ address_self 用户叫我「…」。）'
         if (persona.length === 0 && work.length === 0) {
           return {
             kind: 'success',
             text: '自画像为空。\n'
               + '模型可以随时用 memory_write（kind=agent_self, facet=persona|work）记录对自己的认识；\n'
-              + '你也可以直接设定：/memory self set persona <正文>。'
+              + '你也可以直接设定：/memory self set persona <正文>（带命名 key 可定称呼，见下）。'
+              + namingHint
               + (archived > 0 ? `\n（另有 ${archived} 条已归档，用 /memory self history 查看修订链。）` : ''),
           }
         }
@@ -2444,6 +2544,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           text: [
             block('人格 · 模型对自身的认知', persona),
             block('工作倾向', work),
+            namingHint.trim(),
             archived > 0 ? `（另有 ${archived} 条已归档：/memory self history）` : '',
           ].filter(Boolean).join('\n'),
         }
@@ -2451,19 +2552,32 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
 
       if (sub === 'set') {
         const facetRaw = (args[1] ?? '').toLowerCase()
-        const text = args.slice(2).join(' ').trim()
         if (facetRaw !== 'persona' && facetRaw !== 'work') {
           return { kind: 'error', text: `facet 只能是 persona 或 work。${SELF_USAGE}` }
         }
-        if (text.length === 0) return { kind: 'error', text: `缺少正文。${SELF_USAGE}` }
         const facet: SelfFacet = facetRaw
+        // M7：persona 可以带一个**命名 key**，用来直接定称呼：
+        //   /memory self set persona name 我叫小忆
+        //   /memory self set persona address_user 我称呼你为「老板」
+        //   /memory self set persona address_self 用户叫我「忆」
+        // 只有「首词是已知命名 key 且后面还有正文」才当作 key —— 否则整段都是正文
+        // （向后兼容：/memory self set persona 我重视把事实和推测分开说 仍写 self.persona.general）。
+        let rest = args.slice(2)
+        let subject = portraitSubjectFor(facet, 'general')
+        const head = String(rest[0] ?? '').toLowerCase()
+        if (facet === 'persona' && rest.length >= 2 && NAMING_KEYS.has(head)) {
+          subject = portraitSubjectFor('persona', head)
+          rest = rest.slice(1)
+        }
+        const text = rest.join(' ').trim()
+        if (text.length === 0) return { kind: 'error', text: `缺少正文。${SELF_USAGE}` }
         // 用户直接设定：origin/pinned/confidence 按契约 §4.3 固定；收敛仍交给 planPortraitUpdate
         // （用户侧可以覆盖用户侧；模型侧条目会被这次设定 refine/supersede）。
         const result = await writeMemory({
           kind: 'agent_self',
           text,
           facet,
-          subject: portraitSubjectFor(facet, 'general'),
+          subject,
           origin: 'user_explicit',
           pinned: true,
           confidence: 1,
@@ -2474,11 +2588,15 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         const action = result.portrait
           ? `（${result.portrait.action}: ${result.portrait.reason}）`
           : ''
+        const naming = NAMING_KEYS.has(head) && facet === 'persona' && subject !== portraitSubjectFor(facet, 'general')
+          ? '\n称呼已定，之后不会再问。'
+          : ''
         return {
           kind: 'success',
-          text: result.status === 'merged'
-            ? `已更新既有自画像条目 ${String(result.id).slice(0, 8)}${action}\n${result.record?.text ?? text}`
-            : `已写入自画像（${facet}）${String(result.id).slice(0, 8)}${action}\n${result.record?.text ?? text}`,
+          text: (result.status === 'merged'
+            ? `已更新既有自画像条目 ${String(result.id).slice(0, 8)}${action}`
+            : `已写入自画像（${subject}）${String(result.id).slice(0, 8)}${action}`)
+            + `\n${result.record?.text ?? text}${naming}`,
         }
       }
 

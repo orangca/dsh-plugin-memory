@@ -245,11 +245,97 @@ false→`'0'`、未覆盖→空）与 `parse`（只接受 0/1，其余视为 inv
   但不能改写它）。
 - 注入的正文一律过 `clampText`（折平单行），防止结构伪造。
 
-## 7. 验收标准
+## 7. 初次设定：称呼（M7，2026-10-02 用户提出）
 
-- `pnpm typecheck` 三套全绿；`pnpm test` 全绿（现有 58 项不许回退）。
-- 新增测试：`planPortraitUpdate` 五种动作 + 用户所有物保护；`shouldReflect` 闸门；`renderSelfBlock`
-  人格在前且总预算不超；宿主侧反思注入的**次数上限**与 dry/off 不注入；`/memory self` 四个子命令；
-  supersede 后旧条目 archived 且带 `supersededBy`。
+> 用户原话意：**种子自画像可以让模型询问用户给自己取名、以及怎么称呼用户，或者由模型自己取名，并确定称呼。**
+
+自画像里最先该定下来的其实是「我们怎么互相称呼」。这件事**必须问用户**，不能由插件猜，
+所以做一个一次性的**初次设定通道**（与反思提示同形，独立注入）。
+
+### 7.1 命名 subject（三个）
+
+| subject | 含义 | 例 |
+|---|---|---|
+| `self.persona.name` | 我（模型）的名字/自称 | `我叫「小忆」。` |
+| `self.persona.address_user` | 我如何称呼用户 | `我称呼用户为「你」。` |
+| `self.persona.address_self` | 用户如何称呼我 | `用户叫我「忆」。` |
+
+三者都属于 `facet='persona'`，按普通自画像条目存储与注入（人格小节里自然显示为一行）。
+
+### 7.2 是否已确定
+
+```ts
+/** 三个命名 subject 的规范值。 */
+export const NAMING_SUBJECTS: readonly string[]
+
+/** 只要**曾经**记过任一命名 subject（active 或 archived 都算），就算已确定 —— 不再追问。 */
+export function namingSettled(records: Iterable<MemoryRecord>): boolean
+```
+
+- archived 也算：`supersede` 掉的名字仍说明「这件事谈过了」，反复追问比名字不完美更烦人。
+- 用户说「不用了/随便」时，模型按提示记一条 `self.persona.name`（正文如「用户不想设定称呼，保持默认」）
+  ⇒ 同样满足已确定条件，之后不再问。
+
+### 7.3 提醒闸门
+
+```ts
+export interface IntroInput {
+  turn: number
+  /** 跨会话累计已提醒次数（宿主从领域水位读出）。 */
+  asks: number
+  /** 命名是否已确定。 */
+  settled: boolean
+}
+/** enabled=false / 已确定 / 已达总次数上限 / 未到最小回合 → false。 */
+export function shouldIntroduce(input: IntroInput, cfg: MemoryConfig): boolean
+
+/** 初次设定提示正文（单行，与 REFLECT_NOTICE 同规格）。 */
+export const INTRO_NOTICE: string
+```
+
+`INTRO_NOTICE` 必须包含：① 用**一句**话问，不要长篇大论；② 用户让你自己取名就提一个并确认；
+③ 用 `memory_write`（`kind=agent_self`、`facet=persona`、对应命名 subject）记下结果；
+④ 用户说不用就记一条「保持默认称呼」，**之后不要再问**。
+
+### 7.4 配置（3 个新键，默认值写在 `DEFAULTS`）
+
+| 键 | 类型 | 默认 | 含义 |
+|---|---|---|---|
+| `selfIntroEnabled` | boolean | `true` | 初次设定通道开关 |
+| `selfIntroMinTurn` | number | `2` | 本会话至少几回合后再问（别一上来就查户口） |
+| `selfIntroMaxAsks` | number | `2` | **跨会话**累计最多问几次，问满即永久停手 |
+
+### 7.5 宿主行为
+
+1. **注入**：`agent/pre-step` 里在 R2 与反思提示**之后**追加第三条独立消息
+   （`sections[0].name = 'dsh-memory:self-intro'`），正文用 `INTRO_NOTICE`。
+   与另外两条同一套守卫：reject / aborted / 领域未打开 / 回合号非法 / `recallMode` 为 `dry|off` /
+   `autoRecall === false` ⇒ 不注入且**不推进计数**。另加一条：**同一会话最多问一次**（`introAskedSession`）。
+2. **计数持久化**：`state.self.introAsks` 写进领域水位（`MemoryMeta.selfIntroAsks`），
+   跨会话累计；水位缺失时按 0 处理（存量用户第一次升级后会**问一次**，这是期望行为）。
+3. **命令**：`/memory self` 在未确定时多打一行提示；`memory_stats` 暴露 `introAsks`。
+   `/memory self set <persona|work> [<命名key>] <正文>`：命名 key（`name` / `address_user` / `address_self`）
+   只在 `persona` 面识别，且必须**后面还有正文**；否则整段按普通正文写 `self.persona.<facet>.general`
+   （老用法语义不变）。
+4. **不新增工具**：模型用既有的 `memory_write` 落盘，来源判定沿用既有逻辑
+   （用户明确说「叫我 X」⇒ 用户侧；模型自己取名 ⇒ `model_proposed`）。
+5. **命名条目同样受用户所有物保护**：用户用 `/memory self set persona name …` 写入的是
+   `origin: user_explicit` + `pinned: true`，模型之后不得改写它。
+
+### 7.6 实现口径（已采纳）
+
+| 议题 | 定案 |
+|---|---|
+| 命名条目的 `too-short` 门槛 | 普通自画像正文仍是 **≥8 字符**；命名 subject 放宽到 **≥2 字符**（「我叫小忆。」只有 5 字符，用 8 字门槛会把称呼静默丢掉） |
+| `status: 'invalid'`（用户 reject）的命名条目 | **不算已确定**：允许再问一次（只有 active/archived 才算谈过） |
+| 同一会话重复询问 | 不允许：`introAskedSession` 保证一个会话只问一次 |
+| 时长/文案预算 | `INTRO_NOTICE` 走 `clampText`，实测约 80 token（上限 120），单行 |
+
+## 8. 验收标准
+
+- `pnpm typecheck` 三套全绿；`pnpm test` 全绿（现有项不许回退）。
+- 新增测试：`planPortraitUpdate` 五种动作 + 用户所有物保护；`shouldReflect` / `shouldIntroduce` 闸门；
+  `renderSelfBlock` 人格在前且总预算不超；宿主侧反思与初次设定注入的**次数上限**与 dry/off 不注入；
+  `/memory self` 四个子命令；supersede 后旧条目 archived 且带 `supersededBy`。
 - `pnpm build` 后 `git diff --exit-code -- lib` 为空（CI 会查）。
-- 文档：`README.md` / `README.zh.md` 的自画像章节改写、`CHANGELOG.md` 增加 0.5.4、本文件保持最新。
+- 文档：`README.md` / `README.zh.md` 的自画像章节改写、`CHANGELOG.md` 增加对应版本、本文件保持最新。

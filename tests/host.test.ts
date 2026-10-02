@@ -34,7 +34,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply as applyRaw, Config } from '../lib/index.js'
-import { REFLECT_NOTICE, workspaceKeyOf } from '../lib/lib.js'
+import { INTRO_NOTICE, REFLECT_NOTICE, workspaceKeyOf } from '../lib/lib.js'
 
 /** 假 ctx 只实现本插件实际用到的那一块；测试里不假装它是完整宿主类型。 */
 const apply = applyRaw as unknown as (ctx: Record<string, unknown>, config?: Record<string, unknown>) => void
@@ -401,7 +401,8 @@ test('host#4a agent/pre-step：recallMode=dry 时原样返回 decision（不注�
 })
 
 test('host#4b agent/pre-step：inject 模式的 runtime-context 消息形状正确', async (t) => {
-  const harness = makeHarness({ config: { recallMode: 'inject' } })
+  // 关掉同时段可能触发的其它通道（初次设定），让这一例只验证 R2 的形状
+  const harness = makeHarness({ config: { recallMode: 'inject', selfIntroEnabled: false } })
   t.after(() => harness.dispose())
   await harness.settle()
   await harness.memory().write({ kind: 'user_profile', text: '构建流程统一用 pnpm，产物输出到 dist 目录' })
@@ -727,7 +728,8 @@ test('host#13 pre-step：冷却过滤发生在 top-K 之前（刚注入过的条
   // recallTopK=1 时最容易暴露：旧实现从 recallRecords 只取 1 条候选，
   // 而刚注入过的条目因为 markUsed 的 recency 加成恰好排第一 → 被冷却过滤掉 → 该回合 0 命中。
   const harness = makeHarness({
-    config: { recallMode: 'inject', recallTopK: 1, recallCooldownTurns: 3, consolidateEnabled: false },
+    // 关掉初次设定：这一例只验证冷却过滤，别被同时段的其它通道干扰
+    config: { recallMode: 'inject', recallTopK: 1, recallCooldownTurns: 3, consolidateEnabled: false, selfIntroEnabled: false },
     noReport: true,
   })
   t.after(() => harness.dispose())
@@ -739,8 +741,10 @@ test('host#13 pre-step：冷却过滤发生在 top-K 之前（刚注入过的条
   const at = (turn: number): unknown => ({ turn, agent: { session: { header: { cwd } } }, signal: { aborted: false } })
   const decision = (text: string): Json => ({ kind: 'continue', messages: [{ role: 'user', content: [{ type: 'text', text }] }] })
   const injected = (result: unknown): string => {
-    const messages = (result as { messages?: Array<{ content?: Array<{ text?: string }> }> }).messages ?? []
-    return String(messages.at(-1)?.content?.[0]?.text ?? '')
+    // 按 section 名挑出 R2 那条：pre-step 可能同时追加别的通道（如初次设定）
+    const messages = (result as { messages?: Array<{ content?: Array<{ text?: string }>; source?: { sections?: Array<{ name?: string }> } }> }).messages ?? []
+    const recall = messages.find((message) => message.source?.sections?.[0]?.name === 'dsh-memory:recall')
+    return String((recall ?? messages.at(-1))?.content?.[0]?.text ?? '')
   }
 
   await harness.memory().write({
@@ -1217,4 +1221,131 @@ test('host#22 pre-step：R2 快照在前、反思提示在后，各自单独一�
   assert.equal(extra.length, 2, 'R2 与反思提示必须各自单独追加一条')
   assert.equal(sectionNameOf(extra[0]!), 'dsh-memory:recall', 'R2 在前')
   assert.equal(sectionNameOf(extra[1]!), 'dsh-memory:self-reflect', '反思提示在后')
+})
+
+// ---------------------------------------------------------------- 26~29. M7 初次设定（称呼）
+
+test('host#23 初次设定：未定称呼时只问一次，且正文/形状与 R2 同规格', async (t) => {
+  const harness = makeHarness({ config: { selfIntroMinTurn: 1, selfIntroMaxAsks: 2 } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const hits: Array<{ turn: number; message: Json }> = []
+  for (let turn = 1; turn <= 4; turn += 1) {
+    for (const message of await stepTurn(harness, turn)) {
+      if (sectionNameOf(message) === 'dsh-memory:self-intro') hits.push({ turn, message })
+    }
+  }
+  assert.deepEqual(hits.map((hit) => hit.turn), [1], '同一会话只问一次，不追着问')
+
+  const message = hits[0]!.message
+  assert.equal(message.role, 'user')
+  assert.ok(typeof message.id === 'string' && (message.id as string).length > 0)
+  const source = message.source as Json
+  assert.equal(source.kind, 'runtime-context')
+  assert.equal(source.form, 'snapshot')
+  const sections = source.sections as Json[]
+  assert.equal(sections.length, 1)
+  assert.equal(sections[0]!.name, 'dsh-memory:self-intro')
+  const content = message.content as Json[]
+  assert.equal(content[0]!.type, 'text')
+  assert.equal(content[0]!.text, INTRO_NOTICE, '注入正文必须是 INTRO_NOTICE（过 clampText）')
+  assert.doesNotMatch(String(content[0]!.text), /\n/u, '注入正文必须折平单行')
+  assert.match(String(content[0]!.text), /不要再问/u)
+  assert.match(String(content[0]!.text), /self\.persona\.name/u)
+
+  assert.equal(Number((harness.reportState().self as Json).introAsks), 1)
+})
+
+test('host#24 初次设定：命名一旦有记录（含「保持默认称呼」）就永久停手', async (t) => {
+  const harness = makeHarness({ config: { selfIntroMinTurn: 1, selfIntroMaxAsks: 3 } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  // 用户说「不用」时，模型按 INTRO_NOTICE 的提示记下的那条
+  const written = await harness.memory().write({
+    kind: 'agent_self',
+    facet: 'persona',
+    subject: 'self.persona.name',
+    text: '用户不想设定称呼，保持默认。',
+  })
+  assert.equal(written.ok, true)
+
+  for (let turn = 1; turn <= 3; turn += 1) {
+    for (const message of await stepTurn(harness, turn)) {
+      assert.notEqual(sectionNameOf(message), 'dsh-memory:self-intro', '已确定称呼后不得再问')
+    }
+  }
+  assert.equal(Number((harness.reportState().self as Json).introAsks), 0, '未注入就不该推进计数')
+})
+
+test('host#25 初次设定：上限是**跨会话累计**（换会话不重置）', async (t) => {
+  const harness = makeHarness({ config: { selfIntroMinTurn: 1, selfIntroMaxAsks: 2 } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const asked: string[] = []
+  for (const [sessionId, turn] of [['s1', 1], ['s1', 2], ['s2', 1], ['s3', 1], ['s3', 2]] as const) {
+    for (const message of await stepTurn(harness, turn, `轮次 ${turn}`, sessionId)) {
+      if (sectionNameOf(message) === 'dsh-memory:self-intro') asked.push(`${sessionId}#${turn}`)
+    }
+  }
+  assert.deepEqual(asked, ['s1#1', 's2#1'], '每会话最多一次，且跨会话累计上限 2 次')
+  assert.equal(Number((harness.reportState().self as Json).introAsks), 2)
+})
+
+test('host#26 初次设定：dry / off / autoRecall=false 都不注入、不推进计数', async (t) => {
+  const cases = [
+    { name: 'dry', config: { recallMode: 'dry' } },
+    { name: 'off', config: { recallMode: 'off' } },
+    { name: 'autoRecall=false', config: { autoRecall: false } },
+  ] as const
+  for (const item of cases) {
+    const harness = makeHarness({ config: { selfIntroMinTurn: 1, ...item.config } })
+    t.after(() => harness.dispose())
+    await harness.settle()
+    for (let turn = 1; turn <= 3; turn += 1) {
+      for (const message of await stepTurn(harness, turn)) {
+        assert.notEqual(sectionNameOf(message), 'dsh-memory:self-intro', `${item.name} 不应注入初次设定`)
+      }
+    }
+    assert.equal(Number((harness.reportState().self as Json).introAsks), 0, `${item.name} 不应推进计数`)
+  }
+})
+
+test('host#27 初次设定：用户用 /memory self set persona name … 直接定称呼也算已确定', async (t) => {
+  const harness = makeHarness({ config: { selfIntroMinTurn: 1, selfIntroMaxAsks: 3 } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 命名 key 形式：写 self.persona.name，并明确告知「不会再问」
+  // 注意正文天生很短（「我叫小忆。」5 字），命名 subject 的 too-short 门槛已放宽到 ≥2 字符
+  const named = await harness.runCommand('self set persona name 我叫小忆。')
+  assert.equal(named.kind, 'success', named.text)
+  assert.match(named.text, /称呼已定/u)
+  const rows = harness.memory().list() as Json[]
+  const record = rows.find((row) => row.subject === 'self.persona.name')
+  assert.ok(record, '应写入 self.persona.name')
+  assert.equal(record.text, '我叫小忆。')
+  assert.equal(record.origin, 'user_explicit')
+  assert.equal(record.pinned, true)
+
+  for (let turn = 1; turn <= 3; turn += 1) {
+    for (const message of await stepTurn(harness, turn)) {
+      assert.notEqual(sectionNameOf(message), 'dsh-memory:self-intro', '用户已定称呼后不得再问')
+    }
+  }
+  assert.equal(Number((harness.reportState().self as Json).introAsks), 0)
+
+  // 向后兼容：不带 key 的正文仍写 self.persona.general，且**不**算定称呼
+  const plain = await harness.runCommand('self set persona 我重视把事实和推测分开说。')
+  assert.equal(plain.kind, 'success')
+  assert.ok(
+    (harness.memory().list() as Json[]).some((row) => row.subject === 'self.persona.general'),
+    '不带命名 key 时仍写 general（老用法不许改语义）',
+  )
+
+  // work 面不识别命名 key：整段都算正文
+  const work = await harness.runCommand('self set work name 只是正文的一部分。')
+  assert.equal(work.kind, 'success')
+  assert.ok((harness.memory().list() as Json[]).some((row) => row.subject === 'self.work.general'))
 })

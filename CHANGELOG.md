@@ -3,6 +3,52 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.6 — 2026-10-02
+
+**First-run naming: the model asks how the two of you address each other.** A self-portrait starts with names, and
+that is not something the plugin should guess — so `agent/pre-step` gains a one-off introduction channel next to
+per-turn recall and the reflection prompt. It is one-off, refusable, and can be settled by hand.
+
+### Added
+
+- **First-run naming prompt** (section `dsh-memory:self-intro`, text from `INTRO_NOTICE`). From session turn
+  `selfIntroMinTurn` (default 2), at most once per session and at most `selfIntroMaxAsks` times **in total across
+  sessions** (default 2), the model is asked to put the question in **one sentence**: what name should the user
+  give it, and how should it address the user. When the user leaves the choice to the model, it proposes a name
+  and confirms it.
+- **Three naming subjects**, stored as ordinary persona rows: `self.persona.name` (my name),
+  `self.persona.address_user` (how I address the user) and `self.persona.address_self` (how the user addresses me).
+  Declining counts too: "no need / whatever" is recorded as a "keep the default address" row.
+- **Three new keys** in `DEFAULTS`: `selfIntroEnabled` (default `true`), `selfIntroMinTurn` (default `2`) and
+  `selfIntroMaxAsks` (default `2`, counted across sessions).
+- `namingSettled` treats **any** past naming row as settled — active **or** archived — so superseding a name does
+  not restart the questions, and a user who already declined is never asked again.
+- The ask counter is persisted in the domain watermark (`MemoryMeta.selfIntroAsks`) so it survives restarts and
+  accumulates across sessions; `memory_stats` reports how many asks were sent. An existing store has no value and
+  is therefore asked **once** after upgrading — intended.
+
+### Changed
+
+- The introduction prompt shares the guards of the other two injections: a rejected decision, an aborted signal, a
+  closed domain, an invalid turn number, `recallMode` `dry`/`off` or `autoRecall: false` means no injection **and**
+  no counter advance; any failure is caught and never bubbles into `agent/pre-step`.
+- No new tool and no new command: the model writes through the existing `memory_write` (`kind: 'agent_self'`,
+  `facet: 'persona'`, the naming subject). The user can settle the names with an **optional naming key** on the
+  existing command (found while writing the docs — plain `self set persona <text>` writes `self.persona.general`,
+  which would *not* have settled the names):
+  `/memory self set persona name 我叫小忆。`, `… address_user 我称呼你为「老板」。`, `… address_self 用户叫我「忆」。`
+  The key is recognised only on the `persona` facet and only when some text follows it; anything else keeps the old
+  behaviour (`self.persona.general`).
+- `README.md` / `README.zh.md` document the channel, the three subjects, the three keys, the one-off rule and the
+  naming-key syntax; the configuration table gains the three new keys.
+
+### Fixed
+
+- `planPortraitUpdate`'s minimum-text rule no longer swallows names: the `too-short` gate (8 characters) applies to
+  ordinary self-cognition rows, but naming subjects now need only ≥2 characters — "我叫小忆。" is five characters and
+  would otherwise have been skipped silently. Covered by a test that also pins the 8-character rule for other
+  subjects.
+
 ## 0.5.5 — 2026-10-02
 
 **The injected footers no longer say "the user always wins".** Reportedly (and correctly) a request from the plugin's

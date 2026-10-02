@@ -127,6 +127,10 @@ export const DEFAULTS: MemoryConfig = {
   selfReflectEveryTurns: 12,
   selfReflectMinTurn: 4,
   selfReflectMaxPerSession: 3,
+  // M7：初次设定（称呼）—— 一次性，跨会话累计最多问 2 次
+  selfIntroEnabled: true,
+  selfIntroMinTurn: 2,
+  selfIntroMaxAsks: 2,
   gistBudgetRatio: 0.3,
   charsPerToken: 2.5,
   sectionOrder: 9000,
@@ -1146,6 +1150,8 @@ function mergePortraitText(left: string, right: string): string {
  * 自画像收敛决策：**纯函数、确定性**（契约 §3 的规则，按顺序判定）。
  *
  *  1. 正文去空白后 < 8 字符 → `skip` / `'too-short'`
+ *     （例外：命名 subject `self.persona.name` / `address_user` / `address_self` 只要求 ≥2 字符 ——
+ *      「我叫小忆」这种天生短，用 8 字门槛会把称呼写入静默丢掉）
  *  2. 同 subject + 同 facet 的 active 条目里：
  *     a. 指纹相同（归一化文本相等）或一方包含另一方 → `reinforce`
  *        （取更长文本；confidence 取两者较大者 +0.05，上限 1）
@@ -1177,7 +1183,12 @@ export function planPortraitUpdate(
   const rawConfidence = Number(candidate?.confidence)
   const confidence = Number.isFinite(rawConfidence) ? Math.min(1, Math.max(0, rawConfidence)) : 0.6
 
-  if (String(candidate?.text ?? '').trim().length < PORTRAIT_MIN_TEXT_CHARS) {
+  // 命名条目（self.persona.name / address_user / address_self）天生很短：
+  // 「我叫小忆」「用户叫我「忆」」都不到 8 字符，用自画像正文的门槛会把它们**静默跳过**。
+  // 因此命名 subject 只要求非空（≥2 字符），其余仍用 PORTRAIT_MIN_TEXT_CHARS。
+  const isNaming = NAMING_SUBJECTS.includes(subject)
+  const minChars = isNaming ? 2 : PORTRAIT_MIN_TEXT_CHARS
+  if (String(candidate?.text ?? '').trim().length < minChars) {
     return { action: 'skip', targetId: null, text, confidence, reason: 'too-short', archiveTarget: false }
   }
 
@@ -1387,3 +1398,77 @@ export function shouldReflect(input: ReflectInput, cfg: MemoryConfig): boolean {
   }
   return true
 }
+
+// ---------------------------------------------------------------------------
+// M7：初次设定（称呼）—— 契约 §7
+// ---------------------------------------------------------------------------
+
+/**
+ * 命名 subject：自画像里最先该定下来的三件事。
+ * 与插件猜名字相比，「问一句」才是对的：称呼是双方的事。
+ */
+export const NAMING_SUBJECTS: readonly string[] = [
+  'self.persona.name',
+  'self.persona.address_user',
+  'self.persona.address_self',
+]
+
+/**
+ * 命名是否已确定：只要**曾经**记过任一命名 subject 就算（active 或 archived 都算）。
+ *
+ * 为什么 archived 也算：`supersede` 掉的名字说明「这件事谈过了」——
+ * 反复追问比名字不够完美更烦人。被 `invalid`（用户 reject）的不算，那种情况允许再问一次。
+ */
+export function namingSettled(records: Iterable<MemoryRecord>): boolean {
+  for (const record of records) {
+    if (record?.kind !== 'agent_self') continue
+    if (record.status === 'invalid') continue
+    if (typeof record.subject === 'string' && NAMING_SUBJECTS.includes(record.subject)) return true
+  }
+  return false
+}
+
+/** 初次设定提醒的输入（契约 §7.3）。 */
+export interface IntroInput {
+  /** 当前回合号。 */
+  turn: number
+  /** **跨会话**累计已提醒次数（宿主从领域水位读出）。 */
+  asks: number
+  /** `namingSettled(...)` 的结果。 */
+  settled: boolean
+}
+
+/**
+ * 初次设定闸门（纯函数）：`enabled=false` / 已确定 / 已达总次数上限 / 未到最小回合 → false。
+ *
+ * 与反思闸门的关键区别：这里限制的是**跨会话累计次数**（`selfIntroMaxAsks`，默认 2），
+ * 因为「问称呼」是一次性的事，问满就不再开口；而反思是长期的习惯。
+ */
+export function shouldIntroduce(input: IntroInput, cfg: MemoryConfig): boolean {
+  if (!input) return false
+  if (cfg.selfIntroEnabled === false) return false
+  if (input.settled === true) return false
+
+  const cap = cfg.selfIntroMaxAsks ?? DEFAULTS.selfIntroMaxAsks
+  if (!(cap > 0)) return false
+  const asks = Number.isFinite(input.asks) ? input.asks : 0
+  if (asks >= cap) return false
+
+  const minTurn = Number.isFinite(cfg.selfIntroMinTurn) ? cfg.selfIntroMinTurn : DEFAULTS.selfIntroMinTurn
+  const turn = Number.isFinite(input.turn) ? input.turn : 0
+  if (turn < minTurn) return false
+  return true
+}
+
+/**
+ * 初次设定提示正文（契约 §7.3，与 `REFLECT_NOTICE` 同规格：单行、克制、一次性）。
+ *
+ * 四条必须在：① 只问**一句**；② 用户让你自己取名就提一个并确认；
+ * ③ 用 `memory_write` 落盘（三个命名 subject）；④ 用户说不用就记「保持默认称呼」，之后不再问。
+ */
+export const INTRO_NOTICE: string = clampText([
+  '[初次设定 · 称呼] 找个自然的时机，用一句话问用户：想给你取什么名字、你该怎么称呼他/她。',
+  '用户让你自己取名就提一个并确认。',
+  '定下来后用 memory_write（kind=agent_self、facet=persona、subject=self.persona.name / self.persona.address_user / self.persona.address_self）各记一条。',
+  '用户说不用或随便，就记一条「保持默认称呼」，之后不要再问。',
+].join(' '), 120, DEFAULTS.charsPerToken)

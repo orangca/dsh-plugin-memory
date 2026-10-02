@@ -66,9 +66,42 @@ prompt as two subsections:
   first checked for whether it is sound and feasible; if it is not, say so and offer an alternative rather than
   agreeing for the sake of agreement.
 
+### Getting your names settled (first run, one-off)
+
+A self-portrait starts with how the two of you address each other, and the plugin does not guess it — the **model
+asks**. From session turn `selfIntroMinTurn` (default 2), at most once per session and at most `selfIntroMaxAsks`
+times **in total across sessions** (default 2), `agent/pre-step` injects one prompt (`dsh-memory:self-intro`)
+telling the model to put the question in **a single sentence**: what name would you like to give me, and how
+should I address you. When you leave the choice to it, it proposes a name and confirms it. The answer is stored as
+ordinary persona rows under three subjects:
+
+| Subject | Meaning |
+|---|---|
+| `self.persona.name` | my own name / how I refer to myself |
+| `self.persona.address_user` | how I address the user |
+| `self.persona.address_self` | how the user addresses me |
+
+- **Declining settles it too.** If you say you don't need one (or "whatever"), the model records a "keep the
+  default address" row instead — and the question is never asked again.
+- **One-off.** As soon as *any* naming subject has ever been recorded — active **or** archived — the matter counts
+  as settled: an archived name still means "we talked about this", and asking again is worse than an imperfect
+  name. You can settle it by hand too (**no new command**: `/memory self set` simply gained an optional naming key):
+
+  ```sh
+  /memory self set persona name 我叫小忆。                   # -> self.persona.name
+  /memory self set persona address_user 我称呼你为「老板」。   # -> self.persona.address_user
+  /memory self set persona address_self 用户叫我「忆」。       # -> self.persona.address_self
+  /memory self set persona 我重视把事实和推测分开说。           # no key: still self.persona.general
+  ```
+
+  The naming keys are only recognised on the `persona` facet; anything else (or the `work` facet) is treated as
+  ordinary text.
+- `selfIntroEnabled` (default `true`) turns the channel off; with `recallMode` `dry`/`off` or `autoRecall: false`
+  the prompt is not injected and the ask counter does not advance. `memory_stats` reports how many asks were sent.
+
 ```
 /memory self                             list the persona and work subsections (id, origin, confidence each)
-/memory self set <persona|work> <text>   set/override directly (user-side, pinned, confidence 1)
+/memory self set <persona|work> [name|address_user|address_self] <text>   set/override (user-side, pinned, confidence 1); a naming key on persona settles the names
 /memory self history [subject]           revision chain, old → new (with archival time)
 /memory self reset [persona|work]        archive the current self-portrait (history is kept, nothing is deleted)
 ```
@@ -130,7 +163,7 @@ Add this package to the profile's `dependencies`, append `dsh-plugin-memory` to
 
 ## The settings form
 
-The plugin exports a schemastery `Config` whose 17 tunable fields are declared `volatile()`, and ships a small
+The plugin exports a schemastery `Config` whose 20 tunable fields are declared `volatile()`, and ships a small
 browser half (`src/client.ts`, built to `lib/client.js`) that renders them as a form. Find it under **Plugins → `dsh-plugin-memory` →
 row `dsh-memory`** (the list card also shows a one-line summary).
 
@@ -152,7 +185,7 @@ whole Config through the settings service and persists it into the profile patch
 /memory confirm <id prefix>                      promote a model self-observation to user-confirmed
 /memory reject <id prefix>                       reject a self-observation (that kind is never re-created)
 /memory self                                     self-portrait: list the persona and work subsections
-/memory self set <persona|work> <text>            set/override it directly (user-side, pinned, confidence 1)
+/memory self set <persona|work> [name|address_user|address_self] <text>            set/override it directly (user-side, pinned, confidence 1); a naming key on persona settles the names
 /memory self history [subject]                   self-portrait revision chain (old → new, with archival time)
 /memory self reset [persona|work]                archive the current self-portrait (history kept, nothing deleted)
 /memory export [path]                            export JSON
@@ -168,7 +201,7 @@ whole Config through the settings service and persists it into the profile patch
 
 | Tool | Purpose |
 |---|---|
-| `memory_write` | Structured write (`kind` + `text`, optional `subject` / `field` / `value` / `scopeLevel`; with `kind='agent_self'` also an optional `facet: 'persona' | 'work'`). **The origin is decided by the plugin — the model cannot claim "the user asked for this"** |
+| `memory_write` | Structured write (`kind` + `text`, optional `subject` / `field` / `value` / `scopeLevel`; with `kind='agent_self'` also an optional `facet: 'persona' \| 'work'`). **The origin is decided by the plugin — the model cannot claim "the user asked for this"** |
 | `memory_recall` | Search by query / kind / scope / tag |
 | `memory_list` | List in deterministic order |
 | `memory_forget` | Delete by id; deleting by query needs `confirm: true` (stricter preview threshold) |
@@ -178,7 +211,7 @@ whole Config through the settings service and persists it into the profile patch
 
 ## Configuration
 
-Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 17 fields exposed in
+Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 20 fields exposed in
 the settings form:
 
 | Field | Default | Meaning |
@@ -194,6 +227,9 @@ the settings form:
 | `selfReflectEveryTurns` | `12` | Minimum turns between two reflection prompts |
 | `selfReflectMinTurn` | `4` | Earliest session turn (too early means nothing to reflect on) |
 | `selfReflectMaxPerSession` | `3` | Maximum reflection prompts per session |
+| `selfIntroEnabled` | `true` | First-run naming channel (the one-off "how do we address each other" prompt); in the form `0` = off, `1` = on |
+| `selfIntroMinTurn` | `2` | Earliest session turn for the naming question (no interrogation on turn 1) |
+| `selfIntroMaxAsks` | `2` | Naming questions allowed **across sessions**, cumulatively; once used up it never asks again |
 | `recallMode` | `inject` | `off` / `dry` (compute but do not inject) / `inject` |
 | `recallTopK` | `8` | Max memories recalled per turn |
 | `captureMode` | `rule` | `off` / `rule` |
