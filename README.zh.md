@@ -177,6 +177,7 @@ pnpm build                                        # src/*.ts → lib/*.js（并�
 pnpm test                                         # 先构建，再对构建产物跑单测
 pnpm typecheck                                    # 宿主半边、客户端半边、工具，分别检查，不产出文件
 node tools/eval-recall.ts                         # 离线召回评测（读真实会话日志）
+node tools/bench.ts                               # 热路径基准（每回合召回、每 step 渲染、整合）
 node tools/deploy-dev.ts                          # 把 lib/ 挂成新的开发修订版（需先 pnpm build）
 node tools/deploy-dev.ts --set "recallMode='dry';maxInjectedTokens=200"
 node tools/extract-asar.ts                        # 提取 DSH 客户端产物（排查界面问题）

@@ -3,6 +3,33 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.3 — 2026-10-02
+
+Performance pass on the hot paths, driven by a new benchmark (`pnpm bench`).
+
+### Fixed
+
+- **Per-turn recall silently stopped working on a large store.** The recall scan took 23 ms at 2000 memories while
+  `recallBudgetMs` is 10 ms, and the budget check runs *after* the scan — so the work was done and then thrown away.
+  Two causes, both fixed: every record was re-tokenised on every scan (now cached per record fingerprint, with
+  oldest-first eviction rather than a full clear, so a store larger than the cache no longer thrashes), and the query
+  text was re-tokenised **per record** (now computed once per scan and passed down).
+
+  | Records | recall (per turn) | recall (search) |
+  |---|---|---|
+  | 200 | 2.11 ms → **0.13 ms** | 0.84 ms → **0.05 ms** |
+  | 2000 | 23.03 ms → **0.91 ms** | 8.45 ms → **0.55 ms** |
+  | 5000 | 56.16 ms → **2.33 ms** | 21.01 ms → **1.56 ms** |
+
+  The public functions (`lexicalMatch`, `memoryMatch`, `scoreRecord`) keep their signatures and semantics; only the
+  internals changed, and two tests pin the cache down (cold/warm results must be identical, cache size stays bounded).
+
+### Added
+
+- `tools/bench.ts` (`pnpm bench`): per-turn recall, per-step render and consolidation timings across store sizes, so
+  budget claims like the 10 ms recall target can be checked instead of assumed. The consolidation path measures
+  1.1 ms / 10.0 ms / 26.3 ms at 200 / 2000 / 5000 records — linear and low-frequency, so it needs no work.
+
 ## 0.5.2 — 2026-10-02
 
 Follow-up to 0.5.1: the host-half test suite landed in full, and reviewing it surfaced one more behavioural bug.

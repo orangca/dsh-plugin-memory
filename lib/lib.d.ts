@@ -132,16 +132,13 @@ export declare function deriveOriginFromMessages(messages: unknown): MemoryOrigi
  * 例：`记忆数据落在` → 记忆/忆数/数据/据落/落在；`scripts/release.mjs` → scripts/release/mjs。
  */
 export declare function tokenize(text: unknown): string[];
+/** 清空分词缓存（供测试与基准使用；正常运行靠指纹键自然失效）。 */
+export declare function clearTokenCache(): void;
+/** 当前缓存条目数（可观测性）。 */
+export declare function tokenCacheSize(): number;
 /** 词面命中率：查询 token 在记录里的覆盖率（0–1）。空查询视为完全匹配。
  *  适合**短查询**（模型显式 recall、销毁性操作）。 */
 export declare function lexicalMatch(record: MemoryRecord, query: unknown): number;
-/**
- * 记忆侧命中度：适合**长查询**（R2 用整轮用户消息去匹配一句话记忆）。
- * 语义是「这条记忆的若干关键词出现在了本轮里」，因此
- *   · 分母封顶（默认 4）：不因为记忆长就吃亏；
- *   · 要求至少 `minHits` 个有信息量的 token（长度 ≥2 且非纯数字），挡掉巧合命中。
- * 用查询覆盖率做这件事会在长消息下趋近 0，这是 M4 评测暴露出来的缺陷。
- */
 export declare function memoryMatch(record: MemoryRecord, query: unknown, options?: MemoryMatchOptions): number;
 /** M1 的轻量检索打分：词面命中 + 重要度 + 时效（向量留到 M4）。 */
 export declare function scoreRecord(record: MemoryRecord, query: unknown, now?: number, matchOverride?: number): number;

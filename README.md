@@ -186,6 +186,7 @@ pnpm build                                        # src/*.ts -> lib/*.js (+ the 
 pnpm test                                         # builds, then runs the unit tests on the built output
 pnpm typecheck                                    # host half, client half and tools — no emit
 node tools/eval-recall.ts                         # offline recall eval over real session logs
+node tools/bench.ts                               # hot-path benchmark (per-turn recall, per-step render, consolidation)
 node tools/deploy-dev.ts                          # mount lib/ as a new dev revision (run pnpm build first)
 node tools/deploy-dev.ts --set "recallMode='dry';maxInjectedTokens=200"
 node tools/extract-asar.ts                        # extract DSH client bundles (UI debugging)

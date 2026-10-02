@@ -10,6 +10,7 @@ import type { MakeRecordInput, MemoryConfig } from '../lib/lib.js'
 import {
   DEFAULTS,
   clampText,
+  clearTokenCache,
   compareRecords,
   composeGistText,
   composeSubjectSummary,
@@ -36,6 +37,7 @@ import {
   renderSelfBlock,
   scanSensitive,
   shouldArchive,
+  tokenCacheSize,
   tokenize,
   workspaceKeyOf,
 } from '../lib/lib.js'
@@ -543,4 +545,48 @@ test('clampText：maxItemTokens 非有限时不放弃截断（否则一条超长
   assert.equal(clampText(long, 60, Number.POSITIVE_INFINITY).length, 150)
   // 正常预算照旧（注意有最小 8 字符的下限）
   assert.equal(clampText('abcdefghij', 2, 2.5), 'abcdefg…')
+})
+
+// ---------------------------------------------------------------- 热路径缓存（性能回归）
+
+/** 造一批带真实形状的样本记录。 */
+function benchStore(size: number, scopeKey = workspaceKeyOf('C:/proj/bench')): ReturnType<typeof makeRecord>[] {
+  return Array.from({ length: size }, (_, index) => makeRecord({
+    kind: index % 2 === 0 ? 'semantic' : 'procedural',
+    text: `构建流程与发布流程：这个项目用 pnpm 跑，构建产物落在 dist/ 目录下（第 ${index} 条）。`,
+    subject: `auto.topic-${index % 8}`,
+    tags: [`tag${index % 5}`],
+    scope: { level: 'workspace', key: scopeKey },
+    importance: 0.5,
+  }))
+}
+
+test('recallRecords：冷/热分词缓存的结果完全一致（缓存不得改变语义）', () => {
+  const store = benchStore(300)
+  const shape = (hits: ReturnType<typeof recallRecords>): Array<[string, number, number]> =>
+    hits.map((hit) => [hit.record.id, Number(hit.match.toFixed(6)), Number(hit.score.toFixed(6))])
+
+  clearTokenCache()
+  const cold = recallRecords(store, { query: '构建流程 产物 dist', limit: 10 })
+  const warm = recallRecords(store, { query: '构建流程 产物 dist', limit: 10 })
+  clearTokenCache()
+  const coldAgain = recallRecords(store, { query: '构建流程 产物 dist', limit: 10 })
+
+  assert.ok(cold.length > 0, '测试数据本身应有命中')
+  assert.deepEqual(shape(warm), shape(cold), '热缓存结果必须与冷缓存逐字段一致')
+  assert.deepEqual(shape(coldAgain), shape(cold), '清空缓存后重算结果必须一致')
+})
+
+test('tokenCacheSize：扫描远超上限的记录后缓存有界（不会无界增长）', () => {
+  clearTokenCache()
+  const store = benchStore(8500)
+  recallRecords(store, { query: '构建流程 产物', limit: 5 })
+  const size = tokenCacheSize()
+  assert.ok(size > 0, '扫描后应有缓存条目')
+  // 上限 8192：超出后逐条淘汰最旧的一条，而不是整表清空（整表清空会在
+  // 「扫描量 > 上限」时每次调用都重新分词全库，反而更慢——实测过）。
+  assert.ok(size <= 8192, `缓存条目 ${size} 超过上限 8192`)
+  // 再次扫描仍然可用，且不会因为淘汰而算错
+  const hits = recallRecords(store, { query: '构建流程 产物', limit: 5 })
+  assert.ok(hits.length > 0, '淘汰后重算仍应有命中')
 })
