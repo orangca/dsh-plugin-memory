@@ -362,4 +362,159 @@ export declare function shouldIntroduce(input: IntroInput, cfg: MemoryConfig): b
  * ③ 用 `memory_write` 落盘（三个命名 subject）；④ 用户说不用就记「保持默认称呼」，之后不再问。
  */
 export declare const INTRO_NOTICE: string;
+/** 一条从会话日志里抽出来的消息（只保留梳理用得上的字段）。 */
+export interface TranscriptMessage {
+    role: 'user' | 'assistant';
+    text: string;
+    at: number | null;
+}
+/** 一个会话的抽取结果。 */
+export interface SleepSource {
+    sessionId: string;
+    cwd: string | null;
+    createdAt: number;
+    messages: TranscriptMessage[];
+    /**
+     * 抽取期说明（单会话字符预算截断、总预算未纳入等）。
+     * `buildSleepPlan` 会把它们按 source 顺序汇总进 `plan.notes` —— 契约 §6 要求
+     * 「任何一项预算超限都要在 notes 里写清」，而 `SleepPlan` 是唯一有 notes 的地方。
+     */
+    notes?: string[];
+}
+/**
+ * `transcriptOf` 的入参：契约 §4 的四个字段 + 会话头的两个可选标记。
+ *
+ * 为什么多了 `origin` / `parentSession` / `header`：契约 §4 要「`origin: 'subagent'` 的会话整体跳过」，
+ * 但 §4 给出的入参形状里没有 origin —— 宿主只能从 `DshSessionRecord.header` 里读。
+ * 这三个字段都是**可选**的，所以契约里那四种字段的调用方式一字不用改。
+ */
+export interface SleepSessionInput {
+    sessionId: string;
+    cwd?: string | null;
+    createdAt: number;
+    events: readonly unknown[];
+    /** `DshSessionRecord.header.origin`：`'subagent'` 的会话整体跳过。 */
+    origin?: string | null;
+    /** `DshSessionRecord.header.parentSession`：有值即视为子代理会话。 */
+    parentSession?: string | null;
+    /** 也可以整块透传 `DshSessionRecord.header`。 */
+    header?: {
+        origin?: string | null;
+        parentSession?: string | null;
+    } | null;
+}
+/** `transcriptOf` 的返回值：契约的四个字段 + 会话整体级说明。 */
+export interface TranscriptOfResult {
+    sources: SleepSource[];
+    messages: number;
+    chars: number;
+    skippedSubagents: number;
+    /** 挂不到具体 source 上的说明（例如跳过子代理会话），可原样传给 `buildSleepPlan({ notes })`。 */
+    notes: string[];
+}
+/** 回放捕获产出的一条候选记忆。 */
+export interface SleepCandidate {
+    text: string;
+    sessionId: string;
+    at: number | null;
+    scope: {
+        level: 'workspace' | 'profile';
+        key: string;
+    };
+    origin: MemoryOrigin;
+    confidence: number;
+    /** 与 `recordHash` 同源的指纹，用于「库里已有」判定。 */
+    hash: string;
+    /**
+     * 候选的 kind 与 subject（与实况捕获路径同源：`deriveSubject(text, signal)`）。
+     *
+     * **宿主持候选落盘时请一并透传**：`recordHash` 把 kind/scope/subject/文本都算进去，
+     * 少了 subject 就会写出一个指纹不同的记录，第二次 `/sleep` 便无法识别「已经补录过」。
+     */
+    kind?: MemoryKind;
+    subject?: string | null;
+}
+/** 梳理计划：**只描述要做什么，不做任何写入**。 */
+export interface SleepPlan {
+    scanned: {
+        sessions: number;
+        messages: number;
+        chars: number;
+    };
+    /** 库里没有的候选（按 hash 去重后）。 */
+    backfill: SleepCandidate[];
+    /** 命中已有指纹（库内已有，或本次更早的候选已经出现过）而跳过的条数。 */
+    duplicates: number;
+    /** 建议合并组（同 subject、相似度 ≥ cfg.mergeSimilarity）。 */
+    merges: Array<{
+        ids: string[];
+        subject: string;
+        text: string;
+    }>;
+    /** 建议失效的矛盾条目（保留 keep，失效 drop）。 */
+    conflicts: Array<{
+        keep: string;
+        drop: string;
+        subject: string;
+    }>;
+    /** 建议归档的条目 id（`shouldArchive`）。 */
+    archive: string[];
+    /** 重算后的项目印象（按 workspace 分组，最多 `cfg.sleepMaxGists` 条）。 */
+    gists: Array<{
+        level: 'workspace';
+        key: string;
+        text: string;
+    }>;
+    /** 人读的说明/降级原因，按顺序渲染。 */
+    notes: string[];
+    /** 上限裁剪后的候选数（`cfg.sleepMaxBackfill`）。 */
+    truncated: number;
+}
+/** `buildSleepPlan` 的入参（契约 §4 的四个字段 + 两个可选透传口）。 */
+export interface SleepPlanInput {
+    records: Iterable<MemoryRecord>;
+    sources: readonly SleepSource[];
+    cfg: MemoryConfig;
+    now?: number;
+    /** `transcriptOf(...).notes` 透传：会话整体级说明。 */
+    notes?: readonly string[];
+    /** `transcriptOf(...).skippedSubagents` 透传：跳过子代理会话的说明。 */
+    skippedSubagents?: number;
+}
+/**
+ * 从会话事件抽消息：**只认 `data.source.kind === 'user'` 的 user/message**，
+ * 以及用于回声检测的 assistant/message 文本（`cfg.sleepAssistantContext` 条以内，默认 3，
+ * 取该用户消息之前最近的几条）。空文本、控制字符、超长文本按 `clampText` 处理；
+ * 每个会话的字符预算 `cfg.sleepMaxCharsPerSession`（超预算时保留**最近**的消息并记 note，
+ * 与契约 §4 步骤 7「补录取最新的」同一取向：最近的话更贴近当前事实）。
+ *
+ * 计数口径：`messages`/`chars` 是**保留下来的全部消息**（含为回声检测保留的 assistant 文本）之和；
+ * `sources` 保持入参顺序；被总预算整体裁掉的会话仍会留在 `sources` 里（`messages: []` + `notes`），
+ * 这样「为什么没回放它」能随计划一起呈现，而不是静默消失。
+ */
+export declare function transcriptOf(sessions: readonly SleepSessionInput[], cfg: MemoryConfig): TranscriptOfResult;
+/**
+ * 生成梳理计划（纯函数、确定性）。
+ * 步骤：
+ *  1. 回放捕获：对每条真实用户消息跑 `extractCandidates`（`deriveOriginFromMessages` 语义：命中显式祈使
+ *     → 只补录 user_explicit，其余跳过 —— `/sleep` 只补录用户明确要求记住的东西，不把闲聊变成记忆）；
+ *  2. 去重：`recordHash` 命中库内已有（**含 archived 与 invalid**）→ `duplicates += 1`，不进 backfill
+ *     （本次更早出现过的同指纹候选同样跳过并计数）；
+ *  3. 合并：对库内 active 集跑 `pickMergeGroups`（含 pinned 的组跳过，§6「合并不动 pinned」）；
+ *  4. 冲突：跑 `findConflicts`（会把用户侧/pinned 条目判成 drop、以及涉及 agent_self 的建议跳过并写进 notes，§6）；
+ *  5. 归档：跑 `shouldArchive`；
+ *  6. 项目印象：用回放期间 `detectWorkspaceMarkers` 观察到的标记按 workspace 重算 `composeGistText`；
+ *  7. 裁剪：backfill 最多 `cfg.sleepMaxBackfill` 条，取**最新**的（更贴近当前事实），其余计入 `truncated`；
+ *  8. **不碰自画像**：计划里不产生任何 `agent_self` 写入（人格/工作倾向属于模型自我认知）。
+ */
+export declare function buildSleepPlan(input: SleepPlanInput): SleepPlan;
+/**
+ * 预览/回报文本（中文，与既有命令风格一致；空计划必须给出「无需改动」而不是空白）。
+ *
+ * 按**预览**语义渲染：尾行会声明「以上为计划，未写入任何内容」。
+ * `--apply` 之后的回报文本请由宿主另行生成（要报的是写入计数，不是计划）。
+ */
+export declare function formatSleepPlan(plan: SleepPlan, cfg: MemoryConfig): string;
+/** 计划是否无事可做（backfill/merges/conflicts/archive/gists 全空）。 */
+export declare function sleepPlanIsEmpty(plan: SleepPlan): boolean;
 //# sourceMappingURL=lib.d.ts.map

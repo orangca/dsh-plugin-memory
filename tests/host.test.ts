@@ -29,7 +29,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -87,6 +87,8 @@ interface DomainControl {
   gatePuts: boolean
   failDeletes: boolean
   releasePuts(): void
+  /** 领域 global 的当前值（`/sleep` 的 lastSleepAt 水位断言用）。 */
+  globalValue(): unknown
 }
 
 interface HarnessOptions {
@@ -97,6 +99,10 @@ interface HarnessOptions {
   asyncGlobal?: boolean
   /** 不写自报告（大量写入的用例可以省掉每次 flush 的同步文件写）。 */
   noReport?: boolean
+  /** `ctx.get('sessionQuery')` 的假实现（M8 `/sleep` 用例用）。 */
+  sessionQuery?: unknown
+  /** true 时领域打开失败（验证 `/sleep --apply` 在没有可写领域时中止）。 */
+  failOpen?: boolean
 }
 
 interface Harness {
@@ -114,7 +120,8 @@ interface Harness {
   memory(): MemoryService
   tool(name: string): ToolCall
   command(): CommandRegistration
-  runCommand(rawInput: string): Promise<{ kind: string; text: string }>
+  commandNamed(name: string): CommandRegistration
+  runCommand(rawInput: string, commandName?: string): Promise<{ kind: string; text: string }>
   emit(event: string, ...args: unknown[]): Promise<unknown[]>
   emitSync(event: string, ...args: unknown[]): void
   preStep(payload: unknown, next: () => Promise<unknown>): Promise<unknown>
@@ -144,6 +151,7 @@ function makeFakeDomain(options: HarnessOptions): { domain: Json; control: Domai
       control.gatePuts = false
       for (const resolve of pending.splice(0)) resolve()
     },
+    globalValue: () => globalValue,
   }
 
   const table = {
@@ -211,12 +219,15 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     storageDomain: {
       open: (spec: Json): Promise<Json> => {
         openSpecs.push(spec)
+        if (options.failOpen === true) return Promise.reject(new Error('domain open failed'))
         return Promise.resolve(fakeDomain)
       },
     },
     tokenMeter: { estimateMessage: (): number => 42 },
     settings,
   }
+  // M8：/sleep 需要 ctx.get('sessionQuery')；不提供时正好验证降级路径。
+  if (options.sessionQuery !== undefined) services.sessionQuery = options.sessionQuery
 
   const ctx: Json = {
     get: (service: string): unknown => services[service],
@@ -256,10 +267,13 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     return found
   }
 
-  const command = (): CommandRegistration => {
-    assert.equal(commands.length, 1, 'commands.register 恰好一次')
-    return commands[0]!
+  const commandNamed = (commandName: string): CommandRegistration => {
+    const found = commands.filter((entry) => entry.name === commandName)
+    assert.equal(found.length, 1, `commands.register 必须恰好注册一次 ${commandName}`)
+    return found[0]!
   }
+
+  const command = (): CommandRegistration => commandNamed('memory')
 
   const settle = async (ticks = 8): Promise<void> => {
     for (let index = 0; index < ticks; index += 1) await new Promise((resolve) => setImmediate(resolve))
@@ -308,8 +322,8 @@ function makeHarness(options: HarnessOptions = {}): Harness {
 
   return {
     ctx, tools, commands, sections, contexts, effects, provided, openSpecs, domain: control, roots, tempDir,
-    memory, tool, command,
-    runCommand: async (rawInput: string) => await command().handler({ rawInput }),
+    memory, tool, command, commandNamed,
+    runCommand: async (rawInput: string, commandName = 'memory') => await commandNamed(commandName).handler({ rawInput }),
     emit, emitSync, preStep, settle, runEffect, report, reportState, dispose,
   }
 }
@@ -319,7 +333,7 @@ const agentWith = (cwd: string): Json => ({ session: { id: 'session-1', seq: 5, 
 
 // ---------------------------------------------------------------- 1. 注册契约
 
-test('host#1 apply 注册契约：7 个工具（都带 output）、memory 命令、两条注入通道各 1 次', async (t) => {
+test('host#1 apply 注册契约：7 个工具（都带 output）、memory + sleep 两条命令、两条注入通道各 1 次', async (t) => {
   const harness = makeHarness()
   t.after(() => harness.dispose())
 
@@ -334,8 +348,15 @@ test('host#1 apply 注册契约：7 个工具（都带 output）、memory 命令
     assert.equal((entry.parameters as Json)?.type, 'object', `${entry.name}.parameters 必须是 JSON Schema 对象`)
   }
 
-  assert.equal(harness.commands.length, 1)
-  assert.equal(harness.commands[0]?.name, 'memory')
+  // 契约 §5.1：`/sleep` 是**独立命令**（不是 /memory 的子命令），两条命令各注册一次。
+  assert.equal(harness.commands.length, 2, '/memory 与 /sleep 各注册一次')
+  assert.deepEqual(harness.commands.map((entry) => entry.name).sort(), ['memory', 'sleep'])
+  const sleepHint = String((harness.commandNamed('sleep') as unknown as { input?: { hint?: string } }).input?.hint ?? '')
+  assert.equal(sleepHint, '[--apply] [--sessions=N] [--all]', 'sleep 的 input.hint 必须与契约 §5.1 一致')
+  assert.match(String(harness.commandNamed('sleep').description ?? ''), /梳理/u)
+  // 独立命令：/memory 的子命令表里不该多出 sleep（否则等于注册成子命令）
+  const viaMemory = await harness.runCommand('sleep')
+  assert.match(viaMemory.text, /用法：\/memory list/u, 'sleep 不是 /memory 的子命令')
 
   assert.equal(harness.sections.length, 1, 'systemPrompt.section 恰好注册一次')
   assert.equal(harness.contexts.length, 1, 'systemPrompt.context 恰好注册一次')
@@ -1349,3 +1370,531 @@ test('host#27 初次设定：用户用 /memory self set persona name … 直接�
   assert.equal(work.kind, 'success')
   assert.ok((harness.memory().list() as Json[]).some((row) => row.subject === 'self.work.general'))
 })
+
+// ================================================================ M8 `/sleep`
+// 契约：docs/sleep.md 第 5/6 节。宿主侧三个不可妥协项在这里逐条钉死：
+//   ① 默认（无 --apply）**零写入**，连计数都不动；
+//   ② `--apply` 的**第一件事**是导出备份，备份失败即中止；
+//   ③ 无 sessionQuery 时优雅降级（可读文案、不抛），且不碰自画像 / 用户所有物。
+//
+// 假设的宿主服务按 src/types.ts 的 `DshSessionQuery` 构造：listSessions / filterSessions /
+// readSession / listEvents，事件形状按契约 §3（user/message 只认 data.source.kind === 'user'）。
+
+interface FakeSessionSpec {
+  id: string
+  cwd?: string
+  createdAt: number
+  origin?: 'subagent'
+  parentSession?: string
+  events: Json[]
+}
+
+interface FakeSessionQuery {
+  /** 交给假 ctx 的 `sessionQuery` 服务。 */
+  query: Json
+  /** `readSession` 的调用顺序（断言「读了哪些会话」）。 */
+  read: string[]
+  /** `filterSessions` 收到的过滤器（断言默认按 cwd 过滤）。 */
+  filterCalls: Json[][]
+  listCalls(): number
+}
+
+function makeFakeSessionQuery(specs: readonly FakeSessionSpec[]): FakeSessionQuery {
+  const byId = new Map(specs.map((spec) => [spec.id, spec]))
+  const read: string[] = []
+  const filterCalls: Json[][] = []
+  let listCalls = 0
+
+  const headerOf = (spec: FakeSessionSpec): Json => {
+    const header: Json = { id: spec.id, createdAt: spec.createdAt }
+    if (spec.cwd !== undefined) header.cwd = spec.cwd
+    if (spec.origin !== undefined) header.origin = spec.origin
+    if (spec.parentSession !== undefined) header.parentSession = spec.parentSession
+    return header
+  }
+  const recordOf = (spec: FakeSessionSpec): Json => ({ header: headerOf(spec), live: false, persisted: true })
+
+  const query: Json = {
+    listSessions: async (): Promise<Json[]> => {
+      listCalls += 1
+      return specs.map(recordOf)
+    },
+    filterSessions: async (filters: readonly Json[]): Promise<Json[]> => {
+      const copy = filters.map((filter) => ({ ...filter }))
+      filterCalls.push(copy)
+      return specs
+        .filter((spec) => copy.every((filter) => {
+          if (filter.kind === 'cwd') return ((filter.values as unknown[]) ?? []).includes(spec.cwd ?? null)
+          return true
+        }))
+        .map(recordOf)
+    },
+    readSession: async (sessionId: string): Promise<Json> => {
+      const spec = byId.get(sessionId)
+      assert.ok(spec, `readSession 收到未知会话：${sessionId}`)
+      read.push(sessionId)
+      const session: Json = { id: spec.id, createdAt: spec.createdAt }
+      if (spec.cwd !== undefined) session.cwd = spec.cwd
+      return { session, inheritedEventCount: 0, events: spec.events }
+    },
+    listEvents: async (sessionId: string): Promise<Json[]> =>
+      (byId.get(sessionId)?.events ?? []).map((event) => ({
+        sessionId, seq: event.seq ?? 0, type: event.type, time: event.time ?? 0,
+      })),
+  }
+  return { query, read, filterCalls, listCalls: () => listCalls }
+}
+
+/** 真实用户消息（`data.source.kind === 'user'`）。 */
+const sleepUserEvent = (text: string, seq = 1): Json =>
+  ({ type: 'user/message', seq, time: 1_000, data: { source: { kind: 'user' }, content: [{ type: 'text', text }] } })
+/** 宿主注入的消息（`data.source.kind === 'model'`）——**不是**用户说的，不许补录。 */
+const sleepInjectedEvent = (text: string, seq = 2): Json =>
+  ({ type: 'user/message', seq, time: 1_001, data: { source: { kind: 'model' }, content: [{ type: 'text', text }] } })
+/** assistant 消息（回声检测的上下文）。 */
+const sleepAssistantEvent = (text: string, seq = 3): Json =>
+  ({ type: 'assistant/message', seq, time: 1_002, data: { message: { role: 'assistant', content: [{ type: 'text', text }] } } })
+
+const SLEEP_CWD = 'C:\\work\\demo'
+const SLEEP_OTHER_CWD = 'C:\\other\\proj'
+
+/**
+ * 固定夹具：一个别的项目的会话、两个本项目的会话、一个**最新**的子代理会话。
+ * 子代理的 cwd（`C:\work\sub`）故意与用户工作目录不同：若宿主拿它当锚点，按 cwd 过滤就会读错会话。
+ */
+const sleepFixture = (): FakeSessionSpec[] => [
+  {
+    id: 'sess-other',
+    cwd: SLEEP_OTHER_CWD,
+    createdAt: 1_000,
+    events: [sleepUserEvent('记住：别的项目的事不许混进来。')],
+  },
+  {
+    id: 'sess-old',
+    cwd: SLEEP_CWD,
+    createdAt: 2_000,
+    events: [sleepUserEvent('记住：提交信息用中文写，一次只做一件事。')],
+  },
+  {
+    id: 'sess-new',
+    cwd: SLEEP_CWD,
+    createdAt: 3_000,
+    events: [
+      sleepUserEvent('记住：构建统一用 pnpm，产物输出到 dist 目录。', 1),
+      sleepInjectedEvent('记住：这条是注入的，不许补录。', 2),
+      sleepAssistantEvent('好的，我会按 pnpm 构建并把产物放到 dist。', 3),
+    ],
+  },
+  {
+    id: 'sess-sub',
+    cwd: 'C:\\work\\sub',
+    createdAt: 4_000,
+    origin: 'subagent',
+    parentSession: 'sess-new',
+    events: [sleepUserEvent('记住：子代理的这条不许补录。')],
+  },
+]
+
+const sleepHarness = (options: HarnessOptions = {}): { harness: Harness; fake: FakeSessionQuery } => {
+  const fake = makeFakeSessionQuery(sleepFixture())
+  return { harness: makeHarness({ ...options, sessionQuery: fake.query }), fake }
+}
+
+// ---------------------------------------------------------------- 28. 无 sessionQuery 降级
+
+test('host#28 /sleep 无 sessionQuery：可读降级文案、绝不抛、零写入，且 /memory 仍可用', async (t) => {
+  const harness = makeHarness() // 故意不提供 sessionQuery
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const result = await harness.runCommand('--apply', 'sleep')
+  assert.equal(result.kind, 'error', '缺服务必须走 error 而不是抛异常')
+  assert.match(result.text, /sessionQuery/u, '降级文案要点名缺的是哪个服务')
+  assert.match(result.text, /仍可用/u, '必须告诉用户还有别的路可走')
+  assert.match(result.text, /\/memory consolidate/u, '契约 §5.3：要说明 /memory consolidate 仍可用')
+
+  assert.equal(harness.domain.puts.length, 0, '降级路径不得碰领域表')
+  assert.equal(harness.memory().list().length, 0)
+  assert.equal((await harness.runCommand('stats')).kind, 'success', '/memory 自身不受影响')
+})
+
+// ---------------------------------------------------------------- 29. 预览零写入
+
+test('host#29 /sleep 预览：零写入、按 cwd 过滤（锚点跳过子代理会话）、--sessions=N 与 --all', async (t) => {
+  const { harness, fake } = sleepHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const result = await harness.runCommand('', 'sleep')
+  assert.equal(result.kind, 'success')
+  assert.match(result.text, /记忆梳理稿 · 预览/u, '默认必须只预览')
+  assert.match(result.text, /未写入任何内容/u)
+  // 回看规模来自契约 §4 的 plan.scanned：两个本项目会话（别的项目与会话外的子代理都没进来）
+  assert.match(result.text, /回看 2 个会话 · \d+ 条消息 · \d+ 字符/u)
+
+  // 两条真实用户消息都该成为补录候选；注入的 model 消息不算
+  const backfill = Number(/补录 (\d+) 条/u.exec(result.text)?.[1] ?? '0')
+  assert.ok(backfill >= 2, `两个会话的真实用户消息都应进入补录候选，实际 ${backfill}`)
+  assert.doesNotMatch(result.text, /注入的/u, 'data.source.kind === "model" 的注入消息不是用户消息（防自激 §3）')
+  assert.doesNotMatch(result.text, /子代理的/u, '子代理会话整体跳过')
+  assert.doesNotMatch(result.text, /别的项目/u, '默认按 cwd 过滤，别的项目不参与')
+
+  // 零写入：领域表一次 put 都没有，记录数不动，state.sleep 计数也不动
+  assert.equal(harness.domain.puts.length, 0, '预览必须零写入')
+  assert.equal(harness.memory().list().length, 0)
+  assert.match((await harness.runCommand('stats')).text, /梳理（\/sleep）：运行 0 次/u, '预览不推进计数')
+
+  // 读了哪些会话：cwd 锚点取「最近一个非 subagent 会话」（sess-new 的 demo），而不是最新的 sess-sub
+  assert.deepEqual(fake.filterCalls[0], [{ kind: 'cwd', values: [SLEEP_CWD] }], '默认必须按 cwd 过滤')
+  assert.deepEqual(fake.read, ['sess-new', 'sess-old'], '按 createdAt 降序读最近的非子代理会话')
+
+  // --sessions=N：只回看最近的 N 个
+  fake.read.length = 0
+  assert.match((await harness.runCommand('--sessions=1', 'sleep')).text, /回看 1 个会话/u)
+  assert.deepEqual(fake.read, ['sess-new'])
+
+  // 上限 20：超限要在输出里写清（契约 §6「任何一项超限都要在 notes 里写清」）
+  fake.read.length = 0
+  assert.match((await harness.runCommand('--sessions=999', 'sleep')).text, /会话数上限 20/u)
+
+  // --all：不按 cwd 过滤，但仍跳过子代理会话
+  fake.read.length = 0
+  const all = await harness.runCommand('--all', 'sleep')
+  assert.equal(all.kind, 'success')
+  assert.deepEqual(fake.read, ['sess-new', 'sess-old', 'sess-other'])
+  assert.match(all.text, /回看 3 个会话/u)
+  assert.match(all.text, /别的项目/u, '--all 时别的项目的会话要参与')
+  assert.doesNotMatch(all.text, /子代理的/u, '--all 也不许把子代理会话当用户会话')
+})
+
+// ---------------------------------------------------------------- 30. apply：先备份后写
+
+test('host#30 /sleep --apply：先导出备份再落盘（备份内容不含本次新增）、水位与统计', async (t) => {
+  const { harness } = sleepHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 库里先有一条：备份文件里应当恰好只有它 —— 这就是「写入发生在备份之后」的证据
+  const preexisting = await harness.memory().write({
+    kind: 'user_profile',
+    text: '用户偏好中文回答与英文标识符',
+    subject: 'language.preference',
+  })
+  assert.equal(preexisting.ok, true)
+  const before = harness.memory().list().length
+  assert.equal(before, 1)
+
+  const result = await harness.runCommand('--apply', 'sleep')
+  assert.equal(result.kind, 'success', result.text)
+  const added = Number(/补录 (\d+) 条/u.exec(result.text)?.[1] ?? '0')
+  assert.ok(added >= 1, `--apply 应至少补录 1 条，实际 ${added}`)
+  assert.match(result.text, /备份：/u)
+
+  // 备份文件：命名、位置（exportDir=reportPath 所在目录）与内容都按契约 §5.2a
+  const backups = readdirSync(harness.tempDir).filter((name) => name.startsWith('sleep-backup-'))
+  assert.equal(backups.length, 1, `应恰好导出 1 份备份，实际 ${backups.join(', ')}`)
+  assert.match(backups[0]!, /^sleep-backup-.*\.json$/u)
+  const backup = JSON.parse(readFileSync(join(harness.tempDir, backups[0]!), 'utf8')) as { items: Json[] }
+  assert.equal(backup.items.length, before, '备份必须只包含 apply 之前的库（证明先备份后写）')
+  assert.ok(
+    backup.items.every((item) => !String(item.text).includes('pnpm')),
+    '本次补录的内容不得出现在备份里：否则说明写入发生在备份之前',
+  )
+  assert.ok(backup.items.some((item) => item.id === preexisting.id))
+
+  // 补录落库：内容来自真实用户消息，注入消息与子代理消息都没进来
+  const rows = harness.memory().list() as Json[]
+  assert.ok(rows.length > before, '--apply 必须落盘')
+  assert.ok(rows.some((row) => String(row.text).includes('pnpm')), '补录的正文应来自会话里的用户消息')
+  assert.ok(rows.every((row) => !String(row.text).includes('注入的')), '注入消息不得补录')
+  assert.ok(rows.every((row) => !String(row.text).includes('子代理的')), '子代理会话不得补录')
+  assert.ok(rows.every((row) => row.kind !== 'agent_self'), '/sleep 不生成任何自画像写入（§6）')
+  const backfilled = rows.find((row) => String(row.text).includes('pnpm'))!
+  assert.equal(backfilled.origin, 'user_explicit', '补录来源用候选的来源')
+  assert.equal(backfilled.status, 'active')
+
+  // 水位：MemoryMeta.lastSleepAt 落进领域 global（契约 §5.2c）
+  const meta = harness.domain.globalValue() as Json
+  assert.equal(typeof meta.lastSleepAt, 'number', 'lastSleepAt 必须随水位落盘')
+  assert.ok(Number(meta.lastSleepAt) > 0)
+
+  // 统计：state.sleep 计数 + /memory stats 的 sleep 行
+  const stats = await harness.runCommand('stats')
+  assert.match(stats.text, /梳理（\/sleep）：运行 1 次/u)
+  const counters = /运行 (\d+) 次（补录 (\d+) \/ 合并 (\d+) \/ 失效 (\d+) \/ 归档 (\d+) \/ 印象 (\d+) \/ 跳过 (\d+)）/u.exec(stats.text)
+  assert.ok(counters, `stats 行格式异常：${stats.text}`)
+  assert.equal(Number(counters[2]), added, 'stats 的补录计数要与本次回报一致')
+  assert.match(stats.text, /最近 .*2 会话 \/ \d+ 消息 \/ \d+ 字符/u, '最近一次扫描的规模要写进 stats')
+})
+
+// ---------------------------------------------------------------- 30b/30c. 中止路径
+
+test('host#30b 备份失败即中止 --apply：库一个字节都不改（没有备份就不改库）', async (t) => {
+  // 用一个**文件**占住路径：exportDir 的父级不是目录 → mkdirSync/writeFileSync 必然失败。
+  const blockerDir = mkdtempSync(join(tmpdir(), 'dsh-memory-blocker-'))
+  const blocker = join(blockerDir, 'blocker')
+  writeFileSync(blocker, 'not a directory')
+  t.after(() => rmSync(blockerDir, { recursive: true, force: true }))
+
+  const fake = makeFakeSessionQuery(sleepFixture())
+  const harness = makeHarness({ sessionQuery: fake.query, config: { exportDir: join(blocker, 'nested') } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  await harness.memory().write({ kind: 'user_profile', text: '用户偏好中文回答与英文标识符', subject: 'language.preference' })
+  const before = harness.memory().list() as Json[]
+
+  const result = await harness.runCommand('--apply', 'sleep')
+  assert.equal(result.kind, 'error', '备份失败必须中止')
+  assert.match(result.text, /备份失败/u)
+  assert.match(result.text, /中止/u)
+  assert.match(result.text, /没有备份就不改库/u)
+
+  const after = harness.memory().list() as Json[]
+  assert.equal(after.length, before.length, '中止后记录数不得变化')
+  assert.deepEqual(after.map((row) => row.id), before.map((row) => row.id))
+  assert.ok(after.every((row) => !String(row.text).includes('pnpm')), '中止后不得有任何补录')
+  assert.match((await harness.runCommand('stats')).text, /梳理（\/sleep）：运行 0 次/u, '中止的运行不计入 runs')
+})
+
+test('host#30c 领域未打开时 --apply 中止（预览仍可用）：不写盘、不报成功', async (t) => {
+  const fake = makeFakeSessionQuery(sleepFixture())
+  const harness = makeHarness({ sessionQuery: fake.query, failOpen: true })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const applied = await harness.runCommand('--apply', 'sleep')
+  assert.equal(applied.kind, 'error')
+  assert.match(applied.text, /领域未打开/u)
+  assert.equal(harness.domain.puts.length, 0, '没有可写领域时不得落盘，也不得假装成功')
+
+  // 预览不依赖领域，仍要给出计划（只读性质不受影响）
+  const preview = await harness.runCommand('', 'sleep')
+  assert.equal(preview.kind, 'success')
+  assert.match(preview.text, /记忆梳理稿 · 预览/u)
+})
+
+// ---------------------------------------------------------------- 31. 幂等
+
+test('host#31 /sleep --apply 重复执行幂等：第二次不再新增', async (t) => {
+  const { harness } = sleepHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  assert.equal((await harness.runCommand('--apply', 'sleep')).kind, 'success')
+  const afterFirst = harness.memory().list() as Json[]
+  assert.ok(afterFirst.length >= 2, '第一次应当补录进来')
+
+  const second = await harness.runCommand('--apply', 'sleep')
+  assert.equal(second.kind, 'success')
+  assert.match(second.text, /补录 0 条/u, '第二次不得再补录（指纹已命中）')
+  const afterSecond = harness.memory().list() as Json[]
+  assert.equal(afterSecond.length, afterFirst.length, '记录数不得增长')
+  assert.deepEqual(
+    afterSecond.map((row) => row.id).sort(),
+    afterFirst.map((row) => row.id).sort(),
+    '不得新建任何条目',
+  )
+})
+
+// ---------------------------------------------------------------- 32. 开关
+
+test('host#32 sleepEnabled=false：拒绝执行且零写入（与 sessionQuery 是否可用无关）', async (t) => {
+  const { harness } = sleepHarness({ config: { sleepEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const result = await harness.runCommand('--apply', 'sleep')
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /sleepEnabled=false/u)
+  assert.match(result.text, /不做任何事/u)
+  assert.equal(harness.domain.puts.length, 0, '关掉开关后一次写盘都不许发生')
+  assert.equal(harness.memory().list().length, 0)
+  assert.match((await harness.runCommand('stats')).text, /梳理（\/sleep）：运行 0 次/u)
+})
+
+// ---------------------------------------------------------------- 33. 与召回模式无关
+
+test('host#33 /sleep 不受 recallMode / autoRecall 影响（契约 §5.5）', async (t) => {
+  const { harness } = sleepHarness({ config: { recallMode: 'off', autoRecall: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const preview = await harness.runCommand('', 'sleep')
+  assert.equal(preview.kind, 'success', '关掉召回不等于关掉 /sleep')
+  assert.match(preview.text, /补录 [1-9]\d* 条/u, '预览仍应给出补录计划')
+
+  const applied = await harness.runCommand('--apply', 'sleep')
+  assert.equal(applied.kind, 'success')
+  assert.match(applied.text, /补录 [1-9]\d* 条/u)
+  assert.ok(harness.memory().list().length > 0, '即使 recallMode=off 也要真的落盘')
+})
+
+// ---------------------------------------------------------------- 34. stats 行（命令 + 工具）
+
+test('host#34 /memory stats 与 memory_stats 工具都暴露 sleep 行与结构化计数', async (t) => {
+  const { harness } = sleepHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 未运行时也要有一行（不能等跑过才出现）
+  assert.match((await harness.runCommand('stats')).text, /梳理（\/sleep）：运行 0 次.*尚未运行/u)
+
+  assert.equal((await harness.runCommand('--apply', 'sleep')).kind, 'success')
+  const raw = JSON.parse(String(await harness.tool('memory_stats').execute({}))) as Json
+  const sleep = raw.sleep as Json
+  assert.ok(sleep, 'memory_stats 必须带 sleep 字段')
+  assert.equal(Number(sleep.runs), 1)
+  assert.ok(Number(sleep.added) >= 1)
+  assert.equal(Number(sleep.merged), 0)
+  assert.equal((sleep.last as Json).sessions, 2, 'last 记录最近一次回看的会话数')
+  assert.match(String(raw.text), /梳理（\/sleep）：运行 1 次/u, '工具文本与 /memory stats 同步')
+})
+
+// ---------------------------------------------------------------- 35. Schema（7 个 sleep 键）
+
+test('host#35 配置 Schema：契约 §4.1 的 7 个 sleep 键与默认值（无 schemastery 时跳过）', async () => {
+  if (Config === undefined) {
+    // 发布版 profile：schemastery 不可解析 → 没有设置页表单（module.test.ts 覆盖这条降级路径）
+    assert.equal(Config, undefined)
+    return
+  }
+  const dict = (Config as { dict?: Record<string, { meta?: { default?: unknown } }> }).dict ?? {}
+  const expected: Array<[string, unknown]> = [
+    ['sleepEnabled', true],
+    ['sleepSessions', 3],
+    ['sleepMaxCharsPerSession', 120000],
+    ['sleepMaxCharsTotal', 300000],
+    ['sleepMaxBackfill', 20],
+    ['sleepAssistantContext', 3],
+    ['sleepMaxGists', 8],
+  ]
+  for (const [key, value] of expected) {
+    const entry = dict[key]
+    assert.ok(entry, `Schema 必须声明 ${key}`)
+    assert.deepEqual(entry.meta?.default, value, `${key} 的默认值必须与契约 §4.1 一致`)
+  }
+})
+
+// ---------------------------------------------------------------- 37. 配置不被宿主改写
+
+test('host#37 sleepMaxBackfill=0：宿主不得把「不补录」悄悄改成默认 20', async (t) => {
+  const { harness } = sleepHarness({ config: { sleepMaxBackfill: 0 } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const preview = await harness.runCommand('', 'sleep')
+  assert.equal(preview.kind, 'success')
+  assert.match(preview.text, /无需改动/u, '上限 0 时计划里不该有可补录的候选')
+  assert.doesNotMatch(preview.text, /补录 \d+ 条（按时间升序）/u, '候选列表必须是空的')
+
+  const applied = await harness.runCommand('--apply', 'sleep')
+  assert.equal(applied.kind, 'success')
+  assert.match(applied.text, /梳理完成（\/sleep --apply）：补录 0 条/u)
+  assert.equal(harness.memory().list().length, 0, '配置说别写，就一条都不许写')
+})
+
+// ---------------------------------------------------------------- 38. agent_self 的第二道防线
+
+test('host#38 agent_self 冲突目标：/sleep 不得动自画像（计划层已排除，宿主侧再挡一次）', async (t) => {
+  const { harness } = sleepHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 用 import 造两条**同 subject/field、不同 value** 的 agent_self：import 不带 facet，
+  // 因此绕过自画像收敛，能真的落下两条 active 记录 —— 这正好是 findConflicts 会配对的形状。
+  const file = join(harness.tempDir, 'agent-self.json')
+  writeFileSync(file, JSON.stringify({
+    schemaVersion: 1,
+    items: [
+      { kind: 'agent_self', subject: 'self.work.style', field: 'verbosity', value: 'low', text: '我倾向用很短的回复，尽量少铺垫。' },
+      { kind: 'agent_self', subject: 'self.work.style', field: 'verbosity', value: 'high', text: '我倾向把背景、选项与理由都展开说明。' },
+    ],
+  }))
+  assert.equal((await harness.runCommand(`import ${file}`)).kind, 'success')
+  const before = (harness.memory().list() as Json[]).filter((row) => row.kind === 'agent_self')
+  assert.equal(before.length, 2, '前置条件：库里有两条同槽位的 agent_self')
+
+  // 计划里就不该出现针对自画像的动作（契约 §4 步骤 8）：预览不能把 agent_self 列进
+  // 补录/合并/失效/归档任何一节的**条目行**里（它只允许出现在「说明」中，例如「已跳过…」）。
+  const preview = await harness.runCommand('', 'sleep')
+  const lines = preview.text.split('\n')
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = lines[index]!
+    if (!/^(补录|合并|失效|归档) /u.test(header)) continue
+    const body: string[] = []
+    for (let next = index + 1; next < lines.length && lines[next]!.startsWith('  '); next += 1) body.push(lines[next]!)
+    assert.ok(body.length > 0, `「${header}」这一节应当有条目行`)
+    assert.ok(body.every((line) => !line.includes('agent_self')), `自画像不得出现在「${header}」的条目里`)
+  }
+
+  const result = await harness.runCommand('--apply', 'sleep')
+  assert.equal(result.kind, 'success', result.text)
+  assert.match(result.text, /补录 [1-9]\d* 条/u, '这次 apply 确实执行了（不是整体空跑）')
+
+  // 自画像一条都不能被 /sleep 改写（§6）：两条都必须还是 active、正文逐字不变
+  const after = (harness.memory().list() as Json[]).filter((row) => row.kind === 'agent_self')
+  assert.equal(after.length, 2, '不得新建 agent_self')
+  for (const record of before) {
+    const now = after.find((row) => row.id === record.id)!
+    assert.ok(now, `${record.id} 不得消失`)
+    assert.equal(now.status, 'active', 'agent_self 不得被 /sleep 置为 invalid/archived')
+    assert.equal(now.text, record.text, 'agent_self 正文不得被改写')
+    assert.equal(now.value, record.value)
+  }
+})
+
+// ---------------------------------------------------------------- 36. 不碰自画像与用户所有物
+
+test('host#36 /sleep --apply 不碰自画像与用户所有物：模型侧候选被挡、既有条目原样保留', async (t) => {
+  // 会话里放一句命中 agent-self-directive 的指令（「以后你要…」）：这类候选绝不能被补录成自画像。
+  const fake = makeFakeSessionQuery([
+    {
+      id: 'sess-self',
+      cwd: SLEEP_CWD,
+      createdAt: 5_000,
+      events: [
+        sleepUserEvent('记住：构建统一用 pnpm，产物输出到 dist 目录。', 1),
+        sleepUserEvent('记住：以后你要先问我再动手，不要自己改公共接口。', 2),
+      ],
+    },
+  ])
+  const harness = makeHarness({ sessionQuery: fake.query })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 用户所有物：pinned 的用户记忆 + 用户侧自画像各一条
+  const pinned = await harness.memory().write({
+    kind: 'user_profile', text: '用户偏好中文回答与英文标识符', subject: 'language.preference', pinned: true,
+  })
+  const portrait = await harness.memory().write({
+    kind: 'agent_self', facet: 'persona', subject: 'self.persona.general',
+    text: '我在解释概念时会先给出结论，再补充理由。', origin: 'user_explicit', pinned: true,
+  })
+  assert.equal(pinned.ok, true)
+  assert.equal(portrait.ok, true)
+  const before = harness.memory().list() as Json[]
+
+  const result = await harness.runCommand('--apply', 'sleep')
+  assert.equal(result.kind, 'success', result.text)
+  const rows = harness.memory().list() as Json[]
+
+  // 自画像：一条都不许多（既有的那条必须逐字保留）
+  const portraits = rows.filter((row) => row.kind === 'agent_self')
+  assert.equal(portraits.length, 1, '/sleep 不得新建 agent_self 条目（§6）')
+  assert.equal(portraits[0]!.id, portrait.id)
+  assert.equal(portraits[0]!.text, before.find((row) => row.id === portrait.id)!.text, '自画像正文不得被改写')
+  assert.equal(portraits[0]!.pinned, true)
+  assert.equal(portraits[0]!.status, 'active')
+  assert.ok(rows.every((row) => !String(row.text).includes('先问我再动手')), 'agent_self 候选不得被补录')
+
+  // 用户所有物：pinned 条目原样保留（不合并、不归档、不改 pin）
+  const kept = rows.find((row) => row.id === pinned.id)!
+  assert.equal(kept.status, 'active')
+  assert.equal(kept.pinned, true)
+  assert.equal(kept.text, '用户偏好中文回答与英文标识符')
+
+  // 对照：普通候选确实补录了（证明这次 apply 真的执行了，而不是整体跳过）
+  assert.ok(rows.some((row) => String(row.text).includes('pnpm') && row.kind !== 'agent_self'))
+})
+

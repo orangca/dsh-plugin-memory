@@ -160,6 +160,20 @@ export interface MemoryConfig {
   selfIntroMinTurn: number
   /** M7：**跨会话**累计最多问几次称呼，问满即永久停手。 */
   selfIntroMaxAsks: number
+  /** M8：`/sleep` 命令开关。 */
+  sleepEnabled: boolean
+  /** M8：默认回看最近几个会话。 */
+  sleepSessions: number
+  /** M8：单会话字符预算。 */
+  sleepMaxCharsPerSession: number
+  /** M8：所有会话合计字符预算。 */
+  sleepMaxCharsTotal: number
+  /** M8：单次最多补录几条。 */
+  sleepMaxBackfill: number
+  /** M8：每条用户消息前保留几条 assistant 文本（回声检测用）。 */
+  sleepAssistantContext: number
+  /** M8：最多重算几条项目印象。 */
+  sleepMaxGists: number
   gistBudgetRatio: number
   charsPerToken: number
   sectionOrder: number
@@ -360,3 +374,60 @@ export interface DshPluginContext {
   /** 对外提供服务（本插件用它暴露 memory 服务）。 */
   provide(name: string, service: unknown): void
 }
+
+// ---------------------------------------------------------------------------
+// M8：`/sleep` 用到的会话查询接缝（实测契约，只声明本插件真正调用的四个方法）
+//
+// 为什么不用文件读取：DSH 的会话日志是**多 zstd 帧拼接**的，`zstdDecompressSync`
+// 只解第一帧（实测一个 8MB 的日志只解出 213 字符），手工解帧既脆弱又依赖内部格式。
+// `ctx.get('sessionQuery')` 是运行版提供的正式读取通道，取不到时要降级而不是崩。
+// ---------------------------------------------------------------------------
+
+/** `ctx.get('sessionQuery')` 的最小可用子集。 */
+export interface DshSessionQuery {
+  listSessions(signal?: AbortSignal): Promise<DshSessionRecord[]>
+  filterSessions(filters: readonly DshSessionResultFilter[], signal?: AbortSignal): Promise<DshSessionRecord[]>
+  readSession(sessionId: string): Promise<DshSessionLogSnapshot>
+  listEvents(sessionId: string): Promise<DshSessionEventRecord[]>
+}
+
+export interface DshSessionRecord {
+  header: {
+    id: string
+    cwd?: string
+    createdAt: number
+    origin?: 'subagent'
+    parentSession?: string
+  }
+  live: boolean
+  persisted: boolean
+}
+
+export interface DshSessionLogSnapshot {
+  session: { id: string; cwd?: string; createdAt: number }
+  inheritedEventCount: number
+  events: DshSessionEvent[]
+}
+
+/** 会话事件：本插件只关心 `type` / `seq` / `time` / `data`。 */
+export interface DshSessionEvent {
+  type: string
+  seq: number
+  time: number
+  data?: Record<string, unknown>
+}
+
+/** `listEvents` 的轻量事件记录（没有 data，只用于统计/诊断）。 */
+export interface DshSessionEventRecord {
+  sessionId: string
+  seq: number
+  type: string
+  time: number
+}
+
+export type DshSessionResultFilter =
+  | { kind: 'id'; values: readonly string[] }
+  | { kind: 'cwd'; values: readonly (string | null)[] }
+  | { kind: 'created-at'; from?: number; to?: number }
+  | { kind: 'parent'; values: readonly (string | null)[] }
+  | { kind: 'availability'; values: readonly ('live' | 'persisted')[] }

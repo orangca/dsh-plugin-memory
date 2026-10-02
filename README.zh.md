@@ -32,7 +32,8 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
    - **R1 常驻**：画像、自画像、当前工作区的项目印象；
    - **R2 按轮**：用本轮用户消息做记忆侧命中匹配，只注入真的相关的条目，同一 id 有冷却轮次。
 3. **整合**：默认每 30 分钟一次 + 启动补跑。合并重复、把矛盾条目标记为失效（可恢复）、
-   按类型半衰期衰减归档、对单一主题过多的条目做规则式摘要。
+   按类型半衰期衰减归档、对单一主题过多的条目做规则式摘要。另有用户显式触发的跨会话梳理
+   `/sleep`（见下）。
 
 ## 自画像：人格 + 工作倾向
 
@@ -93,6 +94,42 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 /memory self reset [persona|work]         归档当前自画像（保留历史，不删除）
 ```
 
+## `/sleep`：空闲梳理
+
+`/memory consolidate` 只做**库内治理**（合并 / 失效 / 归档 / 摘要）；`/sleep` 是**独立命令**（不是
+`/memory` 的子命令），做的是**跨库 + 跨会话**的梳理：把最近若干会话的**完整事件日志**重新过一遍记忆管线，
+补上当时漏掉的记忆，再把整个库重新排一遍。
+
+```
+/sleep [--sessions=N] [--all] [--apply]
+```
+
+- **默认只是预览**：只读、只算，输出一份「会怎么改」的计划 —— 补录几条、合并几组、失效几条、归档几条、
+  重算哪几段项目印象。**不写任何东西**。
+- **`--apply` 才落盘**，而且第一步就是**自动导出备份**（导出目录下的 `sleep-backup-<ISO 时间戳>.json`，
+  复用 `/memory export` 的实现）：备份失败即中止，绝不「先改再备份」。
+- `--sessions=N` 回看最近 N 个会话（默认 `sleepSessions`，上限 20）；不带 `--all` 时按当前/最近会话的
+  cwd 过滤，免得把别的项目的事混进来。
+- 会话记录经宿主的 `sessionQuery` 服务读取；宿主没有这个服务时，命令给出说明并提示
+  `/memory consolidate` 仍可用。
+- **只认真实用户消息**：只有 `source.kind === 'user'` 的消息算数 —— 插件自己注入的上下文不算（防自激）；
+  `origin: 'subagent'` 的子代理会话默认跳过。
+- 各项预算（单会话 `sleepMaxCharsPerSession`、合计 `sleepMaxCharsTotal`、补录 `sleepMaxBackfill`）任一
+  超限，都会写进计划的说明里。
+
+**三条不越界**：
+
+- **只补录你明确要求记住的内容**：走与自动捕获同一套规则抽取，没命中显式祈使的闲聊不会变成记忆；与库里
+  已有的同指纹条目直接跳过，所以重复执行不会重复补录。
+- **不碰自画像**：人格与工作倾向属于模型自我认知，规则不替它下结论 —— `/sleep` 不产生任何 `agent_self`
+  写入。
+- **不动用户所有物**：合并不动 `pinned`；冲突判定不会把你设定 / 确认过的条目判成失效，遇到就跳过并在
+  计划说明里标注。
+
+`sleepEnabled`（默认 `true`）关掉后命令只返回一句说明、不做任何事；`/sleep` 是用户显式触发的维护动作，
+**不受** `recallMode` / `autoRecall` 影响。跑完的计数与水位（`lastSleepAt`）在 `/memory stats` 与
+`memory_stats` 里可见。
+
 ## 防「记忆污染 / 自激」
 
 - 自动捕获**只读真实用户消息**（插件自己注入的上下文不算）；
@@ -146,8 +183,8 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置表单在哪
 
-插件导出 schemastery `Config`，其中 20 个可调字段声明为 `volatile()`；同时附带一个小的浏览器半边
-（`src/client.ts`，构建为 `lib/client.js`）把它们渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
+插件导出 schemastery `Config`，其中 **23 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
+同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 23 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
 （列表里的行卡片上还有一行摘要）。
 
 实现上，客户端半边注册进 **keyed** 插槽 `plugins.row.config`，key 为
@@ -178,6 +215,8 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 /memory consolidate                              立即整理一次
 /memory stats                                    运行时可观测：计数、写入、渲染耗时、注入行数
 /memory help
+
+/sleep [--sessions=N] [--all] [--apply]          空闲梳理（独立命令，不是 /memory 的子命令）：默认只预览；--apply 先备份再落盘
 ```
 
 ## 模型工具
@@ -194,7 +233,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置
 
-在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 20 个字段：
+在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 23 个字段：
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -218,6 +257,9 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 | `captureMaxPerTurn` | `3` | 每回合最多自动写入几条 |
 | `consolidateEnabled` | `true` | 定时整合开关 |
 | `consolidateIntervalMinutes` | `30` | 整合间隔 |
+| `sleepEnabled` | `true` | 空闲梳理（`/sleep`）开关；表单里 `0`=关、`1`=开。关掉后命令只说明一句、不做任何事 |
+| `sleepSessions` | `3` | 不带 `--sessions=N` 时默认回看最近几个会话（上限 20） |
+| `sleepMaxBackfill` | `20` | 一次 `/sleep --apply` 最多补录几条（只补你明确要求记住的内容） |
 
 只能通过 patch 行设置的进阶旋钮（含默认值）：自画像条数 `selfPortraitMaxItems` 12 /
 `selfPortraitMaxSelfObserved` 4；捕获调优 `capturePerHour` 20、`captureMinConfidence` 0.6、
@@ -226,6 +268,10 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 `archiveBelowImportance` 0.15、`summarizeAbove` 5；召回细节 `recallMinQueryChars` 12、`recallMinHits` 2、
 `recallMinMatch` 0.4、`recallCooldownTurns` 3、`recallBudgetMs` 10；隐私 `piiPolicy` `mask`；
 `repeatMentionBoost` 0.1；`reportPath`（开发期自报告 JSON）；`seed`（仅开发期示例数据，**出厂关闭**）。
+
+`/sleep` 的其余旋钮同样不在表单里，走 patch 行（含默认值）：单会话字符预算 `sleepMaxCharsPerSession`
+120000、合计字符预算 `sleepMaxCharsTotal` 300000、每条用户消息前保留的 assistant 文本条数
+`sleepAssistantContext` 3（回声检测用）、最多重算几段项目印象 `sleepMaxGists` 8。
 
 ## 数据与隐私
 

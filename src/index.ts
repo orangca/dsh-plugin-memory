@@ -11,7 +11,7 @@
 // 约束（M-1 spike 实测）：零外部 import（鸭子类型域 schema + 原生 JSON Schema 工具）；
 // 只 inject 确定存在的服务；所有渲染/工具路径不得抛异常影响主流程。
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join } from 'node:path'
 
 import type {
@@ -20,6 +20,7 @@ import type {
   DshDomain,
   DshPluginContext,
   DshSession,
+  DshSessionQuery,
   DshSettings,
   DshStorageDomain,
   DshToolDefinition,
@@ -36,6 +37,7 @@ import type {
 } from './types.js'
 import {
   DEFAULTS,
+  buildSleepPlan,
   clampText,
   composeGistText,
   composeSubjectSummary,
@@ -52,12 +54,15 @@ import {
   fillWithinBudget,
   findConflicts,
   fnv1a,
+  formatSleepPlan,
   isEcho,
   isExcluded,
+  isUserSideOrigin,
   listActive,
   makeRecord,
   maskPii,
   normalizeFacet,
+  normalizeText,
   INTRO_NOTICE,
   namingSettled,
   pickMergeGroups,
@@ -73,12 +78,17 @@ import {
   shouldArchive,
   shouldIntroduce,
   shouldReflect,
+  sleepPlanIsEmpty,
   splitSentences,
+  transcriptOf,
   workspaceKeyOf,
 } from './lib.js'
 // 自画像 v2（M6-A）新增的纯函数与类型：签名冻结在 docs/self-portrait.md 第 3 节。
 // 类型用 `import type` 引入（verbatimModuleSyntax）：它们只参与编译期检查，运行期不存在。
 import type { PortraitAction, PortraitCandidate, PortraitDecision, SelfFacet } from './lib.js'
+// M8（/sleep）纯函数层的类型：签名冻结在 docs/sleep.md 第 4 节，由 lib.ts 提供。
+// 宿主只按签名调用；`SleepCandidate` 的运行期字段比声明多时也不依赖（见 sleepBackfillInput）。
+import type { SleepCandidate, SleepPlan, SleepSessionInput } from './lib.js'
 
 // 设置页表单需要 schemastery（DSH 用它把 Config 投影成表单）。但它对第三方包是**可选**的：
 // profile 的 pnpm 配置是 autoInstallPeers: false，能否解析取决于宿主 loader 的 peer 映射。
@@ -290,6 +300,47 @@ interface RecallState {
 }
 
 /**
+ * M8（`/sleep`）的可观测状态（契约 §5.4）。
+ *
+ * 全部字段都只在 `--apply` 真正落盘时推进 —— 预览必须零副作用，连计数与 `last` 都不能动
+ * （契约 §5.2c 也是把「更新 state.sleep 计数」放在 apply 分支里）。
+ */
+interface SleepLast {
+  at: string
+  sessions: number
+  messages: number
+  chars: number
+}
+
+interface SleepState {
+  /** `--apply` 的执行次数（预览不计入：预览零副作用）。 */
+  runs: number
+  /** 补录新建的条数。 */
+  added: number
+  /** 被合并吸收（归档）的条数，与整合的 `merged` 同义。 */
+  merged: number
+  /** 冲突失效的条数。 */
+  invalidated: number
+  /** 归档条数。 */
+  archived: number
+  /** 写入/刷新的项目印象条数。 */
+  gists: number
+  /** 因保护规则、指纹重复或目标缺失而跳过的条数。 */
+  skipped: number
+  last: SleepLast | null
+}
+
+/** `/sleep` 的解析结果（`--sessions` 已夹进硬上限）。 */
+interface SleepArgs {
+  apply: boolean
+  all: boolean
+  /** 实际回看的会话数（1..SLEEP_MAX_SESSIONS）。 */
+  sessions: number
+  /** 请求值超过硬上限时为 true（要在输出里写清）。 */
+  capped: boolean
+}
+
+/**
  * 领域 global 句柄：types.ts 只声明了 `get()` / `put()`，而运行版（以及原实现）的写入口叫 `set()`。
  * 保留原调用名，这里按实测契约补上（见交付报告）。
  */
@@ -302,6 +353,8 @@ interface MemoryMeta {
   lastConsolidatedAt?: number
   /** M7：初次设定（称呼）跨会话累计已问次数。 */
   selfIntroAsks?: number
+  /** M8：最近一次 `/sleep --apply` 的水位（毫秒时间戳）。 */
+  lastSleepAt?: number
 }
 
 interface BudgetCheck {
@@ -412,6 +465,8 @@ interface PluginState {
   rejectedHashes: Set<string>
   recall: RecallState
   recallTurnById: Map<string, number>
+  /** M8：`/sleep` 的执行计数与最近一次扫描规模。 */
+  sleep: SleepState
   /** M6：自画像 v2 的运行时状态（写入收敛计数 + 反思提示的会话闸门状态）。 */
   self: SelfState
   // 用量：注入/召回只在内存累加（每次写盘会产生大量 IO），由整合或卸载时统一落盘。
@@ -558,6 +613,16 @@ function buildConfig(useVolatile: boolean): ReturnType<SchemaFactory['object']> 
     selfIntroEnabled: field(Schema!.boolean().default(true)),
     selfIntroMinTurn: field(Schema!.number().default(2)),
     selfIntroMaxAsks: field(Schema!.number().default(2)),
+    // M8：/sleep（契约 docs/sleep.md §4.1）——类型与默认值必须与 lib.ts 的 DEFAULTS 逐字一致。
+    // 只有前三个进设置页表单（客户端的 3 个新配置键），其余四个走 patch 行。
+    sleepEnabled: field(Schema!.boolean().default(true)),
+    sleepSessions: field(Schema!.number().default(3)),
+    sleepMaxBackfill: field(Schema!.number().default(20)),
+    // 非 volatile：预算类参数，进设置页只会增加误配面的风险（它们是硬上限，不是偏好）。
+    sleepMaxCharsPerSession: Schema!.number().default(120000),
+    sleepMaxCharsTotal: Schema!.number().default(300000),
+    sleepAssistantContext: Schema!.number().default(3),
+    sleepMaxGists: Schema!.number().default(8),
     recallMode: field(Schema!.union(['off', 'dry', 'inject']).default('inject')),
     recallTopK: field(Schema!.number().default(8)),
     captureMode: field(Schema!.union(['off', 'rule']).default('rule')),
@@ -619,6 +684,9 @@ const RECALL_COOLDOWN_KEEP_TURNS = 200
 /** 工具结果里列表条目的硬上限（按条目数截断，见 `jsonList`）。 */
 const WIRE_MAX_ITEMS = 50
 
+/** `/sleep` 回看的会话数硬上限（契约 §2：`--sessions=N` 的上限是 20，且不受配置调高影响）。 */
+const SLEEP_MAX_SESSIONS = 20
+
 /**
  * 归一化宿主下发的配置。
  *
@@ -663,6 +731,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     rejectedHashes: new Set(),
     recall: { injected: 0, turns: 0, last: null },
     recallTurnById: new Map(),
+    // M8：/sleep（预览不计数，只有 --apply 累加）
+    sleep: { runs: 0, added: 0, merged: 0, invalidated: 0, archived: 0, gists: 0, skipped: 0, last: null },
     // M6：自画像 v2（写入收敛计数 + 反思提示的会话状态）
     self: {
       added: 0,
@@ -804,6 +874,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         recentEvents: [...state.recentEvents],
         consolidate: state.consolidate,
         recall: state.recall,
+        sleep: state.sleep,
         self: {
           added: state.self.added,
           refined: state.self.refined,
@@ -2165,7 +2236,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       execute: async () => {
         state.toolCalls.memory_stats = (state.toolCalls.memory_stats ?? 0) + 1
-        return json(handlers.stats())
+        // 结构化字段与 `/memory stats` 的文本同步（契约 §5.4）：模型不必去解析那行中文。
+        return json({ ...handlers.stats(), sleep: { ...state.sleep } })
       },
     },
     {
@@ -2485,6 +2557,11 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           `自画像：新增 ${state.self.added} / 更新 ${state.self.refined} / 取代 ${state.self.superseded} / 跳过 ${state.self.skipped}`
             + `；反思提醒 ${state.self.reflections} 次（最近回合 ${state.self.lastReflectTurn ?? '-'}）`
             + `；初次设定已问 ${state.self.introAsks} 次`,
+          `梳理（/sleep）：运行 ${state.sleep.runs} 次（补录 ${state.sleep.added} / 合并 ${state.sleep.merged} / 失效 ${state.sleep.invalidated}`
+            + ` / 归档 ${state.sleep.archived} / 印象 ${state.sleep.gists} / 跳过 ${state.sleep.skipped}）`
+            + (state.sleep.last
+              ? `；最近 ${state.sleep.last.at}（${state.sleep.last.sessions} 会话 / ${state.sleep.last.messages} 消息 / ${state.sleep.last.chars} 字符）`
+              : '；尚未运行'),
           `turn-stopping：plain=${state.turnStopping.plain}${state.turnStopping.last ? `，last=${state.turnStopping.last.at}（${state.turnStopping.last.channel}）` : '，last=none'}`,
           `设置页：${settingsLine()}`,
         ].join('\n'),
@@ -2661,6 +2738,407 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
   }
 
+  // ---------------- M8：`/sleep` 空闲梳理（契约 docs/sleep.md §5/§6） ----------------
+  //
+  // 与 `/memory consolidate` 的分工：consolidate 做**库内治理**，`/sleep` 做**跨库 + 跨会话**的梳理 ——
+  // 回看最近若干会话的完整事件日志，补上当时漏掉/被节流掉的记忆，再把整个库重新排一遍。
+  // 数据源是宿主服务 `ctx.sessionQuery`（实测契约见 §3），不是手工解会话日志文件。
+  //
+  // 三条不可妥协的性质（§6）：
+  //   1) 默认不写：没有 `--apply` 就绝不落盘（连计数都不动）；
+  //   2) 有备份才改：`--apply` 的**第一件事**是导出备份，备份失败即中止；
+  //   3) 不碰自画像、不碰用户所有物：计划层已保证不该出现，宿主侧仍然逐条防御并如实汇报。
+
+  /**
+   * 契约 §4.1 默认值的宿主侧兜底：`cfg` 里这些键缺失/非法时（patch 行给错类型、中间修订）
+   * 用契约默认值。口径与 lib.ts 的 `sleepCap` / `sleepBudget` **逐条对齐**，否则宿主会把
+   * 用户显式设的 `sleepMaxBackfill: 0`（= 不补录）悄悄改成 20 —— 那是「配置说别写、插件照写」。
+   */
+  const sleepLimits = (): MemoryConfig => {
+    // 计数型上限：允许 0（= 关闭该项），NaN/负数回落默认值
+    const cap = (value: unknown, fallback: number): number =>
+      typeof value === 'number' && !Number.isNaN(value) && value >= 0 ? value : fallback
+    // 预算型上限：必须是正数（0 会把所有会话裁空）
+    const budget = (value: unknown, fallback: number): number =>
+      typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback
+    return {
+      ...cfg,
+      sleepEnabled: cfg.sleepEnabled !== false,
+      sleepSessions: cap(cfg.sleepSessions, 3),
+      sleepMaxCharsPerSession: budget(cfg.sleepMaxCharsPerSession, 120_000),
+      sleepMaxCharsTotal: budget(cfg.sleepMaxCharsTotal, 300_000),
+      sleepMaxBackfill: cap(cfg.sleepMaxBackfill, 20),
+      sleepAssistantContext: cap(cfg.sleepAssistantContext, 3),
+      sleepMaxGists: cap(cfg.sleepMaxGists, 8),
+    }
+  }
+
+  /** 解析 `/sleep` 的输入：只认契约 §2 的三个开关，未知参数忽略；会话数夹进硬上限 20。 */
+  const parseSleepInput = (rawInput: string): SleepArgs => {
+    const parts = String(rawInput ?? '').trim().split(/\s+/u).filter(Boolean)
+    const raw = parts.find((part) => part.startsWith('--sessions='))?.slice('--sessions='.length)
+    const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10)
+    // 至少要回看 1 个会话：0 个会话的 /sleep 没有意义（库内治理请用 /memory consolidate）。
+    const requested = Number.isFinite(parsed) && parsed > 0 ? parsed : Math.max(1, sleepLimits().sleepSessions)
+    return {
+      apply: parts.includes('--apply'),
+      all: parts.includes('--all'),
+      sessions: Math.max(1, Math.min(SLEEP_MAX_SESSIONS, requested)),
+      capped: requested > SLEEP_MAX_SESSIONS,
+    }
+  }
+
+  /**
+   * 列出候选会话并逐个读完整事件日志。
+   * 默认按 cwd 过滤（cwd 取「最近一个非 subagent 会话」的 header，避免把别的项目的事混进来）；
+   * `--all` 用 `listSessions()`。子代理会话一律跳过（§3：它们的「用户消息」是父代理的指令）。
+   */
+  const collectSleepSources = async (
+    sq: DshSessionQuery,
+    request: SleepArgs,
+  ): Promise<{ sources: SleepSessionInput[]; notes: string[]; skippedSubagents: number }> => {
+    const notes: string[] = []
+    const listed = await sq.listSessions()
+    const sorted = (Array.isArray(listed) ? [...listed] : [])
+      .filter((record) => record !== null && typeof record === 'object')
+      .sort((a, b) => Number(b?.header?.createdAt ?? 0) - Number(a?.header?.createdAt ?? 0))
+    // cwd 取最近一个**非 subagent** 会话：子代理的 cwd 不是用户的工作目录。
+    const anchor = sorted.find((record) => record?.header?.origin !== 'subagent')
+    const cwd = anchor?.header?.cwd ?? null
+    let candidates = sorted
+    if (!request.all) {
+      if (!cwd) {
+        notes.push('最近会话没有 cwd，无法按项目过滤：本次按全部会话处理。')
+      } else {
+        try {
+          const filtered = await sq.filterSessions([{ kind: 'cwd', values: [cwd] }])
+          candidates = Array.isArray(filtered) ? [...filtered] : []
+          if (candidates.length === 0) {
+            notes.push(`按 cwd（${cwd}）过滤后没有会话：本次按全部会话处理。`)
+            candidates = sorted
+          }
+        } catch (error) {
+          notes.push(`filterSessions 失败（${errorText(error)}）：降级为在 listSessions 结果里按 cwd 手工过滤。`)
+          candidates = sorted.filter((record) => (record?.header?.cwd ?? null) === cwd)
+        }
+      }
+    }
+    const roots = candidates.filter((record) => record?.header?.origin !== 'subagent')
+    const skippedSubagents = candidates.length - roots.length
+    const picked = [...roots]
+      .sort((a, b) => Number(b?.header?.createdAt ?? 0) - Number(a?.header?.createdAt ?? 0))
+      .slice(0, request.sessions)
+    const sources: SleepSessionInput[] = []
+    for (const record of picked) {
+      const id = String(record?.header?.id ?? '')
+      if (id === '') continue
+      try {
+        const snapshot = await sq.readSession(id)
+        // inheritedEventCount 与本次梳理无关（§3）：只看 events。
+        // origin/parentSession 一并透传：纯函数层还会再挡一次子代理会话（防御性重复无害）。
+        sources.push({
+          sessionId: id,
+          cwd: snapshot?.session?.cwd ?? record?.header?.cwd ?? null,
+          createdAt: Number(snapshot?.session?.createdAt ?? record?.header?.createdAt ?? 0),
+          events: Array.isArray(snapshot?.events) ? snapshot.events : [],
+          origin: record?.header?.origin ?? null,
+          parentSession: record?.header?.parentSession ?? null,
+        })
+      } catch (error) {
+        notes.push(`读取会话 ${id} 失败，已跳过：${errorText(error)}`)
+      }
+    }
+    return { sources, notes, skippedSubagents }
+  }
+
+  /**
+   * 一条不愿被 `/sleep` 改写的既有条目（§6）：自画像是模型的自我认知（规则不能替它下结论），
+   * 用户所有物（`pinned`）由用户掌控。返回原因文本（`null` = 可以动），用于如实汇报。
+   */
+  const sleepImmutableReason = (record: MemoryRecord | undefined): string | null => {
+    if (!record) return '目标不存在'
+    if (record.kind === 'agent_self') return '自画像（agent_self）'
+    if (record.pinned === true) return '用户固定的条目（pinned）'
+    return null
+  }
+
+  /**
+   * 把 `SleepCandidate` 变成 `writeMemory` 的入参。
+   *
+   * 契约里的 `SleepCandidate` 只有 text/scope/origin/confidence/hash（没有 kind/subject），
+   * 但 `writeMemory` 必须有 kind，而 `recordHash` 又含 kind/subject —— 猜错会让「重复执行」不再幂等。
+   * 取值顺序：候选自带的 kind/subject（lib 若保留就最准）→ 库内同 hash 的既有条目 → 按 scope 兜底。
+   */
+  const sleepBackfillInput = (candidate: SleepCandidate): { kind: MemoryKind; scope: MemoryScope; subject: string | null; text: string } | null => {
+    const view = candidate as SleepCandidate & { kind?: unknown; subject?: unknown }
+    const text = String(view?.text ?? '')
+    if (text.trim().length === 0) return null
+    const level: ScopeLevel = view?.scope?.level === 'profile' ? 'profile' : 'workspace'
+    const key = typeof view?.scope?.key === 'string' && view.scope.key.length > 0 ? view.scope.key : '*'
+    const twin = [...state.records.values()].find((record) => record.hash === view?.hash)
+    const kind: MemoryKind = isMemoryKind(view?.kind) ? view.kind : (twin?.kind ?? (level === 'profile' ? 'user_profile' : 'semantic'))
+    const subject = typeof view?.subject === 'string' ? view.subject : (twin?.subject ?? null)
+    return { kind, scope: { level, key }, subject, text }
+  }
+
+  /** 补录的幂等防线（与 `writeMemory` 的 hash 去重互为兜底）：同 scope 下已有同文本，或该指纹已在库里（含 archived）。 */
+  const sleepAlreadyPresent = (input: { kind: MemoryKind; scope: MemoryScope; subject: string | null; text: string }): boolean => {
+    const hash = recordHash({ kind: input.kind, scope: input.scope, subject: input.subject, text: input.text })
+    const normalized = normalizeText(input.text)
+    return [...state.records.values()].some((record) =>
+      record.hash === hash
+      || (record.scope.level === input.scope.level && record.scope.key === input.scope.key && normalizeText(record.text) === normalized))
+  }
+
+  /** 执行计划（调用前已确认：备份成功、领域已打开）。返回本次计数。 */
+  const executeSleepPlan = async (
+    plan: SleepPlan,
+    now: number,
+    notes: string[],
+  ): Promise<{ added: number; merged: number; invalidated: number; archived: number; gists: number; skipped: number }> => {
+    const counts = { added: 0, merged: 0, invalidated: 0, archived: 0, gists: 0, skipped: 0 }
+
+    // 1) 补录：走 writeMemory（敏感扫描 / 回声剔除 / 指纹去重都在里面），origin 用候选的来源。
+    for (const candidate of plan.backfill ?? []) {
+      const input = sleepBackfillInput(candidate)
+      if (!input) {
+        counts.skipped += 1
+        continue
+      }
+      if (input.kind === 'agent_self') {
+        counts.skipped += 1
+        notes.push('跳过 1 条补录：候选是 agent_self，而 /sleep 不生成任何自画像写入（§6）。')
+        continue
+      }
+      if (sleepAlreadyPresent(input)) {
+        counts.skipped += 1
+        continue
+      }
+      const result = await writeMemory({
+        kind: input.kind,
+        text: input.text,
+        subject: input.subject,
+        scope: input.scope,
+        origin: candidate.origin,
+        confidence: candidate.confidence,
+        tags: ['sleep'],
+        sessionId: candidate.sessionId,
+        source: candidate.sessionId ? { sessionId: candidate.sessionId, seqStart: 0, seqEnd: 0 } : null,
+      })
+      if (result.ok && result.status === 'created') counts.added += 1
+      else if (result.ok) counts.skipped += 1 // 合并进既有条目（指纹命中）：不算新增
+      else {
+        counts.skipped += 1
+        notes.push(`跳过 1 条补录：${result.error ?? '写入失败'}`)
+      }
+    }
+
+    // 2) 合并：复用整合的合并路径（领头者吸收计数，其余归档不删；不动 pinned 与自画像）。
+    for (const merge of plan.merges ?? []) {
+      const members = (merge?.ids ?? [])
+        .map((id) => state.records.get(String(id)))
+        .filter((record): record is MemoryRecord => Boolean(record))
+      if (members.length < 2) {
+        counts.skipped += 1
+        continue
+      }
+      const blocked = members
+        .map((record) => ({ record, reason: sleepImmutableReason(record) }))
+        .find((entry) => entry.reason !== null)
+      if (blocked) {
+        counts.skipped += 1
+        notes.push(`跳过 1 组合并（${merge.subject || '未命名主题'}）：成员 ${blocked.record.id.slice(0, 8)} 不可动 —— ${blocked.reason}。`)
+        continue
+      }
+      const [lead, ...rest] = members
+      for (const extra of rest) {
+        lead.useCount = (lead.useCount ?? 0) + (extra.useCount ?? 0)
+        lead.importance = Math.max(lead.importance, extra.importance)
+        lead.confidence = Math.max(lead.confidence, extra.confidence)
+        lead.observedAt = Math.max(lead.observedAt, extra.observedAt)
+        extra.status = 'archived'
+        await persist(extra)
+        counts.merged += 1
+      }
+      await persist(lead)
+    }
+
+    // 3) 冲突：旧条目置 invalid（可恢复）、新条目记 supersedes。
+    //    §6：不允许把**用户侧**条目判成 drop —— 计划里出现就必须标注并跳过。
+    for (const conflict of plan.conflicts ?? []) {
+      const keep = state.records.get(String(conflict?.keep ?? ''))
+      const drop = state.records.get(String(conflict?.drop ?? ''))
+      const reason = sleepImmutableReason(drop)
+        ?? (keep && drop && isUserSideOrigin(drop.origin) && !isUserSideOrigin(keep.origin) ? '用户侧条目不允许被自动推翻（§6）' : null)
+      if (!keep || !drop || reason) {
+        counts.skipped += 1
+        notes.push(`跳过 1 条失效（${conflict?.subject || '未命名主题'}）：${reason ?? '保留方不存在'}。`)
+        continue
+      }
+      drop.status = 'invalid'
+      drop.invalidAt = now
+      keep.supersedes = [...new Set([...(keep.supersedes ?? []), drop.id])]
+      await persist(drop)
+      await persist(keep)
+      counts.invalidated += 1
+    }
+
+    // 4) 归档（shouldArchive 已排除 pinned 与自画像，这里再防一层）。
+    for (const id of plan.archive ?? []) {
+      const record = state.records.get(String(id ?? ''))
+      if (!record) {
+        counts.skipped += 1
+        continue
+      }
+      const reason = sleepImmutableReason(record)
+      if (reason) {
+        counts.skipped += 1
+        notes.push(`跳过 1 条归档（${record.id.slice(0, 8)}）：${reason}。`)
+        continue
+      }
+      if (record.status === 'archived') continue
+      record.status = 'archived'
+      await persist(record)
+      counts.archived += 1
+    }
+
+    // 5) 项目印象：同 workspace 只刷新不新增（与捕获路径同一策略）。
+    for (const gist of plan.gists ?? []) {
+      const text = String(gist?.text ?? '').trim()
+      const key = typeof gist?.key === 'string' && gist.key.length > 0 ? gist.key : '*'
+      if (text.length === 0) {
+        counts.skipped += 1
+        continue
+      }
+      const existing = [...state.records.values()].find((record) =>
+        record.kind === 'project_gist' && record.status === 'active'
+        && record.scope.key === key && record.subject === 'project.overview')
+      if (existing) {
+        existing.text = text
+        existing.observedAt = now
+        existing.hash = recordHash(existing)
+        existing.confidence = Math.min(0.6, (existing.confidence ?? 0.5) + 0.05)
+        await persist(existing)
+        counts.gists += 1
+        continue
+      }
+      const result = await writeMemory({
+        kind: 'project_gist',
+        precision: 'gist',
+        text,
+        subject: 'project.overview',
+        origin: 'observed',
+        confidence: 0.5,
+        importance: 0.5,
+        tags: ['gist', 'sleep'],
+        scope: { level: 'workspace', key },
+      })
+      if (result.ok) counts.gists += 1
+      else {
+        counts.skipped += 1
+        notes.push(`项目印象未写入（${key}）：${result.error ?? '未知原因'}`)
+      }
+    }
+
+    return counts
+  }
+
+  /** `/sleep` 的完整流程：解析 → 取服务 → 读会话 → 纯函数计划 → 预览 / 落盘。**绝不抛**。 */
+  const runSleep = async (rawInput: string): Promise<DshCommandResult> => {
+    const request = parseSleepInput(rawInput)
+    const limits = sleepLimits()
+    // §5.5：/sleep 是用户显式触发的维护动作，与 recallMode / autoRecall 无关；只受 sleepEnabled 约束。
+    if (limits.sleepEnabled === false) {
+      return { kind: 'error', text: '`/sleep` 已在配置里关闭（sleepEnabled=false）：本次不做任何事。开启后可随时重跑；`/memory consolidate` 仍可用。' }
+    }
+    const sq = ctx.get<DshSessionQuery>('sessionQuery')
+    if (!sq || typeof sq.listSessions !== 'function' || typeof sq.readSession !== 'function') {
+      return {
+        kind: 'error',
+        text: '当前宿主没有 sessionQuery 服务，`/sleep` 需要它读取会话记录（DSH 的日志是多 zstd 帧拼接，不能手工解）；'
+          + '/memory consolidate 仍可用（库内治理不依赖会话日志）。',
+      }
+    }
+    if (request.apply && !state.opened) {
+      return { kind: 'error', text: `记忆领域未打开（${state.openError ?? '未知原因'}），无法落盘：已中止 --apply（没有备份就不改库）。` }
+    }
+
+    const collected = await collectSleepSources(sq, request)
+    const transcript = transcriptOf(collected.sources, limits)
+    const plan = buildSleepPlan({
+      records: state.records.values(),
+      sources: transcript.sources,
+      cfg: limits,
+      // 会话整体级说明（预算超限 / 跳过的子代理会话）透传给计划，由 formatSleepPlan 统一渲染。
+      notes: transcript.notes,
+      skippedSubagents: collected.skippedSubagents,
+    })
+    const snapshot: SleepLast = {
+      at: new Date().toISOString(),
+      sessions: plan.scanned.sessions,
+      messages: plan.scanned.messages,
+      chars: plan.scanned.chars,
+    }
+    // 只有宿主自己才知道的说明（纯函数层看不到 --sessions 这个开关）。
+    const notes = [...collected.notes]
+    if (request.capped) {
+      notes.push(`会话数上限 ${SLEEP_MAX_SESSIONS}：本次只回看最近 ${request.sessions} 个（请求更多也只到这里）。`)
+    }
+
+    if (!request.apply) {
+      // 预览：只读、只算，零写入 —— 连 state.sleep 计数都不动（§6：没有 --apply 就绝不落盘）。
+      // 直接返回纯函数层的预览文本（它已声明「未写入任何内容」）；宿主自己的说明放在它之前，
+      // 让「未写入」这句始终是最后一行。
+      return { kind: 'success', text: [...notes, formatSleepPlan(plan, limits)].filter((line) => line.length > 0).join('\n') }
+    }
+
+    // a) 先备份：`--apply` 的**第一件事**；失败即中止（没有备份就不改库）。
+    let backupFile = ''
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/gu, '-') // 冒号在 Windows 路径里非法
+      backupFile = exportRecords(`sleep-backup-${stamp}.json`)
+      if (!existsSync(backupFile) || statSync(backupFile).size <= 0) throw new Error('备份文件不存在或为空')
+    } catch (error) {
+      return { kind: 'error', text: `导出备份失败，已中止 --apply（没有备份就不改库）：${errorText(error)}` }
+    }
+
+    // b) 按计划落盘；c) 计数与水位；d) flush 后回报统计。
+    const now = Date.now()
+    const counts = await executeSleepPlan(plan, now, notes)
+    state.sleep.runs += 1
+    state.sleep.added += counts.added
+    state.sleep.merged += counts.merged
+    state.sleep.invalidated += counts.invalidated
+    state.sleep.archived += counts.archived
+    state.sleep.gists += counts.gists
+    state.sleep.skipped += counts.skipped
+    state.sleep.last = snapshot
+    if (domain) {
+      state.meta = {
+        ...(state.meta ?? {}),
+        schemaVersion: 1,
+        collectionVersion: state.collectionVersion,
+        lastSleepAt: now,
+        selfIntroAsks: state.self.introAsks,
+      }
+      try {
+        await (domain.global as DshDomainGlobal).set(state.meta)
+      } catch { /* 水位写失败不影响本次梳理结果 */ }
+    }
+    flush()
+    return {
+      kind: 'success',
+      text: [
+        `梳理完成（/sleep --apply）：补录 ${counts.added} 条，合并 ${counts.merged} 条，失效 ${counts.invalidated} 条，`
+          + `归档 ${counts.archived} 条，项目印象 ${counts.gists} 条，跳过 ${counts.skipped} 条。`,
+        `回看：会话 ${snapshot.sessions} 个 / 消息 ${snapshot.messages} 条 / ${snapshot.chars} 字符`,
+        `备份：${backupFile}`,
+        sleepPlanIsEmpty(plan) ? '计划为空：本次无需改动。' : '',
+        ...notes,
+      ].filter((line) => line.length > 0).join('\n'),
+    }
+  }
+
   try {
     ctx.commands.register({
       name: 'memory',
@@ -2679,6 +3157,25 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     })
   } catch (error) {
     state.openError = `command register failed: ${errorText(error)}`
+  }
+
+  // `/sleep` 是**独立命令**（用户明确要的是 /sleep，不是 /memory 的子命令，见契约 §5.1）。
+  // 整条命令包在 try/catch 里：任何异常都必须变成可读的 error 结果，不能抛给宿主（§5.3）。
+  try {
+    ctx.commands.register({
+      name: 'sleep',
+      description: '空闲梳理：回看最近会话补录漏掉的记忆，并重新排一遍整个库（默认只预览；--apply 才落盘，且先导出备份）',
+      input: { hint: '[--apply] [--sessions=N] [--all]' },
+      handler: async (invocation) => {
+        try {
+          return await runSleep(String(invocation?.rawInput ?? ''))
+        } catch (error) {
+          return { kind: 'error', text: `梳理命令失败：${errorText(error)}` }
+        }
+      },
+    })
+  } catch (error) {
+    state.openError = `sleep command register failed: ${errorText(error)}`
   }
 
   // 供其他插件/调试使用的最小服务面（不导出类型，M4 再考虑正式 seam）

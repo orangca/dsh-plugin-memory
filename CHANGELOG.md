@@ -3,6 +3,44 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.7 — 2026-10-02
+
+**Idle review: `/sleep` re-reads the recent sessions and re-sorts the store.** A new independent command (not a
+`/memory` subcommand) replays the **complete event logs** of the most recent sessions through the memory pipeline,
+backfills what was missed at the time, then re-runs merge / conflict / archive / gist over the whole store — as a
+preview by default, writing nothing until asked.
+
+### Added
+
+- **`/sleep [--sessions=N] [--all] [--apply]`**, registered as its own command next to `/memory`. Session logs are
+  read through the host's `sessionQuery` service (on-disk logs are concatenated zstd frames, so exact reads are the
+  only reliable route); when that service is absent the command degrades with a readable message.
+- **Preview is the default and writes nothing.** The plan reports what *would* change: rows to backfill, merge
+  groups, conflicts to invalidate, rows to archive and project gists to recompute; an empty plan says "nothing to
+  do" instead of printing nothing.
+- **`--apply` backs up first.** The run exports every record to `sleep-backup-<ISO timestamp>.json` before touching
+  the store, and a failed export aborts the whole apply.
+- **Backfill only recognises what the user explicitly asked to remember**, reusing the automatic-capture rule
+  extractor, so small talk never turns into memory; candidates already present by fingerprint are skipped, which
+  makes a second run a no-op.
+- **Seven new keys** in `DEFAULTS`: `sleepEnabled` (`true`), `sleepSessions` (`3`), `sleepMaxCharsPerSession`
+  (`120000`), `sleepMaxCharsTotal` (`300000`), `sleepMaxBackfill` (`20`), `sleepAssistantContext` (`3`) and
+  `sleepMaxGists` (`8`). Run counters live in `state.sleep` and the watermark in `MemoryMeta.lastSleepAt`; both
+  `/memory stats` and `memory_stats` gained a sleep line.
+
+### Changed
+
+- **The self-portrait is out of scope.** Persona and work tendencies are the model's cognition about itself, so the
+  rules do not draw conclusions for it: `/sleep` never produces an `agent_self` write.
+- **User-owned rows are out of scope too.** Merges leave `pinned` alone, and a conflict plan that would invalidate
+  a user-side row is skipped and flagged in the notes rather than executed.
+- **Injected context is not user speech.** Only `source.kind === 'user'` events count as user messages (the
+  plugin's own `runtime-context` injections are excluded) and `origin: 'subagent'` sessions are skipped, so the
+  review cannot feed on its own output.
+- The settings form grows from 20 to 23 fields — `sleepEnabled` (entered as `0`/`1`, still written as a **real
+  boolean**), `sleepSessions` and `sleepMaxBackfill`; the other four sleep knobs stay patch-row only. Both READMEs
+  gain a `/sleep` chapter plus the command line and the configuration rows.
+
 ## 0.5.6 — 2026-10-02
 
 **First-run naming: the model asks how the two of you address each other.** A self-portrait starts with names, and

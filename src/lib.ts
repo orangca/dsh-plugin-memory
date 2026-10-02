@@ -131,6 +131,14 @@ export const DEFAULTS: MemoryConfig = {
   selfIntroEnabled: true,
   selfIntroMinTurn: 2,
   selfIntroMaxAsks: 2,
+  // M8：`/sleep` 空闲梳理（契约 docs/sleep.md §4.1）
+  sleepEnabled: true,
+  sleepSessions: 3,
+  sleepMaxCharsPerSession: 120_000,
+  sleepMaxCharsTotal: 300_000,
+  sleepMaxBackfill: 20,
+  sleepAssistantContext: 3,
+  sleepMaxGists: 8,
   gistBudgetRatio: 0.3,
   charsPerToken: 2.5,
   sectionOrder: 9000,
@@ -1472,3 +1480,640 @@ export const INTRO_NOTICE: string = clampText([
   '定下来后用 memory_write（kind=agent_self、facet=persona、subject=self.persona.name / self.persona.address_user / self.persona.address_self）各记一条。',
   '用户说不用或随便，就记一条「保持默认称呼」，之后不要再问。',
 ].join(' '), 120, DEFAULTS.charsPerToken)
+
+// ---------------------------------------------------------------------------
+// M8：`/sleep` 空闲梳理 —— 契约 docs/sleep.md §4
+//
+// 与上面几节一样，整节是**纯函数**：不依赖 ctx、不碰存储、不引新依赖、不用模型。
+// `/sleep` 干两件事：① 把最近会话的完整事件日志重新过一遍记忆管线（补录当时漏记的）；
+// ② 把整个库重新排一遍（合并/失效/归档/印象）。判定权仍然在规则手里，计划里只有「要做什么」。
+//
+// 三条不可妥协的性质（契约 §6），实现里各有一道闸门：
+//  · 只认 `data.source.kind === 'user'` 的 user/message（注入的 runtime-context 不是用户说的话）；
+//  · 计划里**不产生任何 agent_self 写入**（人格/工作倾向属于模型自我认知，规则不替它下结论）；
+//  · 冲突建议里 `drop` 指向用户侧条目（user_explicit / user_correction / pinned）时跳过并写进 notes。
+// ---------------------------------------------------------------------------
+
+/** 一条从会话日志里抽出来的消息（只保留梳理用得上的字段）。 */
+export interface TranscriptMessage {
+  role: 'user' | 'assistant'
+  text: string
+  at: number | null
+}
+
+/** 一个会话的抽取结果。 */
+export interface SleepSource {
+  sessionId: string
+  cwd: string | null
+  createdAt: number
+  messages: TranscriptMessage[]
+  /**
+   * 抽取期说明（单会话字符预算截断、总预算未纳入等）。
+   * `buildSleepPlan` 会把它们按 source 顺序汇总进 `plan.notes` —— 契约 §6 要求
+   * 「任何一项预算超限都要在 notes 里写清」，而 `SleepPlan` 是唯一有 notes 的地方。
+   */
+  notes?: string[]
+}
+
+/**
+ * `transcriptOf` 的入参：契约 §4 的四个字段 + 会话头的两个可选标记。
+ *
+ * 为什么多了 `origin` / `parentSession` / `header`：契约 §4 要「`origin: 'subagent'` 的会话整体跳过」，
+ * 但 §4 给出的入参形状里没有 origin —— 宿主只能从 `DshSessionRecord.header` 里读。
+ * 这三个字段都是**可选**的，所以契约里那四种字段的调用方式一字不用改。
+ */
+export interface SleepSessionInput {
+  sessionId: string
+  cwd?: string | null
+  createdAt: number
+  events: readonly unknown[]
+  /** `DshSessionRecord.header.origin`：`'subagent'` 的会话整体跳过。 */
+  origin?: string | null
+  /** `DshSessionRecord.header.parentSession`：有值即视为子代理会话。 */
+  parentSession?: string | null
+  /** 也可以整块透传 `DshSessionRecord.header`。 */
+  header?: { origin?: string | null; parentSession?: string | null } | null
+}
+
+/** `transcriptOf` 的返回值：契约的四个字段 + 会话整体级说明。 */
+export interface TranscriptOfResult {
+  sources: SleepSource[]
+  messages: number
+  chars: number
+  skippedSubagents: number
+  /** 挂不到具体 source 上的说明（例如跳过子代理会话），可原样传给 `buildSleepPlan({ notes })`。 */
+  notes: string[]
+}
+
+/** 回放捕获产出的一条候选记忆。 */
+export interface SleepCandidate {
+  text: string
+  sessionId: string
+  at: number | null
+  scope: { level: 'workspace' | 'profile'; key: string }
+  origin: MemoryOrigin
+  confidence: number
+  /** 与 `recordHash` 同源的指纹，用于「库里已有」判定。 */
+  hash: string
+  /**
+   * 候选的 kind 与 subject（与实况捕获路径同源：`deriveSubject(text, signal)`）。
+   *
+   * **宿主持候选落盘时请一并透传**：`recordHash` 把 kind/scope/subject/文本都算进去，
+   * 少了 subject 就会写出一个指纹不同的记录，第二次 `/sleep` 便无法识别「已经补录过」。
+   */
+  kind?: MemoryKind
+  subject?: string | null
+}
+
+/** 梳理计划：**只描述要做什么，不做任何写入**。 */
+export interface SleepPlan {
+  scanned: { sessions: number; messages: number; chars: number }
+  /** 库里没有的候选（按 hash 去重后）。 */
+  backfill: SleepCandidate[]
+  /** 命中已有指纹（库内已有，或本次更早的候选已经出现过）而跳过的条数。 */
+  duplicates: number
+  /** 建议合并组（同 subject、相似度 ≥ cfg.mergeSimilarity）。 */
+  merges: Array<{ ids: string[]; subject: string; text: string }>
+  /** 建议失效的矛盾条目（保留 keep，失效 drop）。 */
+  conflicts: Array<{ keep: string; drop: string; subject: string }>
+  /** 建议归档的条目 id（`shouldArchive`）。 */
+  archive: string[]
+  /** 重算后的项目印象（按 workspace 分组，最多 `cfg.sleepMaxGists` 条）。 */
+  gists: Array<{ level: 'workspace'; key: string; text: string }>
+  /** 人读的说明/降级原因，按顺序渲染。 */
+  notes: string[]
+  /** 上限裁剪后的候选数（`cfg.sleepMaxBackfill`）。 */
+  truncated: number
+}
+
+/** `buildSleepPlan` 的入参（契约 §4 的四个字段 + 两个可选透传口）。 */
+export interface SleepPlanInput {
+  records: Iterable<MemoryRecord>
+  sources: readonly SleepSource[]
+  cfg: MemoryConfig
+  now?: number
+  /** `transcriptOf(...).notes` 透传：会话整体级说明。 */
+  notes?: readonly string[]
+  /** `transcriptOf(...).skippedSubagents` 透传：跳过子代理会话的说明。 */
+  skippedSubagents?: number
+}
+
+/** 会话事件视图（`transcriptOf` 只读 type/seq/time/data）。 */
+interface SleepEventView {
+  type: string
+  seq: number | null
+  time: number | null
+  data: Record<string, unknown> | null
+}
+
+/** 消息视图：`user/message` 的 `data` 与 `assistant/message` 的 `data.message` 形状一致。 */
+interface SleepMessageView {
+  role?: unknown
+  source?: { kind?: unknown } | null
+  content?: unknown
+}
+
+/** 事件视图：非对象/无 type 的一律忽略（宿主日志里还有本插件不关心的事件）。 */
+function sleepEventView(value: unknown): SleepEventView | null {
+  if (value === null || typeof value !== 'object') return null
+  const raw = value as { type?: unknown; seq?: unknown; time?: unknown; data?: unknown }
+  if (typeof raw.type !== 'string' || raw.type.length === 0) return null
+  return {
+    type: raw.type,
+    seq: typeof raw.seq === 'number' && Number.isFinite(raw.seq) ? raw.seq : null,
+    time: typeof raw.time === 'number' && Number.isFinite(raw.time) ? raw.time : null,
+    data: raw.data !== null && typeof raw.data === 'object' ? raw.data as Record<string, unknown> : null,
+  }
+}
+
+function sleepMessageView(value: unknown): SleepMessageView | null {
+  return value !== null && typeof value === 'object' ? value as SleepMessageView : null
+}
+
+/** 内容块数组 → 纯文本（只取 text 块；图片/工具块忽略）。 */
+function sleepTextOf(content: unknown): string {
+  if (Array.isArray(content)) {
+    const parts: string[] = []
+    for (const block of content as readonly MemoryMessageContentBlock[]) {
+      if (block?.type === 'text' && typeof block.text === 'string' && block.text.length > 0) parts.push(block.text)
+    }
+    return parts.join('\n')
+  }
+  return typeof content === 'string' ? content : ''
+}
+
+/**
+ * 真实用户消息：**只认 `data.source.kind === 'user'`**（防自激闸门 1）。
+ * 我们自己注入的 runtime-context 消息同样落在 `user/message` 事件里，混进来就会把注入当用户要求。
+ */
+function isRealUserMessage(message: SleepMessageView): boolean {
+  if (message.source?.kind !== 'user') return false
+  // user/message 事件的 role 就是 'user'；缺失时不强求（实测契约如此）。
+  return message.role === undefined || message.role === null || message.role === 'user'
+}
+
+/** 子代理会话：`origin: 'subagent'` 或带 `parentSession`（契约 §3/§4）—— 整体跳过。 */
+function isSubagentSession(session: SleepSessionInput): boolean {
+  const origin = session.origin ?? session.header?.origin ?? null
+  if (typeof origin === 'string' && origin.toLowerCase() === 'subagent') return true
+  const parent = session.parentSession ?? session.header?.parentSession ?? null
+  return typeof parent === 'string' && parent.length > 0
+}
+
+/** 计数型上限：允许 0（= 关闭该项），NaN/负数回落到默认值；`Infinity` 视为不限。 */
+function sleepCap(value: unknown, fallback: number): number {
+  if (typeof value !== 'number' || Number.isNaN(value) || value < 0) return fallback
+  return value
+}
+
+/** 预算型上限：必须是正数，否则回落到默认值（0 会把所有会话裁空）。 */
+function sleepBudget(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
+}
+
+function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0
+}
+
+/** 工作区标记的规范顺序（`detectWorkspaceMarkers` 的输出顺序），用于跨会话求并集后仍保持稳定。 */
+const MARKER_ORDER: ReadonlyMap<string, number> = new Map(
+  WORKSPACE_MARKERS.map(([name], index): [string, number] => [name, index]),
+)
+
+/**
+ * 从会话事件抽消息：**只认 `data.source.kind === 'user'` 的 user/message**，
+ * 以及用于回声检测的 assistant/message 文本（`cfg.sleepAssistantContext` 条以内，默认 3，
+ * 取该用户消息之前最近的几条）。空文本、控制字符、超长文本按 `clampText` 处理；
+ * 每个会话的字符预算 `cfg.sleepMaxCharsPerSession`（超预算时保留**最近**的消息并记 note，
+ * 与契约 §4 步骤 7「补录取最新的」同一取向：最近的话更贴近当前事实）。
+ *
+ * 计数口径：`messages`/`chars` 是**保留下来的全部消息**（含为回声检测保留的 assistant 文本）之和；
+ * `sources` 保持入参顺序；被总预算整体裁掉的会话仍会留在 `sources` 里（`messages: []` + `notes`），
+ * 这样「为什么没回放它」能随计划一起呈现，而不是静默消失。
+ */
+export function transcriptOf(
+  sessions: readonly SleepSessionInput[],
+  cfg: MemoryConfig,
+): TranscriptOfResult {
+  const list: readonly SleepSessionInput[] = Array.isArray(sessions) ? sessions : []
+  const contextLimit = sleepCap(cfg.sleepAssistantContext, DEFAULTS.sleepAssistantContext)
+  const charsPerToken = sleepBudget(cfg.charsPerToken, DEFAULTS.charsPerToken)
+  const totalBudget = sleepBudget(cfg.sleepMaxCharsTotal, DEFAULTS.sleepMaxCharsTotal)
+  // 单会话预算再夹一次总预算：否则「单会话预算 > 总预算」时，最新的会话会因为装不进总预算被整体丢掉。
+  const sessionBudget = Math.min(
+    sleepBudget(cfg.sleepMaxCharsPerSession, DEFAULTS.sleepMaxCharsPerSession),
+    totalBudget,
+  )
+  // 单条消息的上限就是单会话预算：正常消息不会被截，异常超长文本有硬上限（且已是单行）。
+  const messageBudgetTokens = sessionBudget / charsPerToken
+  const notes: string[] = []
+  let skippedSubagents = 0
+
+  const drafts: Array<{ source: SleepSource; chars: number }> = []
+  for (const session of list) {
+    if (isSubagentSession(session)) {
+      skippedSubagents += 1
+      continue
+    }
+
+    // ---- 事件顺序：按 seq 升序（seq 缺失时保持原有相对顺序；Array#sort 稳定）
+    const ordered = (Array.isArray(session.events) ? session.events : [])
+      .map((event, index) => ({ view: sleepEventView(event), index }))
+      .filter((item): item is { view: SleepEventView; index: number } => item.view !== null)
+    ordered.sort((a, b) => (a.view.seq === null || b.view.seq === null ? 0 : a.view.seq - b.view.seq)
+      || (a.index - b.index))
+
+    // ---- 抽取：每条真实用户消息 = 一个「组」（它 + 它之前最近 N 条 assistant 文本）
+    const groups: Array<{ user: TranscriptMessage; context: TranscriptMessage[] }> = []
+    let pending: TranscriptMessage[] = []
+    for (const { view: event } of ordered) {
+      const at = event.time
+      if (event.type === 'user/message') {
+        const view = sleepMessageView(event.data)
+        // 实测契约是「`data` 就是 UserMessage」；`data.message` 只是多包一层的兼容读法，
+        // 仅在 data 里没有 source.kind 时才回退（否则注入消息会被误读成用户消息）。
+        const message = view && view.source?.kind !== undefined
+          ? view
+          : sleepMessageView(event.data?.message)
+        if (!message || !isRealUserMessage(message)) continue
+        const text = clampText(sleepTextOf(message.content), messageBudgetTokens, charsPerToken)
+        if (!text) continue
+        groups.push({ user: { role: 'user', text, at }, context: pending })
+        pending = []
+        continue
+      }
+      if (event.type === 'assistant/message') {
+        const message = sleepMessageView(event.data?.message) ?? sleepMessageView(event.data)
+        if (!message) continue
+        const text = clampText(sleepTextOf(message.content), messageBudgetTokens, charsPerToken)
+        if (!text) continue
+        pending.push({ role: 'assistant', text, at })
+        if (pending.length > contextLimit) pending = pending.slice(pending.length - contextLimit)
+      }
+    }
+
+    // ---- 单会话字符预算：从最新往回装填（装不下的整组丢弃并计数）
+    const kept: Array<{ user: TranscriptMessage; context: TranscriptMessage[] }> = []
+    let used = 0
+    let dropped = 0
+    for (let index = groups.length - 1; index >= 0; index -= 1) {
+      const group = groups[index]!
+      const full = group.user.text.length + group.context.reduce((sum, item) => sum + item.text.length, 0)
+      if (used + full <= sessionBudget) {
+        kept.push(group)
+        used += full
+        continue
+      }
+      // 组放不下就退化为「只留用户消息」：回声上下文只是辅助，用户消息才是回放素材。
+      if (used + group.user.text.length <= sessionBudget) {
+        kept.push({ user: group.user, context: [] })
+        used += group.user.text.length
+        dropped += group.context.length
+        continue
+      }
+      // 连用户消息都放不下：这一组以及更早的全部丢弃
+      for (let earlier = 0; earlier <= index; earlier += 1) dropped += 1 + groups[earlier]!.context.length
+      break
+    }
+    kept.reverse()
+    const messages = kept.flatMap((group) => [...group.context, group.user])
+
+    const source: SleepSource = {
+      sessionId: String(session.sessionId ?? ''),
+      cwd: typeof session.cwd === 'string' && session.cwd.length > 0 ? session.cwd : null,
+      createdAt: typeof session.createdAt === 'number' && Number.isFinite(session.createdAt) ? session.createdAt : 0,
+      messages,
+    }
+    if (dropped > 0) {
+      source.notes = [`单会话字符预算（${sessionBudget} 字符）已满：保留最近的 ${messages.length} 条消息，丢弃较早的 ${dropped} 条。`]
+    }
+    drafts.push({ source, chars: messages.reduce((sum, message) => sum + message.text.length, 0) })
+  }
+
+  // ---- 总字符预算：按「会话越新越先装」分配（与入参顺序无关，结果可复现）
+  const byRecency = drafts
+    .map((entry, index) => ({ entry, index }))
+    .sort((a, b) => (b.entry.source.createdAt - a.entry.source.createdAt) || (a.index - b.index))
+  let usedTotal = 0
+  for (const { entry } of byRecency) {
+    if (entry.chars === 0) continue
+    if (usedTotal + entry.chars <= totalBudget) {
+      usedTotal += entry.chars
+      continue
+    }
+    entry.source.messages = []
+    entry.source.notes = [
+      ...(entry.source.notes ?? []),
+      `总字符预算（${totalBudget} 字符）已用尽：该会话未纳入本次回放。`,
+    ]
+    entry.chars = 0
+  }
+
+  const sources = drafts.map((entry) => entry.source)
+  let messages = 0
+  let chars = 0
+  for (const entry of drafts) {
+    messages += entry.source.messages.length
+    chars += entry.chars
+  }
+  if (skippedSubagents > 0) {
+    notes.push(`跳过 ${skippedSubagents} 个子代理会话（其中的「用户消息」是父代理的指令，不是用户说的话）。`)
+  }
+  return { sources, messages, chars, skippedSubagents, notes }
+}
+
+/**
+ * 生成梳理计划（纯函数、确定性）。
+ * 步骤：
+ *  1. 回放捕获：对每条真实用户消息跑 `extractCandidates`（`deriveOriginFromMessages` 语义：命中显式祈使
+ *     → 只补录 user_explicit，其余跳过 —— `/sleep` 只补录用户明确要求记住的东西，不把闲聊变成记忆）；
+ *  2. 去重：`recordHash` 命中库内已有（**含 archived 与 invalid**）→ `duplicates += 1`，不进 backfill
+ *     （本次更早出现过的同指纹候选同样跳过并计数）；
+ *  3. 合并：对库内 active 集跑 `pickMergeGroups`（含 pinned 的组跳过，§6「合并不动 pinned」）；
+ *  4. 冲突：跑 `findConflicts`（会把用户侧/pinned 条目判成 drop、以及涉及 agent_self 的建议跳过并写进 notes，§6）；
+ *  5. 归档：跑 `shouldArchive`；
+ *  6. 项目印象：用回放期间 `detectWorkspaceMarkers` 观察到的标记按 workspace 重算 `composeGistText`；
+ *  7. 裁剪：backfill 最多 `cfg.sleepMaxBackfill` 条，取**最新**的（更贴近当前事实），其余计入 `truncated`；
+ *  8. **不碰自画像**：计划里不产生任何 `agent_self` 写入（人格/工作倾向属于模型自我认知）。
+ */
+export function buildSleepPlan(input: SleepPlanInput): SleepPlan {
+  const cfg = input.cfg
+  const now = typeof input.now === 'number' && Number.isFinite(input.now) ? input.now : Date.now()
+  const records = input.records ? [...input.records] : []
+  const sources = Array.isArray(input.sources) ? [...input.sources] : []
+  const notes: string[] = []
+  for (const note of input.notes ?? []) if (note) notes.push(String(note))
+  for (const source of sources) for (const note of source.notes ?? []) if (note) notes.push(String(note))
+  const skippedSubagents = sleepCap(input.skippedSubagents, 0)
+  if (skippedSubagents > 0 && !notes.some((note) => note.includes('子代理'))) {
+    notes.push(`跳过 ${skippedSubagents} 个子代理会话（其中的「用户消息」是父代理的指令，不是用户说的话）。`)
+  }
+
+  // ---- 0) 统计：回看的规模（含为回声检测保留的 assistant 文本）
+  let scannedMessages = 0
+  let scannedChars = 0
+  for (const source of sources) {
+    for (const message of source.messages) {
+      scannedMessages += 1
+      scannedChars += message.text.length
+    }
+  }
+
+  // ---- 1) 回放捕获 + 2) 去重
+  const libraryHashes = new Set(records.map((record) => record.hash))
+  const createdAtOf = new Map<string, number>()
+  for (const source of sources) createdAtOf.set(source.sessionId, source.createdAt)
+  const charsPerToken = sleepBudget(cfg.charsPerToken, DEFAULTS.charsPerToken)
+  const bodyBudgetTokens = sleepBudget(cfg.sleepMaxCharsPerSession, DEFAULTS.sleepMaxCharsPerSession) / charsPerToken
+  const seen = new Set<string>()
+  const found: SleepCandidate[] = []
+  let duplicates = 0
+  for (const source of sources) {
+    const workspaceKey = workspaceKeyOf(source.cwd)
+    for (const message of source.messages) {
+      if (!message || message.role !== 'user') continue
+      const text = message.text
+      // 契约 §4 步骤 1：命中显式祈使才回放 —— 与 `deriveOriginFromMessages` 的判定同源（同一个正则）。
+      if (!EXPLICIT_SIGNAL_RE.test(text)) continue
+      const at = typeof message.at === 'number' && Number.isFinite(message.at) ? message.at : null
+      const extracted = extractCandidates(text, cfg, at ?? now)
+      for (const candidate of extracted.candidates) {
+        // 硬要求（§4 步骤 8）：计划里绝不产生 agent_self 写入。
+        if (candidate.kind === 'agent_self') continue
+        // 只补录「用户明确要求记住的东西」：observed / user_correction / model_proposed 一律不补录。
+        if (candidate.origin !== 'user_explicit') continue
+        const level = defaultScopeFor(candidate.kind)
+        const scope: { level: 'workspace' | 'profile'; key: string } = level === 'workspace'
+          ? { level: 'workspace', key: workspaceKey ?? '*' }
+          : { level: 'profile', key: '*' }
+        // subject 与实况捕获路径同源（`deriveSubject(text, signal)`）—— 否则指纹对不上，去重会漏判。
+        const subject = deriveSubject(candidate.text, candidate.signal)
+        // 与 `writeMemory` 的落盘前处理对齐（maskPii），并过 clampText（上限 = 单会话预算，正常句子不受影响）。
+        const body = clampText(maskPii(candidate.text), bodyBudgetTokens, charsPerToken)
+        if (!body) continue
+        const hash = recordHash({ kind: candidate.kind, scope, subject, text: body })
+        if (seen.has(hash) || libraryHashes.has(hash)) {
+          duplicates += 1
+          continue
+        }
+        seen.add(hash)
+        found.push({
+          text: body,
+          sessionId: source.sessionId,
+          at,
+          scope,
+          origin: candidate.origin,
+          confidence: candidate.confidence,
+          hash,
+          kind: candidate.kind,
+          subject,
+        })
+      }
+    }
+  }
+
+  // ---- 3) 合并（§6：含 pinned 的组不动）
+  const merges: SleepPlan['merges'] = []
+  let pinnedMergeGroups = 0
+  for (const group of pickMergeGroups(records, cfg)) {
+    if (group.some((record) => record.pinned)) {
+      pinnedMergeGroups += 1
+      continue
+    }
+    const sorted = [...group].sort(compareRecords)
+    const lead = sorted[0]!
+    merges.push({
+      ids: sorted.map((record) => record.id),
+      subject: lead.subject ?? '',
+      text: clampText(lead.text, cfg.maxItemTokens, cfg.charsPerToken),
+    })
+  }
+  if (pinnedMergeGroups > 0) {
+    notes.push(`跳过 ${pinnedMergeGroups} 组含 pinned 条目的合并建议（合并不动 pinned）。`)
+  }
+
+  // ---- 4) 冲突（§6：不允许把用户侧条目判成 drop；§4 步骤 8：自画像不由规则下结论）
+  const conflicts: SleepPlan['conflicts'] = []
+  let protectedConflicts = 0
+  let selfConflicts = 0
+  for (const entry of findConflicts(records)) {
+    if (entry.winner.kind === 'agent_self' || entry.loser.kind === 'agent_self') {
+      selfConflicts += 1
+      continue
+    }
+    if (entry.blocked || isUserSideOrigin(entry.loser.origin) || entry.loser.pinned) {
+      protectedConflicts += 1
+      continue
+    }
+    conflicts.push({
+      keep: entry.winner.id,
+      drop: entry.loser.id,
+      subject: entry.winner.subject ?? entry.loser.subject ?? '',
+    })
+  }
+  if (protectedConflicts > 0) {
+    notes.push(`跳过 ${protectedConflicts} 条会失效用户侧条目的冲突建议（用户明确说过、被用户纠正过、以及 pinned 的条目不由规则推翻）。`)
+  }
+  if (selfConflicts > 0) {
+    notes.push(`跳过 ${selfConflicts} 条涉及自画像（agent_self）的冲突建议：人格与工作倾向属于模型自我认知，不由规则下结论。`)
+  }
+
+  // ---- 5) 归档（agent_self / project_gist / pinned 由 `shouldArchive` 自己排除）
+  const archive = records
+    .filter((record) => record.status === 'active' && shouldArchive(record, cfg, now))
+    .map((record) => record.id)
+
+  // ---- 6) 项目印象：回放期间观察到的标记，按 workspace 重算
+  const markerSets = new Map<string, Set<string>>()
+  const latestOf = new Map<string, number>()
+  for (const source of sources) {
+    const key = workspaceKeyOf(source.cwd)
+    if (!key) continue
+    latestOf.set(key, Math.max(latestOf.get(key) ?? 0, source.createdAt))
+    const set = markerSets.get(key) ?? new Set<string>()
+    markerSets.set(key, set)
+    for (const message of source.messages) {
+      for (const marker of detectWorkspaceMarkers(message.text)) set.add(marker)
+    }
+  }
+  const gistCandidates: Array<{ level: 'workspace'; key: string; text: string; at: number }> = []
+  const gistMinMarkers = sleepCap(cfg.gistMinMarkers, DEFAULTS.gistMinMarkers)
+  for (const [key, markers] of markerSets) {
+    if (markers.size < gistMinMarkers) continue
+    // 并集按标记表的规范顺序输出，composeGistText 的文案才稳定（跨会话也是同一个顺序）
+    const ordered = [...markers].sort((a, b) => (MARKER_ORDER.get(a) ?? 0) - (MARKER_ORDER.get(b) ?? 0))
+    const text = clampText(composeGistText(ordered), cfg.maxItemTokens, cfg.charsPerToken)
+    if (!text) continue
+    // 库里已有同样文本的项目印象 → 这次无需改动（这也是「第二次 /sleep 无事可做」的一部分）。
+    // subject 与宿主刷新路径保持一致（`project.overview`）：否则计划说「没变化」而宿主会新建一条。
+    const unchanged = records.some((record) => record.status === 'active'
+      && record.kind === 'project_gist'
+      && record.scope.level === 'workspace'
+      && record.scope.key === key
+      && record.subject === 'project.overview'
+      && record.text === text)
+    if (unchanged) continue
+    gistCandidates.push({ level: 'workspace', key, text, at: latestOf.get(key) ?? 0 })
+  }
+  gistCandidates.sort((a, b) => (b.at - a.at) || compareText(a.key, b.key))
+  const maxGists = sleepCap(cfg.sleepMaxGists, DEFAULTS.sleepMaxGists)
+  // 只把契约 §4 声明的三个字段交出去（排序用的 `at` 是内部信息，不进计划）
+  const gists: SleepPlan['gists'] = maxGists > 0
+    ? gistCandidates.slice(0, maxGists).map(({ level, key, text }) => ({ level, key, text }))
+    : []
+  if (gistCandidates.length > gists.length) {
+    notes.push(`项目印象超过上限 ${maxGists} 条：只重算最近活跃的 ${gists.length} 个工作区，另有 ${gistCandidates.length - gists.length} 个未处理。`)
+  }
+
+  // ---- 7) 裁剪：取最新的 `cfg.sleepMaxBackfill` 条，其余计入 truncated
+  const orderKeyOf = (candidate: SleepCandidate): number =>
+    candidate.at ?? createdAtOf.get(candidate.sessionId) ?? 0
+  const orderedBackfill = [...found].sort((a, b) => (orderKeyOf(a) - orderKeyOf(b))
+    || compareText(a.sessionId, b.sessionId)
+    || compareText(a.hash, b.hash))
+  const maxBackfill = sleepCap(cfg.sleepMaxBackfill, DEFAULTS.sleepMaxBackfill)
+  const backfill = maxBackfill > 0
+    ? orderedBackfill.slice(Math.max(0, orderedBackfill.length - maxBackfill))
+    : []
+  const truncated = orderedBackfill.length - backfill.length
+  if (truncated > 0) {
+    notes.push(`补录候选 ${orderedBackfill.length} 条超过上限 ${maxBackfill} 条：只补录最新的 ${backfill.length} 条，其余 ${truncated} 条本次未补录。`)
+  }
+
+  if (sources.length === 0) {
+    notes.push('没有可回看的会话（未提供会话记录，或全部被跳过）。')
+  } else if (scannedMessages === 0) {
+    notes.push(`最近 ${sources.length} 个会话里没有可回放的消息（注入的 runtime-context 消息与子代理会话都不算）。`)
+  }
+
+  return {
+    scanned: { sessions: sources.length, messages: scannedMessages, chars: scannedChars },
+    backfill,
+    duplicates,
+    merges,
+    conflicts,
+    archive,
+    gists,
+    notes,
+    truncated,
+  }
+}
+
+/** 局部时间戳（人读用；`formatSleepPlan` 内部使用）。 */
+function stampOf(at: number): string {
+  const date = new Date(at)
+  if (Number.isNaN(date.getTime())) return '-'
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+    + `${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+function shortId(id: string): string {
+  return id ? String(id).slice(0, 8) : '-'
+}
+
+/**
+ * 预览/回报文本（中文，与既有命令风格一致；空计划必须给出「无需改动」而不是空白）。
+ *
+ * 按**预览**语义渲染：尾行会声明「以上为计划，未写入任何内容」。
+ * `--apply` 之后的回报文本请由宿主另行生成（要报的是写入计数，不是计划）。
+ */
+export function formatSleepPlan(plan: SleepPlan, cfg: MemoryConfig): string {
+  const lines: string[] = ['[记忆梳理稿 · 预览]']
+  const scanned = plan?.scanned ?? { sessions: 0, messages: 0, chars: 0 }
+  lines.push(`回看 ${scanned.sessions} 个会话 · ${scanned.messages} 条消息 · ${scanned.chars} 字符；`
+    + `与库内指纹重复而跳过 ${plan?.duplicates ?? 0} 条。`)
+
+  if (sleepPlanIsEmpty(plan)) {
+    lines.push('无需改动：没有可补录的候选，也没有需要合并/失效/归档的条目。')
+  } else {
+    if (plan.backfill.length > 0) {
+      lines.push(`补录 ${plan.backfill.length} 条（按时间升序）：`)
+      for (const candidate of plan.backfill) {
+        const parts = [String(candidate.origin), `会话 ${shortId(candidate.sessionId)}`]
+        if (candidate.at !== null && Number.isFinite(candidate.at)) parts.push(stampOf(candidate.at))
+        lines.push(`  - ${clampText(candidate.text, cfg.maxItemTokens, cfg.charsPerToken)}（${parts.join(' · ')}）`)
+      }
+    }
+    if (plan.merges.length > 0) {
+      lines.push(`合并 ${plan.merges.length} 组：`)
+      for (const merge of plan.merges) {
+        lines.push(`  - ${merge.subject || '(无主题)'}：${merge.ids.length} 条，保留 ${shortId(merge.ids[0] ?? '')}「${merge.text}」`)
+      }
+    }
+    if (plan.conflicts.length > 0) {
+      lines.push(`失效 ${plan.conflicts.length} 条：`)
+      for (const conflict of plan.conflicts) {
+        lines.push(`  - 保留 ${shortId(conflict.keep)}，失效 ${shortId(conflict.drop)}（${conflict.subject || '(无主题)'}）`)
+      }
+    }
+    if (plan.archive.length > 0) {
+      const sample = plan.archive.slice(0, 5).map((id) => shortId(id)).join('、')
+      lines.push(`归档 ${plan.archive.length} 条：${sample}${plan.archive.length > 5 ? ` 等 ${plan.archive.length} 条` : ''}`)
+    }
+    if (plan.gists.length > 0) {
+      lines.push(`项目印象 ${plan.gists.length} 条：`)
+      for (const gist of plan.gists) lines.push(`  - ${gist.key}：${gist.text}`)
+    }
+  }
+
+  if (plan?.truncated > 0) {
+    lines.push(`裁剪：补录候选超出上限，本次少补录 ${plan.truncated} 条（见下方说明）。`)
+  }
+  if ((plan?.notes?.length ?? 0) > 0) {
+    lines.push('说明：')
+    for (const note of plan.notes) lines.push(`  - ${clampText(note, 300, cfg.charsPerToken)}`)
+  }
+  lines.push('以上为计划，未写入任何内容；确认后用 /sleep --apply 落盘（会先自动导出备份）。')
+  return lines.join('\n')
+}
+
+/** 计划是否无事可做（backfill/merges/conflicts/archive/gists 全空）。 */
+export function sleepPlanIsEmpty(plan: SleepPlan): boolean {
+  if (!plan) return true
+  return plan.backfill.length === 0
+    && plan.merges.length === 0
+    && plan.conflicts.length === 0
+    && plan.archive.length === 0
+    && plan.gists.length === 0
+}

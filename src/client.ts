@@ -78,6 +78,7 @@ const zh = {
   groupStore: '记忆库',
   groupCapture: '自动捕获',
   groupConsolidate: '整合治理',
+  groupSleep: '空闲梳理（/sleep）',
   overridden: '已覆盖',
   reset: '恢复默认',
   save: '保存',
@@ -109,6 +110,9 @@ const zh = {
   captureMaxPerTurn: '每回合最多写入',
   consolidateEnabled: '定时整合',
   consolidateIntervalMinutes: '整合间隔（分钟）',
+  sleepEnabled: '空闲梳理开关',
+  sleepSessions: '默认回看会话数',
+  sleepMaxBackfill: '单次最多补录条数',
   hintDomainName: '记忆库名（= 落盘目录名）。换成别的名字即启用一个空库，旧库仍留在磁盘上。',
   hintMaxInjectedTokens: '常驻注入的 token 硬上限；块头尾的固定文案也计入。',
   hintMaxItemTokens: '单条记忆注入时的截断长度。',
@@ -129,6 +133,9 @@ const zh = {
   hintCaptureMaxPerTurn: '每回合最多自动写入几条。',
   hintConsolidateEnabled: '定时整合：合并重复、失效矛盾、衰减归档、规则式摘要。',
   hintConsolidateIntervalMinutes: '整合间隔（分钟）。',
+  hintSleepEnabled: '0=关、1=开；默认 1（开）。关掉后 /sleep 只返回一句说明、不做任何事；它不受 recallMode / autoRecall 影响。',
+  hintSleepSessions: '不带 --sessions=N 时默认回看最近几个会话；上限 20。',
+  hintSleepMaxBackfill: '一次 /sleep --apply 最多补录几条（只补用户明确要求记住的内容）；超出的候选计入计划的 truncated 并写进说明。',
 }
 
 const en = {
@@ -138,6 +145,7 @@ const en = {
   groupStore: 'Memory store',
   groupCapture: 'Automatic capture',
   groupConsolidate: 'Consolidation',
+  groupSleep: 'Idle review (/sleep)',
   overridden: 'Overridden',
   reset: 'Reset to default',
   save: 'Save',
@@ -169,6 +177,9 @@ const en = {
   captureMaxPerTurn: 'Writes per turn',
   consolidateEnabled: 'Scheduled consolidation',
   consolidateIntervalMinutes: 'Consolidation interval (min)',
+  sleepEnabled: 'Idle review switch',
+  sleepSessions: 'Sessions reviewed by default',
+  sleepMaxBackfill: 'Backfill cap per run',
   hintDomainName: 'Memory store name (= on-disk directory). A new name starts an empty store; the old one stays on disk.',
   hintMaxInjectedTokens: 'Hard token cap for resident injection; the fixed block header/footer counts too.',
   hintMaxItemTokens: 'Truncation length for one injected memory.',
@@ -189,6 +200,9 @@ const en = {
   hintCaptureMaxPerTurn: 'Maximum automatic writes per turn.',
   hintConsolidateEnabled: 'Scheduled consolidation: merge duplicates, invalidate conflicts, decay-archive, rule-based summary.',
   hintConsolidateIntervalMinutes: 'Consolidation interval in minutes.',
+  hintSleepEnabled: '0 = off, 1 = on; default 1 (on). When off, /sleep only explains that it is disabled and does nothing; it is not affected by recallMode / autoRecall.',
+  hintSleepSessions: 'How many recent sessions /sleep reviews when --sessions=N is omitted; capped at 20.',
+  hintSleepMaxBackfill: 'Maximum rows one /sleep --apply may backfill (only things the user explicitly asked to remember); candidates beyond it are reported as truncated in the plan and its notes.',
 }
 
 // ---------------------------------------------------------------- 字段定义
@@ -251,6 +265,12 @@ const FIELDS: readonly Field[] = [
   { name: 'captureMaxPerTurn', kind: 'number', group: 'groupCapture' },
   { name: 'consolidateEnabled', kind: 'boolean', group: 'groupConsolidate' },
   { name: 'consolidateIntervalMinutes', kind: 'number', group: 'groupConsolidate' },
+  // M8：空闲梳理（独立命令 `/sleep`）。这里只放最常用的三个旋钮；字符预算与自画像条数
+  // （sleepMaxCharsPerSession / sleepMaxCharsTotal / sleepAssistantContext / sleepMaxGists）
+  // 仍走 patch 行，见两份 README 的配置章节。
+  { name: 'sleepEnabled', kind: 'number', bool01: true, group: 'groupSleep' },
+  { name: 'sleepSessions', kind: 'number', group: 'groupSleep' },
+  { name: 'sleepMaxBackfill', kind: 'number', group: 'groupSleep' },
 ]
 
 /**

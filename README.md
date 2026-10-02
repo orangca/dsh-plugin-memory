@@ -36,7 +36,8 @@ explainable and deletable.
      genuinely related, with a per-id cooldown.
 3. **Consolidate** — every 30 minutes by default, plus a catch-up run at startup. Merges duplicates, marks
    contradictions invalid (recoverable), decays/archives by per-kind half-life, and summarizes subjects that
-   accumulate too many rows.
+   accumulate too many rows. A separate cross-session pass, `/sleep`, is triggered explicitly by the user (see
+   below).
 
 ## The self-portrait: persona + work tendencies
 
@@ -106,6 +107,46 @@ ordinary persona rows under three subjects:
 /memory self reset [persona|work]        archive the current self-portrait (history is kept, nothing is deleted)
 ```
 
+## `/sleep`: idle review
+
+`/memory consolidate` only does **governance inside the store** (merge / invalidate / archive / summarize).
+`/sleep` is an **independent command** (not a `/memory` subcommand) that works **across the store and across
+sessions**: it replays the **complete event logs** of the most recent sessions through the memory pipeline to pick
+up what was missed at the time, then reorders the whole store.
+
+```
+/sleep [--sessions=N] [--all] [--apply]
+```
+
+- **Preview by default**: read-only, compute-only. It prints a plan of what it *would* do — how many rows to
+  backfill, how many groups to merge, how many rows to invalidate, how many to archive, which project gists to
+  recompute. **It writes nothing.**
+- **Only `--apply` writes**, and its first step is an **automatic backup** (a `sleep-backup-<ISO timestamp>.json` in
+  the export directory, reusing the `/memory export` implementation): if the backup fails, the run stops. There is
+  no "write first, back up later".
+- `--sessions=N` reviews the last N sessions (default `sleepSessions`, capped at 20). Without `--all` the list is
+  filtered by the cwd of the current / most recent session, so another project's business does not leak in.
+- Session logs are read through the host's `sessionQuery` service. Where that service is unavailable, the command
+  says so and points out that `/memory consolidate` still works.
+- **Real user messages only**: only messages whose `source.kind === 'user'` count — context the plugin injected
+  itself does not (self-reinforcement guard) — and `origin: 'subagent'` sessions are skipped by default.
+- Every budget that is hit (per-session `sleepMaxCharsPerSession`, total `sleepMaxCharsTotal`, backfill
+  `sleepMaxBackfill`) is reported in the plan's notes.
+
+**Three lines it does not cross:**
+
+- **It backfills only what you explicitly asked to remember.** It runs the same rule extraction as automatic
+  capture, so small talk that hits no explicit imperative never becomes a memory, and candidates whose fingerprint
+  is already in the store are skipped — running it again does not re-add rows.
+- **It does not touch the self-portrait.** Persona and work tendencies are the model's cognition about itself, and
+  the rules do not draw conclusions on its behalf: `/sleep` produces no `agent_self` write at all.
+- **It does not touch user-owned rows.** Merges never touch `pinned`, and conflict detection never marks a row you
+  set or confirmed as invalid — those are skipped and flagged in the plan's notes.
+
+With `sleepEnabled` (default `true`) off, the command only explains that it is disabled and does nothing. `/sleep`
+is a maintenance action the user triggers explicitly, so it is **not** affected by `recallMode` / `autoRecall`. The
+run counters and the watermark (`lastSleepAt`) are visible in `/memory stats` and `memory_stats`.
+
 ## Guarding against memory pollution / self-reinforcement
 
 - Capture reads **real user messages only** — the plugin's own injected context does not count.
@@ -163,9 +204,10 @@ Add this package to the profile's `dependencies`, append `dsh-plugin-memory` to
 
 ## The settings form
 
-The plugin exports a schemastery `Config` whose 20 tunable fields are declared `volatile()`, and ships a small
-browser half (`src/client.ts`, built to `lib/client.js`) that renders them as a form. Find it under **Plugins → `dsh-plugin-memory` →
-row `dsh-memory`** (the list card also shows a one-line summary).
+The plugin exports a schemastery `Config` whose **23 fields** are declared `volatile()` (hot-applied when edited);
+everything else is patch-row only. It ships a small browser half (`src/client.ts`, built to `lib/client.js`) that
+renders those 23 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
+also shows a one-line summary).
 
 Under the hood the client half registers into the keyed `plugins.row.config` slot with
 `key: 'dsh-plugin-memory#dsh-memory'`, using DSH's shared `SettingsFormModel` / `SettingsForm`. Saving validates the
@@ -195,6 +237,8 @@ whole Config through the settings service and persists it into the profile patch
 /memory consolidate                              consolidate right now
 /memory stats                                    runtime observability: counts, writes, render time
 /memory help
+
+/sleep [--sessions=N] [--all] [--apply]          idle review (independent command, not a /memory subcommand): preview only by default; --apply backs up first
 ```
 
 ## Model tools
@@ -211,7 +255,7 @@ whole Config through the settings service and persists it into the profile patch
 
 ## Configuration
 
-Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 20 fields exposed in
+Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 23 fields exposed in
 the settings form:
 
 | Field | Default | Meaning |
@@ -236,6 +280,9 @@ the settings form:
 | `captureMaxPerTurn` | `3` | Max automatic writes per turn |
 | `consolidateEnabled` | `true` | Scheduled consolidation |
 | `consolidateIntervalMinutes` | `30` | Consolidation interval |
+| `sleepEnabled` | `true` | Idle review (`/sleep`) switch; in the form `0` = off, `1` = on. When off, the command only explains itself and does nothing |
+| `sleepSessions` | `3` | Sessions reviewed by default when `--sessions=N` is omitted (capped at 20) |
+| `sleepMaxBackfill` | `20` | Maximum rows one `/sleep --apply` may backfill (only things you explicitly asked to remember) |
 
 Additional knobs available only through the patch row (with their defaults): `maxItemTokens` neighbours such as
 `selfPortraitMaxItems` 12 / `selfPortraitMaxSelfObserved` 4, capture tuning (`capturePerHour` 20,
@@ -245,6 +292,11 @@ Additional knobs available only through the patch row (with their defaults): `ma
 recall detail (`recallMinQueryChars` 12, `recallMinHits` 2, `recallMinMatch` 0.4, `recallCooldownTurns` 3,
 `recallBudgetMs` 10), privacy (`piiPolicy` `mask`), `repeatMentionBoost` 0.1, `reportPath` (optional JSON
 self-report for development) and `seed` (dev-only demo data, **off** by default).
+
+`/sleep`'s remaining knobs are not in the form either and go through the patch row (with their defaults):
+per-session character budget `sleepMaxCharsPerSession` 120000, total character budget `sleepMaxCharsTotal`
+300000, assistant texts kept ahead of each user message `sleepAssistantContext` 3 (used for echo detection), and
+the maximum number of project gists recomputed `sleepMaxGists` 8.
 
 ## Data and privacy
 
