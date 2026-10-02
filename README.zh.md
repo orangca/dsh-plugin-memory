@@ -205,6 +205,14 @@ node tools/scan-asar.cjs settingsNumberField    # 定位某个符号在 app.asar
 本插件依赖的 DSH 接缝、插槽语义与环境事实，见 [`docs/dsh-mechanisms.md`](docs/dsh-mechanisms.md)
 （面向插件作者，不含任何环境特定信息）。
 
+### 版本号
+
+发布**只递增 patch 位**：`0.5.0` → `0.5.1` → `0.5.2`，不跳 minor/major。
+
+```sh
+pnpm version patch --no-git-tag-version   # 0.5.0 -> 0.5.1
+```
+
 ## 已知限制
 
 - **压缩固化取决于部署**：代码监听 `compaction/summary`；没有挂载压缩插件的 profile 不会产生该事件。
