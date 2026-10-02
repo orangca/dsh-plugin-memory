@@ -3,6 +3,29 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.2 — 2026-10-02
+
+Follow-up to 0.5.1: the host-half test suite landed in full, and reviewing it surfaced one more behavioural bug.
+
+### Fixed
+
+- **Recall could return nothing while relevant memories existed.** The per-turn recall path asked the index for
+  exactly `recallTopK` candidates and applied the cooldown filter *afterwards*. Because injected memories get a
+  recency boost, the row injected last turn sorted first, was then removed by its cooldown, and took the whole
+  candidate pool with it. The pool is now four times the requested size (capped at 50) and the cooldown filter runs
+  **before** the top-K slice. Regression test `host#13` fails against the previous behaviour (verified by mutation).
+
+### Added
+
+- `tests/host.test.ts` grew to 14 cases (55 → 56 tests overall); every 0.5.1 fix is covered by a case that turns red
+  when the fix is reverted.
+
+### Documented
+
+- `/memory clear` now documents that `--all` is mutually exclusive with `--kind=` / `--scope=` and that filters
+  combine with AND; `/memory import` documents the field validation, clamping, forced `pinned: false` and the
+  `observed` downgrade (so re-importing your own export loses the pin on purpose).
+
 ## 0.5.1 — 2026-10-02
 
 Hardening pass driven by two independent audits (code correctness/security, and repository engineering).

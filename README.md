@@ -114,8 +114,9 @@ whole Config through the settings service and persists it into the profile patch
 /memory confirm <id prefix>                      promote a model self-observation to user-confirmed
 /memory reject <id prefix>                       reject a self-observation (that kind is never re-created)
 /memory export [path]                            export JSON
-/memory import <path>                            import JSON (deduplicated by fingerprint)
-/memory clear --all --yes                        permanently clear (also --kind= / --scope=)
+/memory import <path>                            import JSON (deduplicated by fingerprint; every field is validated, numbers are clamped, `pinned` is forced off and the origin is downgraded to `observed`)
+/memory clear --all --yes                        permanently clear everything (`--all` is mutually exclusive with the filters below)
+/memory clear --kind=<kind> --scope=<level> --yes   clear a subset; conditions combine with AND and values are validated against the enums
 /memory consolidate                              consolidate right now
 /memory stats                                    runtime observability: counts, writes, render time
 /memory help

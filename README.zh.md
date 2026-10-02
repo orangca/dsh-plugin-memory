@@ -108,8 +108,9 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 /memory confirm <id 前缀>                        把模型自评升级为用户确认
 /memory reject <id 前缀>                         拒绝一条自我观察（同类不再产生）
 /memory export [path]                            导出 JSON
-/memory import <path>                            导入 JSON（按指纹去重）
-/memory clear --all --yes                        永久清空（也支持 --kind= / --scope=）
+/memory import <path>                            导入 JSON（按指纹去重；逐字段校验、数值夹取、`pinned` 强制关闭、来源一律降级为 `observed`）
+/memory clear --all --yes                        永久清空全部（`--all` 与下面的筛选条件互斥）
+/memory clear --kind=<kind> --scope=<level> --yes   清空子集；条件之间是 AND，取值按枚举校验
 /memory consolidate                              立即整理一次
 /memory stats                                    运行时可观测：计数、写入、渲染耗时、注入行数
 /memory help

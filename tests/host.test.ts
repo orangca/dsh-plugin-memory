@@ -28,6 +28,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { apply as applyRaw } from '../lib/index.js'
+import { workspaceKeyOf } from '../lib/lib.js'
 
 /** 假 ctx 只实现本插件实际用到的那一块；测试里不假装它是完整宿主类型。 */
 const apply = applyRaw as unknown as (ctx: Record<string, unknown>, config?: Record<string, unknown>) => void
@@ -88,6 +89,8 @@ interface HarnessOptions {
   globalValue?: unknown
   /** 把 global.get() 包成 Promise —— 运行版就是这样。 */
   asyncGlobal?: boolean
+  /** 不写自报告（大量写入的用例可以省掉每次 flush 的同步文件写）。 */
+  noReport?: boolean
 }
 
 interface Harness {
@@ -122,7 +125,7 @@ function makeFakeDomain(options: HarnessOptions): { domain: Json; control: Domai
   const puts: Array<{ key: string; value: Json }> = []
   const deletes: string[] = []
   const pending: Array<() => void> = []
-  let globalValue = options.globalValue ?? null
+  let globalValue: unknown = options.globalValue ?? null
 
   const control: DomainControl = {
     rows,
@@ -233,7 +236,7 @@ function makeHarness(options: HarnessOptions = {}): Harness {
     provide: (serviceName: string, service: unknown): void => { provided.set(serviceName, service) },
   }
 
-  apply(ctx, { reportPath: join(tempDir, 'report.json'), ...options.config })
+  apply(ctx, { ...(options.noReport === true ? {} : { reportPath: join(tempDir, 'report.json') }), ...options.config })
 
   const memory = (): MemoryService => {
     const service = provided.get('memory')
@@ -627,6 +630,57 @@ test('host#10 工具结果按条目数截断：仍是完整 JSON，并带 total 
   assert.equal(small.truncated, false, '没超上限时也要给出稳定的 truncated 字段')
 })
 
+// ---------------------------------------------------------------- 12. 冷却表 cutoff
+
+test('host#12 冷却表 cutoff：跨会话的旧回合号会被清掉，条目不会被永久压制', async (t) => {
+  // 冷却表的键是记录 id，值是该记录最近一次被注入的回合号；回合号按会话从 0 重新计数。
+  // 旧实现用「从来没人写过的 state.consolidate.last.turn」算 cutoff（恒为 -200），
+  // 于是超过 500 条之后这个表只增不减：上个会话的回合号会永久压制同名条目。
+  const harness = makeHarness({
+    noReport: true,
+    config: {
+      // 每回合放行 50 条、冷却 60 回合：11 个回合即可把冷却表推到 550 条（> 500 的收敛阈值）。
+      recallTopK: 60,
+      recallCooldownTurns: 60,
+      maxInjectedTokens: 20_000,
+      // 默认 10ms 的召回预算在 600 条记录上会被判成 over-budget（那是性能护栏，不是本用例的被测点）
+      recallBudgetMs: 10_000,
+    },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const memory = harness.memory()
+  // 每 50 条一个批次，批次内共享 batchK、批次间不共享其它 token：
+  // 这样第 K 个回合的查询只会命中第 K 批（记忆侧覆盖率要求 ≥2 个信息量 token）。
+  for (let index = 0; index < 600; index += 1) {
+    await memory.write({ kind: 'user_profile', text: `构建 batch${Math.floor(index / 50)} child${index}` })
+  }
+
+  /** 跑一个回合，返回本轮真正注入的行数（块头 + N 行 + 块尾）。 */
+  const runTurn = async (turn: number, batch: number): Promise<number> => {
+    const decision = {
+      kind: 'continue',
+      messages: [{ role: 'user', content: [{ type: 'text', text: `构建 batch${batch} 请继续处理这些内容` }] }],
+    }
+    const result = await harness.preStep({ turn, agent: agentWith('C:\\work\\demo') }, async () => decision) as { messages: Json[] }
+    if (result.messages.length === 1) return 0
+    const text = String((((result.messages[1]!.content as Json[])[0]!).text))
+    return text.split('\n').length - 2
+  }
+
+  // 上一个会话：回合号从 1000 起，11 个回合各注入 50 条新记录 → 冷却表 550 条
+  for (let batch = 0; batch < 11; batch += 1) {
+    assert.equal(await runTurn(1000 + batch, batch), 50, '每个回合应恰好注入 50 条新记录')
+  }
+
+  // 新会话：回合号回到 1，此时 550 条冷却记录全部来自「未来」回合 —— 旧实现下它们会被永久压制
+  assert.equal(await runTurn(1, 0), 0, '冷却表生效：新会话第一回合不该重复注入')
+  // 触发整合 → 冷却表超过 500 条，cutoff 必须用**当前回合号**把它们收敛掉
+  await harness.runCommand('consolidate')
+  assert.equal(await runTurn(2, 0), 50, '跨会话的旧回合号必须被清掉，否则条目被永久压制')
+})
+
 // ---------------------------------------------------------------- 11. 删除落盘失败
 
 test('host#11 落盘失败的删除不得报成功（memory_forget / forget / clear）', async (t) => {
@@ -659,4 +713,51 @@ test('host#11 落盘失败的删除不得报成功（memory_forget / forget / cl
   assert.match(ok.text, /已删除/)
   assert.equal(harness.memory().list().length, 0)
   assert.deepEqual(harness.domain.deletes, [id])
+})
+
+// ---------------------------------------------------------------- 13. 冷却过滤必须在 top-K 之前
+
+test('host#13 pre-step：冷却过滤发生在 top-K 之前（刚注入过的条目不能把候选池挤空）', async (t) => {
+  // recallTopK=1 时最容易暴露：旧实现从 recallRecords 只取 1 条候选，
+  // 而刚注入过的条目因为 markUsed 的 recency 加成恰好排第一 → 被冷却过滤掉 → 该回合 0 命中。
+  const harness = makeHarness({
+    config: { recallMode: 'inject', recallTopK: 1, recallCooldownTurns: 3, consolidateEnabled: false },
+    noReport: true,
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const cwd = 'C:/proj/cooldown'
+  const scopeKey = workspaceKeyOf(cwd)
+  const query = '构建与发布流程都走 pnpm，产物放在哪个目录？'
+  const at = (turn: number): unknown => ({ turn, agent: { session: { header: { cwd } } }, signal: { aborted: false } })
+  const decision = (text: string): Json => ({ kind: 'continue', messages: [{ role: 'user', content: [{ type: 'text', text }] }] })
+  const injected = (result: unknown): string => {
+    const messages = (result as { messages?: Array<{ content?: Array<{ text?: string }> }> }).messages ?? []
+    return String(messages.at(-1)?.content?.[0]?.text ?? '')
+  }
+
+  await harness.memory().write({
+    kind: 'semantic',
+    text: '构建流程用 pnpm build 跑，构建产物输出到 dist 目录。',
+    scope: { level: 'workspace', key: scopeKey },
+    importance: 0.9,
+  })
+  await harness.memory().write({
+    kind: 'semantic',
+    text: '发布流程用 pnpm publish 发到 npm，发布产物也在 dist。',
+    scope: { level: 'workspace', key: scopeKey },
+    importance: 0.5,
+  })
+
+  const first = await harness.preStep(at(1), async () => decision(query))
+  assert.match(injected(first), /构建流程用 pnpm build/u, '第一回合应注入分数最高的那条')
+
+  // 冷却期内的下一回合（turn 2：距上次注入仅 1 轮 < 冷却 3 轮）：
+  // 排第一的那条被冷却挡掉，候选池里还必须剩下另一条
+  const second = await harness.preStep(at(2), async () => decision(query))
+  const text = injected(second)
+  assert.match(text, /相关记忆 · 本轮召回/u, '冷却过滤不应把候选池挤空（旧实现这里 0 命中）')
+  assert.doesNotMatch(text, /构建流程用 pnpm build/u, '被冷却的条目本轮不得重复注入')
+  assert.match(text, /发布流程用 pnpm publish/u, '应改用候选池里的下一条')
 })

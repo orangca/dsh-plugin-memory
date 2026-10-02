@@ -1216,18 +1216,22 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           .map((line) => line.replace(/^[-*\s]+/u, '').replace(/^\([a-z]+\)\s*/u, '').trim()))
         const cooldownTurns = cfg.recallCooldownTurns ?? 3
 
+        // 候选池要**大于** topK：过滤发生在取前 K 条之前，否则刚注入过的条目
+        // （markUsed 给了 recency 加成，分数最高）会霸占前 K 个名额、随即被冷却过滤掉，
+        // 把它们后面的相关条目全挤走 —— 表现就是后续回合「0 命中」。
+        const topK = cfg.recallTopK ?? 8
         const hits = recallRecords(state.records.values(), {
           query,
           mode: 'memory',
           minHits: cfg.recallMinHits ?? 2,
           minMatch: cfg.recallMinMatch ?? 0.4,
-          limit: cfg.recallTopK ?? 8,
+          limit: Math.max(topK, Math.min(50, topK * 4)),
         })
           .filter((hit) => hit.record.kind !== 'agent_self')
           .filter((hit) => hit.record.scope.level !== 'workspace' || hit.record.scope.key === workspaceKey)
           .filter((hit) => !residentLines.has(hit.record.text.trim()))
           .filter((hit) => turn - (state.recallTurnById.get(hit.record.id) ?? -999) >= cooldownTurns)
-          .slice(0, cfg.recallTopK ?? 8)
+          .slice(0, topK)
 
         state.recall.turns += 1
         // 超时保护（设计稿 §6.3：召回耗时上限 10ms，超时跳过本轮）
