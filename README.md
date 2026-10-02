@@ -341,6 +341,7 @@ Layout:
 | `lib/` | Build output — **committed on purpose** (see below), shipped in the package (`files`) |
 | `tools/build-client.ts` | Wraps the compiled client into `window.__ModuleLoader__.load({ id, factory })` |
 | `tools/deploy-dev.ts` | Copies `lib/` into a fresh dev revision and rewrites the profile patch |
+| `tools/session-log.ts` | Shared reader for session logs: DSH appends **one zstd frame per JSONL line**, so decoding must walk the zstd magic — a single-frame decode returns only the header |
 
 Why the build output is committed: `dsh plugin add github:<owner>/<repo>` fetches **source, not artifacts** and
 runs no build script. If `lib/` were gitignored, a GitHub install would end up with a `main` pointing at a file that

@@ -14,11 +14,9 @@
 //
 // 用法：node tools/eval-recall.ts [--domain dsh_memory] [--limit 400] [--minHits 2] [--minMatch 0.4]
 
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import type { Dirent } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { zstdDecompressSync } from 'node:zlib'
 
 import {
   DEFAULTS,
@@ -30,6 +28,8 @@ import {
   workspaceKeyOf,
 } from '../lib/lib.js'
 import type { MemoryConfig, MemoryRecord } from '../lib/lib.js'
+// 会话日志的读取统一走共享模块：多帧 zstd 的逐帧解压与路径发现都在那里（见其文件头注释）
+import { decompressAllFrames, listSessionLogs } from './session-log.ts'
 
 /** 会话日志里的一行（只声明本工具读到的字段）。 */
 interface SessionLogEvent {
@@ -108,30 +108,6 @@ const minHits = Number(argOf('minHits', String(DEFAULTS.recallMinHits)))
 const minMatch = Number(argOf('minMatch', String(DEFAULTS.recallMinMatch)))
 const cfg: MemoryConfig = { ...DEFAULTS, reportPath: null }
 
-const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
-
-/** 逐帧解压（DSH 的会话日志是多个 zstd 帧顺序追加的，zstdDecompressSync 只解第一帧）。 */
-function decompressAllFrames(buffer: Buffer): string {
-  const offsets: number[] = []
-  let cursor = 0
-  while (cursor >= 0) {
-    const found = buffer.indexOf(ZSTD_MAGIC, cursor)
-    if (found < 0) break
-    offsets.push(found)
-    cursor = found + 4
-  }
-  if (offsets.length === 0) {
-    try { return zstdDecompressSync(buffer).toString('utf8') } catch { return '' }
-  }
-  let text = ''
-  for (let index = 0; index < offsets.length; index += 1) {
-    const start = offsets[index]
-    const end = index + 1 < offsets.length ? offsets[index + 1] : buffer.length
-    try { text += zstdDecompressSync(buffer.subarray(start, end)).toString('utf8') } catch { /* 单帧失败跳过 */ }
-  }
-  return text
-}
-
 /** 读一个会话日志：返回该会话的 cwd 与真实用户消息（按会话分桶，绝不跨会话混合）。 */
 function readSession(file: string): SessionSample | null {
   let text: string
@@ -162,20 +138,11 @@ function readSession(file: string): SessionSample | null {
 
 function loadSessions(root: string): SessionSample[] {
   const sessions: SessionSample[] = []
-  const walk = (dir: string, depth: number): void => {
-    if (depth > 3) return
-    let entries: Dirent[] = []
-    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
-    for (const entry of entries) {
-      const full = join(dir, entry.name)
-      if (entry.isDirectory()) { walk(full, depth + 1); continue }
-      if (!entry.name.startsWith('session.') || !entry.name.endsWith('.zstd')) continue
-      try { if (statSync(full).size < 500) continue } catch { continue }
-      const session = readSession(full)
-      if (session) sessions.push(session)
-    }
+  // 路径发现也走共享模块：minBytes 过滤掉只有会话头的空日志
+  for (const log of listSessionLogs(root, { minBytes: 500 })) {
+    const session = readSession(log.file)
+    if (session) sessions.push(session)
   }
-  walk(root, 0)
   return sessions
 }
 

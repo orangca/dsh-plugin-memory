@@ -101,6 +101,12 @@ Slot semantics that matter:
 - Full-text session search ships disabled (`openAt: 'never'`), so `searchSessions`/`searchEvents` can be
   unavailable; exact session reads still work.
 - Compaction is a deployment choice: without a mounted compaction plugin there is no `compaction/summary` event.
+- **Session logs are streams of independent zstd frames, one JSONL line each.** `zstdDecompressSync(buffer)`
+  — and Node's streaming decompressor — stop after the **first** frame, so a naive read of an 8 MB log yields
+  213 characters (just the `session` header). Read them through the host service
+  `ctx.get('sessionQuery')` (`readSession(id)` returns the complete event log); offline tools should use
+  `tools/session-log.ts`, which walks the zstd magic and decodes every frame. Measured on a real log:
+  1 line naive vs **9008 events** frame-aware.
 
 ## 7. Reading DSH's own browser code
 

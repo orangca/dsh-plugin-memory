@@ -3,6 +3,30 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.8 — 2026-10-02
+
+Found while building `/sleep`: DSH session logs are streams of **independent zstd frames**, one JSONL line each,
+and Node's decompressor (sync or streaming) stops after the first one.
+
+### Fixed
+
+- `tools/read-session-log.ts` had always used a single-frame decode, so it printed "共 1 行" (just the `session`
+  header) for logs holding thousands of events — measured on a real 8 MB log: **1 line before, 9008 events after**.
+  It now decodes every frame, accepts a sessions *directory* as well as a file, and prints the session id and cwd.
+
+### Changed
+
+- Session-log reading is now one shared module, `tools/session-log.ts` (`decompressAllFrames`, `readSessionEvents`,
+  `listSessionLogs`, `sessionHeaderOf`, `isRealUserMessage`, `textOfMessageContent`) instead of three near-copies
+  that had already drifted. `inspect-session-header.ts`, `inspect-message-shape.ts` and `eval-recall.ts` all use it;
+  `listSessionLogs` sorts newest-first with a deterministic path tiebreak.
+- `docs/dsh-mechanisms.md` documents the frame format; both READMEs list `tools/session-log.ts`.
+
+### Added
+
+- `tests/tools.test.ts` (4 cases): a synthetic multi-frame log proves every frame is decoded, contrasts it with the
+  single-frame hazard that caused the bug, and covers filtering, ordering and malformed lines.
+
 ## 0.5.7 — 2026-10-02
 
 **Idle review: `/sleep` re-reads the recent sessions and re-sorts the store.** A new independent command (not a

@@ -315,6 +315,7 @@ node tools/scan-asar.ts settingsNumberField       # 定位某个符号在 app.as
 | `lib/` | 构建产物：**刻意提交进仓库**（见下），并通过 `files` 进发布包 |
 | `tools/build-client.ts` | 把编译后的客户端包成 `window.__ModuleLoader__.load({ id, factory })` |
 | `tools/deploy-dev.ts` | 把 `lib/` 复制成一个新的开发修订版并改写 profile patch |
+| `tools/session-log.ts` | 会话日志的共享读取模块：DSH 是**一行 JSONL 一个 zstd 帧**，必须按魔数逐帧解 —— 单帧解压只拿得到会话头 |
 
 为什么把构建产物也提交：`dsh plugin add github:<owner>/<repo>` 拉的是**源码而不是产物**，也**不会**跑构建脚本。
 如果 `lib/` 被 git 忽略，GitHub 安装下来的包 `main` 会指向不存在的文件。提交它可以让安装保持「零构建步骤」——

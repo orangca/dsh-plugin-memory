@@ -1,18 +1,10 @@
 // 从会话日志里取最近一条 runtime-context 的 user/message，打印其完整形状。
 // 用途：确认 pre-step 注入的 user 消息对象应该长什么样（本地无法读 llm 源码时的取证手段）。
-import { readdirSync, readFileSync, statSync } from 'node:fs'
-import type { Dirent } from 'node:fs'
-import { join } from 'node:path'
-import { zstdDecompressSync } from 'node:zlib'
+import { isRealUserMessage, listSessionLogs, readSessionEvents, sessionsRoot } from './session-log.ts'
+import type { SessionLogEvent } from './session-log.ts'
 
-/** 会话日志里的一行（只声明本工具读到的字段）。 */
-interface SessionLogEvent {
-  type?: string
-  data?: {
-    source?: { kind?: string } | null
-    content?: unknown
-  } | null
-}
+const root = process.argv[2] ?? sessionsRoot()
+const wanted = process.argv[3] ?? 'runtime-context'
 
 /** 命中的一条消息及其所在文件。 */
 interface MessageSample {
@@ -20,56 +12,29 @@ interface MessageSample {
   event: SessionLogEvent
 }
 
-const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+let found: MessageSample | null = null
+let userSample: MessageSample | null = null
+let scanned = 0
 
-function decompressAllFrames(buffer: Buffer): string {
-  const offsets: number[] = []
-  let cursor = 0
-  while (cursor >= 0) {
-    const found = buffer.indexOf(ZSTD_MAGIC, cursor)
-    if (found < 0) break
-    offsets.push(found)
-    cursor = found + 4
+// 从新到旧扫描；只看体积像样的日志（会话头那种空日志没有消息）
+for (const log of listSessionLogs(root, { minBytes: 500 })) {
+  if (found && userSample) break
+  scanned += 1
+  let events: SessionLogEvent[]
+  try {
+    events = readSessionEvents(log.file)
+  } catch {
+    continue
   }
-  let text = ''
-  for (let index = 0; index < offsets.length; index += 1) {
-    const start = offsets[index]
-    const end = index + 1 < offsets.length ? offsets[index + 1] : buffer.length
-    try { text += zstdDecompressSync(buffer.subarray(start, end)).toString('utf8') } catch { /* skip */ }
-  }
-  return text
-}
-
-const root = process.argv[2]
-const wanted = process.argv[3] ?? 'runtime-context'
-// 显式断言初始值类型：两者由下面的 walk 闭包赋值，TS 的控制流分析看不到这一点
-let found: MessageSample | null = null as MessageSample | null
-let userSample: MessageSample | null = null as MessageSample | null
-
-const walk = (dir: string, depth: number): void => {
-  if (depth > 3 || found) return
-  let entries: Dirent[] = []
-  try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
-  for (const entry of entries) {
-    if (found && userSample) return
-    const full = join(dir, entry.name)
-    if (entry.isDirectory()) { walk(full, depth + 1); continue }
-    if (!entry.name.startsWith('session.') || !entry.name.endsWith('.zstd')) continue
-    if (statSync(full).size < 500) continue
-    const text = decompressAllFrames(readFileSync(full))
-    for (const line of text.split('\n')) {
-      if (!line.startsWith('{')) continue
-      let event: SessionLogEvent
-      try { event = JSON.parse(line) as SessionLogEvent } catch { continue }
-      if (event?.type !== 'user/message') continue
-      const kind = event.data?.source?.kind
-      if (kind === wanted && !found) found = { file: full, event }
-      if (kind === 'user' && !userSample) userSample = { file: full, event }
-    }
+  for (const event of events) {
+    if (event.type !== 'user/message') continue
+    const kind = event.data?.source?.kind
+    if (kind === wanted && !found) found = { file: log.file, event }
+    if (isRealUserMessage(event) && !userSample) userSample = { file: log.file, event }
   }
 }
 
-walk(root, 0)
+console.log(`（扫描 ${scanned} 个日志，根目录 ${root}）`)
 if (found) {
   console.log('=== runtime-context 消息（持久化形状）===')
   console.log(JSON.stringify(found.event, null, 2).slice(0, 2500))
