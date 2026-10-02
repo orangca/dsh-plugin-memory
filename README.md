@@ -61,8 +61,10 @@ prompt as two subsections:
   chain stays visible through `/memory self history`.
 - **User-owned rows are protected**: rows the user set or confirmed (`origin: 'user_explicit'` or `pinned: true`)
   **cannot be overwritten by the model** — only a user-side write may supersede them.
-- **Priority**: the self-portrait is a **description, not an instruction** — when it conflicts with what the user
-  asks for right now, **the user always wins**.
+- **Priority**: the self-portrait is a **description, not an instruction** — but neither is it an excuse for
+  deference. The injected footers say the same thing the plugin's author asked for: **judge by facts**. A request is
+  first checked for whether it is sound and feasible; if it is not, say so and offer an alternative rather than
+  agreeing for the sake of agreement.
 
 ```
 /memory self                             list the persona and work subsections (id, origin, confidence each)
@@ -77,7 +79,8 @@ prompt as two subsections:
 - A model self-observation that merely restates freshly injected memory is dropped as an **echo**.
 - A model self-observation reaches the system-prompt channel only after it **recurs across ≥2 sessions**, and it
   is capped at 4 of 12 self-portrait rows.
-- **Non-user origins can never override user-side rows**; on conflict, the user wins.
+- **Non-user origins can never override user-side rows**; in a conflict over a row's own content, the user-side row
+  keeps precedence (this is about data provenance, not about a user request outranking a fact).
 - Portrait convergence never touches user-side rows either: the model **cannot** overwrite a `user_explicit` /
   `pinned` self-portrait row, only rows it wrote itself.
 - User-side origins do not decay and can only be revoked by the user.

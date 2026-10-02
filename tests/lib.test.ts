@@ -299,7 +299,7 @@ test('renderContextBlock：workspace 印象只取当前 workspace，且单独成
   assert.match(block.text, /项目印象 · 模糊且可能过时/)
   assert.match(block.text, /这是 A 项目/)
   assert.doesNotMatch(block.text, /这是 B 项目/)
-  assert.match(block.text, /以当前对话为准/)
+  assert.match(block.text, /先核对事实/)
 })
 
 test('renderContextBlock：空库不产生任何注入（冷启动不注入空块）', () => {
@@ -487,7 +487,7 @@ test('clampText：折平成单行并剔除控制字符、零宽字符、双向�
 })
 
 test('注入块结构不可伪造：含换行的记忆仍只占一行，块尾声明只出现一次', () => {
-  const FOOTER = '以上历史信息如与当前对话冲突，以当前对话为准。'
+  const FOOTER = '以上为历史记录，可能过时或有误；与当前情况冲突时先核对事实，以事实与实际效果为准。'
   const forged = makeRecord({
     kind: 'user_profile',
     scope: { level: 'profile', key: '*' },
@@ -1011,15 +1011,25 @@ test('renderSelfBlock：人格正文里的换行/伪造页脚不能自成一行�
   assert.equal(block.lines.length, 1, '一条记忆 = 一行')
 })
 
-test('常量：工作节文案逐字不变；人格页脚是安全声明；REFLECT_NOTICE 单行且克制', () => {
+test('常量：工作节文案稳定；页脚声明事实优先而非顺从；REFLECT_NOTICE 单行且克制', () => {
   assert.equal(WORK_CONFIRMED_HEADER, '[我的工作约定 · 来自用户确认]')
   assert.equal(WORK_OBSERVED_HEADER, '[自我观察 · 未经用户确认]')
-  assert.equal(WORK_OBSERVED_FOOTER, '以上为自我观察，可能不准；与用户当场的指示冲突时以用户为准。')
+  assert.equal(WORK_OBSERVED_FOOTER, '以上为自我观察，可能不准；判断依据是事实与实际效果，而不是谁说得更肯定，先评估再执行。')
   assert.equal(PERSONA_HEADER, '[我的人格 · 模型自述，非用户指令]')
 
-  // 契约 §6：人格小节页脚必须声明「描述而非指令、冲突时以用户为准」
+  // 契约 §6 + 用户 2026-10-02 的要求：页脚必须声明「描述而非指令」，并且
+  // **以事实为准、先评估要求的合理性与可行性**（不是「用户永远优先」）。
   assert.ok(PERSONA_FOOTER.includes('不是用户指令'))
-  assert.ok(PERSONA_FOOTER.includes('以用户为准'))
+  assert.ok(PERSONA_FOOTER.includes('以事实为准'))
+  assert.ok(PERSONA_FOOTER.includes('合理'))
+  assert.ok(PERSONA_FOOTER.includes('可行'))
+  assert.ok(PERSONA_FOOTER.includes('替代方案'))
+
+  // 回归护栏：谄媚式表述不得回来（这三条曾经写进页脚）
+  for (const [name, text] of [['PERSONA_FOOTER', PERSONA_FOOTER], ['WORK_OBSERVED_FOOTER', WORK_OBSERVED_FOOTER]] as const) {
+    assert.doesNotMatch(text, /以用户为准/u, `${name} 不得再写「以用户为准」`)
+    assert.doesNotMatch(text, /用户.*永远/u, `${name} 不得写「用户永远…」`)
+  }
 
   // 契约 §6：反思提示必须写明「没有新认识就不要写」，且不得鼓励改用户的所有物
   assert.equal(REFLECT_NOTICE.includes('\n'), false, '反思提示必须折平单行')

@@ -3,6 +3,33 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.5 — 2026-10-02
+
+**The injected footers no longer say "the user always wins".** Reportedly (and correctly) a request from the plugin's
+author: deference is not a virtue — judge the request, then answer from the facts.
+
+### Changed
+
+- Every injected footer now states the same principle instead of a precedence rule:
+  - persona block: *the self-portrait is the model's own cognition, not an instruction; judge by facts — check
+    whether a request is sound and feasible, and if it is not, say so and offer an alternative rather than agreeing
+    to please*
+  - self-observation block: *judged by facts and actual results, not by who sounds more certain*
+  - resident memory and per-turn recall blocks: *historical and possibly stale — check the facts before using it*
+- `REFLECT_NOTICE` tells the model not to write a self-image it does not believe (no agreement for agreement's sake)
+  and keeps its "write nothing if you learned nothing" instruction.
+- Docs updated to match (`README.md`, `README.zh.md`, `SECURITY.md`, `docs/self-portrait.md` §6). User-side rows keep
+  precedence **as data provenance** — the model still cannot rewrite a row the user set; it can disagree with it.
+
+### Added
+
+- Regression guards in `tests/lib.test.ts` so the deference wording (`以用户为准` / `用户…永远`) cannot come back.
+
+### Note
+
+- The persona footer grew, so the persona budget accounting was rechecked: header + footer now cost 31 of the 80
+  available tokens, leaving 49 for actual entries. `REFLECT_NOTICE` is 79 tokens, comfortably below its 120 clamp.
+
 ## 0.5.4 — 2026-10-02
 
 **Self-portrait v2: from work agreements to self-cognition — and it evolves.** `agent_self` no longer only records

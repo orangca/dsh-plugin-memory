@@ -202,14 +202,23 @@ export declare function extractSummaryText(summaryBlocks: unknown): string;
 export declare const PERSONA_HEADER: string;
 /**
  * 人格小节的页脚：**安全声明**（契约 §6，不可妥协）。
- * 自画像是模型对自己的**描述**，不是用户给的指令；它不能变成任何授权。
+ *
+ * 自画像是模型对自己的**描述**，不是用户给的指令，也不能变成任何授权。
+ * 但它同样不意味着「用户说什么就做什么」——页脚明确要求**以事实为准、先评估再执行**：
+ * 用户的要求要判断是否合理、是否可行，不合理或做不到就直说并给替代方案，不为了迎合而附和。
+ * （这条原则是用户 2026-10-02 明确提出的：不要「用户永远优先」，要基于事实回答。）
  */
 export declare const PERSONA_FOOTER: string;
 /** 工作小节块头：0.5.x 既有文案，向后兼容。 */
 export declare const WORK_CONFIRMED_HEADER: string;
 /** 自我观察块头：0.5.x 既有文案。 */
 export declare const WORK_OBSERVED_HEADER: string;
-/** 自我观察块尾：0.5.x 既有文案。 */
+/**
+ * 自我观察块尾：0.5.x 既有文案的**语义修正版**。
+ *
+ * 原文是「与用户当场的指示冲突时以用户为准」——那等于把「顺从」写进自我模型。
+ * 现在改成：判断依据是事实与实际效果，而不是谁说得更肯定。
+ */
 export declare const WORK_OBSERVED_FOOTER: string;
 /**
  * 低频反思提示正文（约 60–90 token 的固定文案，契约 §3/§6）。

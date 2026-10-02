@@ -1549,7 +1549,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       // 硬预算（设计稿 §7.2）：块内固定文案先扣掉，再逐条填。不能像早期版本那样直接 map 全部命中，
       // 否则 8 条 × 60 token 会突破 maxInjectedTokens。
       const R2_HEADER = '[相关记忆 · 本轮召回]'
-      const R2_FOOTER = '以上为历史记录，可能与本轮任务相关；与当前对话冲突时以当前对话为准。'
+      // 与 lib 的 FACTS_FOOTER 同一原则：记忆可能过时，判断以事实与实际效果为准，
+      // 而不是「谁说的更新/更肯定」。原文「以当前对话为准」把顺从写进了规则。
+      const R2_FOOTER = '以上为历史记录，可能与本轮任务相关，也可能已过时；先核对事实再采用。'
       const r2Budget = Math.max(0, cfg.maxInjectedTokens - estimateTokens(`${R2_HEADER}\n${R2_FOOTER}`, cfg.charsPerToken))
       const filled = fillWithinBudget(
         hits.map((hit) => hit.record),

@@ -18,7 +18,7 @@ What the implementation guarantees today:
 | Hard secrets | API keys, private keys, passwords, national IDs and bank cards are **rejected at write time**, with no force flag. Detection folds full-width/compatibility forms (NFKC) before matching, so `１２３…` cannot slip past the half-width patterns. |
 | PII | Email addresses and phone numbers are **masked before storage** (`piiPolicy: mask`), or rejected (`reject`). |
 | Injection structure | Every injected line is flattened to a **single line** and stripped of control, zero-width and bidi characters, so stored text cannot forge block headers, footers or extra `[system]` lines. |
-| Rendering | Memory blocks are always emitted with an explicit header and a footer stating that the block is historical data, not instructions, and that the current conversation wins on conflict. |
+| Rendering | Memory blocks are always emitted with an explicit header and a footer stating that the block is historical data and **possibly stale**, that the reader should check the facts before using it, and that soundness and feasibility come before agreement — the injected footers explicitly tell the model not to agree merely to please. |
 | Provenance | Write origin is decided by the plugin from real user messages; the model cannot claim "the user asked for this". Model self-observations need recurrence across ≥2 sessions before they reach the system-prompt channel. |
 | Data location | Everything stays under `$DSH_HOME/storages/<domainName>/`. No network calls, no telemetry, no embedding service. |
 
