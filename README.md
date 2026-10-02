@@ -217,14 +217,6 @@ Three development notes that cost real debugging time and are worth knowing:
 See [`docs/dsh-mechanisms.md`](docs/dsh-mechanisms.md) for the DSH seams, slot semantics and environment facts this
 plugin is built on — written for plugin authors, with no environment-specific details.
 
-### Versioning
-
-Releases bump the **patch digit only**: `0.5.0` → `0.5.1` → `0.5.2`. Do not jump minor or major versions.
-
-```sh
-pnpm version patch --no-git-tag-version   # 0.5.0 -> 0.5.1
-```
-
 ## Known limitations
 
 - **Consolidation of compaction summaries depends on the deployment.** The code path listens to
