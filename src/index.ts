@@ -30,6 +30,7 @@ import type {
   MemoryOrigin,
   MemoryPrecision,
   MemoryRecord,
+  MemoryRef,
   MemoryScope,
   MemorySource,
   RecallOptions,
@@ -54,6 +55,7 @@ import {
   fillWithinBudget,
   findConflicts,
   fnv1a,
+  formatRefs,
   formatSleepPlan,
   isEcho,
   isExcluded,
@@ -72,6 +74,8 @@ import {
   recallRecords,
   recordHash,
   REFLECT_NOTICE,
+  refsOf,
+  refsToString,
   renderContextBlock,
   renderSelfBlock,
   scanSensitive,
@@ -80,7 +84,9 @@ import {
   shouldReflect,
   sleepPlanIsEmpty,
   splitSentences,
+  tokenize,
   transcriptOf,
+  withRef,
   workspaceKeyOf,
 } from './lib.js'
 // 自画像 v2（M6-A）新增的纯函数与类型：签名冻结在 docs/self-portrait.md 第 3 节。
@@ -341,6 +347,32 @@ interface SleepArgs {
 }
 
 /**
+ * M9（refs）：**零 I/O** 的序号跟踪（契约 docs/refs.md §4.1）。
+ *
+ * 只在既有的 `session/event` 回调里做内存赋值，不新增任何服务调用或写盘 ——
+ * 写路径靠它把「这条记忆出自哪段事件」记下来。
+ */
+interface SeqState {
+  /** 当前会话 id（`_session.id` 变化时同步）。 */
+  sessionId: string
+  /** 最近一条事件的 seq（未知为 null）。 */
+  last: number | null
+  /** 本回合 `turn/start` 的 seq（未知为 null）—— live 捕获的左端点。 */
+  turnStart: number | null
+}
+
+/** M9（refs）的可观测计数（契约 §4.5）。 */
+interface RefsState {
+  /** 写入路径成功附着引用的次数。 */
+  attached: number
+  /** `/memory verify` 判定命中的引用条数。 */
+  verified: number
+  /** `/memory verify` 判定未命中（含会话/事件不存在）的引用条数。 */
+  mismatched: number
+  lastError: string | null
+}
+
+/**
  * 领域 global 句柄：types.ts 只声明了 `get()` / `put()`，而运行版（以及原实现）的写入口叫 `set()`。
  * 保留原调用名，这里按实测契约补上（见交付报告）。
  */
@@ -467,6 +499,10 @@ interface PluginState {
   recallTurnById: Map<string, number>
   /** M8：`/sleep` 的执行计数与最近一次扫描规模。 */
   sleep: SleepState
+  /** M9：事件序号跟踪（写路径附引用用；零 I/O）。 */
+  seq: SeqState
+  /** M9：引用附着/核对的可观测计数。 */
+  refs: RefsState
   /** M6：自画像 v2 的运行时状态（写入收敛计数 + 反思提示的会话闸门状态）。 */
   self: SelfState
   // 用量：注入/召回只在内存累加（每次写盘会产生大量 IO），由整合或卸载时统一落盘。
@@ -514,6 +550,18 @@ interface WriteMemoryInput {
    * 捕获/导入/整合路径不带它，行为与 0.5.x 完全一致。
    */
   facet?: SelfFacet
+  /**
+   * M9：这次写入的**引用来源**（契约 docs/refs.md §4.2）——宿主按 `state.seq` 自动推导
+   * 会话与序号，调用方只声明走哪条路径：
+   *   · `'live'`    回合收尾规则捕获 → `from = turnStart, to = last`；
+   *   · `'tool'`    `memory_write`   → 单点 `from = last`；
+   *   · `'command'` 用户命令         → 单点；
+   *   · `'solidify'`压缩摘要固化     → 单点。
+   * `refsEnabled === false` 或不满足条件时不附着（`withRef` 会原样返回）。
+   */
+  refVia?: MemoryRef['via']
+  /** M9：调用方**直接给出**的引用（`/sleep` 补录透传候选自带 refs）：优先于 `refVia` 推导。 */
+  refs?: MemoryRef[]
 }
 
 /** `writeMemory` 的返回：工具与命令共用（成功带 status，失败带 error）。 */
@@ -534,6 +582,8 @@ type CommandHandler = (args: string[]) => DshCommandResult | Promise<DshCommandR
 interface MemoryCommandHandlers extends Record<string, CommandHandler> {
   list(args: string[]): DshCommandResult
   show(args: string[]): DshCommandResult
+  /** M9：核对引用的只读命令（`/memory verify <id>`）。 */
+  verify(args: string[]): Promise<DshCommandResult>
   forget(args: string[]): Promise<DshCommandResult>
   restore(args: string[]): Promise<DshCommandResult>
   pin(args: string[]): Promise<DshCommandResult>
@@ -623,6 +673,10 @@ function buildConfig(useVolatile: boolean): ReturnType<SchemaFactory['object']> 
     sleepMaxCharsTotal: Schema!.number().default(300000),
     sleepAssistantContext: Schema!.number().default(3),
     sleepMaxGists: Schema!.number().default(8),
+    // M9：可核验引用（契约 docs/refs.md §2.1）——类型与默认值必须与 lib.ts 的 DEFAULTS 逐字一致。
+    // 两个键都进设置页表单（与 src/client.ts 的字段一一对应：volatile 集合 +2）。
+    refsEnabled: field(Schema!.boolean().default(true)),
+    refsMax: field(Schema!.number().default(5)),
     recallMode: field(Schema!.union(['off', 'dry', 'inject']).default('inject')),
     recallTopK: field(Schema!.number().default(8)),
     captureMode: field(Schema!.union(['off', 'rule']).default('rule')),
@@ -733,6 +787,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     recallTurnById: new Map(),
     // M8：/sleep（预览不计数，只有 --apply 累加）
     sleep: { runs: 0, added: 0, merged: 0, invalidated: 0, archived: 0, gists: 0, skipped: 0, last: null },
+    // M9：refs（序号跟踪 + 附着/核对计数）
+    seq: { sessionId: '', last: null, turnStart: null },
+    refs: { attached: 0, verified: 0, mismatched: 0, lastError: null },
     // M6：自画像 v2（写入收敛计数 + 反思提示的会话状态）
     self: {
       added: 0,
@@ -875,6 +932,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         consolidate: state.consolidate,
         recall: state.recall,
         sleep: state.sleep,
+        // M9：refs（序号跟踪 + 附着/核对计数）
+        seq: { ...state.seq },
+        refs: refsSummary(),
         self: {
           added: state.self.added,
           refined: state.self.refined,
@@ -975,6 +1035,166 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     return flushed
   }
 
+  // ---------------- M9：可核验引用（refs，契约 docs/refs.md §4） ----------------
+  //
+  // 目标：每条记忆都能回答「你凭什么这么说」——指向来源会话与事件序号区间。
+  // 三条硬约束（§5）：引用**不参与指纹**（否则同一条记忆会因来源不同被判成两条）；
+  // 写路径**绝不因此变慢**（序号只在既有的 session/event 回调里做内存赋值，零 I/O）；
+  // 老记录没有 refs 时所有读取路径都必须容错（`refsOf` 返回空数组）。
+
+  /**
+   * 本次写入该附着哪些引用。
+   *
+   * 显式 `input.refs`（`/sleep` 补录透传候选自带）优先；否则按 `input.refVia` 从
+   * `state.seq` 推导。**没见过带 seq 的事件时不编造区间**（宁可没有引用，也不要假引用）。
+   */
+  const pendingRefs = (input: WriteMemoryInput): MemoryRef[] => {
+    if (cfg.refsEnabled === false) return []
+    if (Array.isArray(input.refs) && input.refs.length > 0) return input.refs
+    const via = input.refVia
+    const sessionId = state.seq.sessionId
+    const last = state.seq.last
+    if (!via || sessionId === '' || last === null) return []
+    if (via === 'live') {
+      // 回合收尾捕获：整个回合 [turn/start, 最后一条事件] —— 用户原话就在这段里。
+      const from = state.seq.turnStart ?? last
+      return [{ sessionId, from, to: last, via: 'live' }]
+    }
+    // 工具/命令/固化：单点引用（省略 to）。
+    return [{ sessionId, from: last, via }]
+  }
+
+  /**
+   * 把引用附着到一条记录上（新在前、去重、按 `cfg.refsMax` 裁剪由 `withRef` 负责）。
+   *
+   * `state.refs.attached` 记的是「带引用落盘的写入次数」，不是「新增了几条不同引用」——
+   * 同一回合里重复提及会在同一区间上再记一次，那正是我们想看到的（这条记忆又被说过一次）。
+   * 注意 `makeRecord` 也会拷贝 `input.refs`（`/sleep` 补录走的就是这条路），
+   * 所以这里不能拿「集合有没有变化」当计数条件。
+   */
+  const attachRefs = (record: MemoryRecord, incoming: readonly MemoryRef[]): MemoryRecord => {
+    if (incoming.length === 0 || cfg.refsEnabled === false) return record
+    let next: MemoryRef[] = refsOf(record)
+    for (const ref of incoming) next = withRef(next, ref, cfg)
+    if (next.length === 0) return record
+    record.refs = next
+    state.refs.attached += 1
+    return record
+  }
+
+  /** 用户命令路径的单点引用（`/memory pin|archive|restore|refresh|confirm|reject` 走这里）。 */
+  const commandRefs = (): MemoryRef[] => pendingRefs({ refVia: 'command' })
+
+  /**
+   * `makeRecord` 会拷贝 `input.refs`，所以「完全跳过」必须在这里也关掉一道：
+   * `refsEnabled === false` 时连**显式传入**的引用（`/sleep` 补录透传）也不落库（§5）。
+   */
+  const refsForRecord = (input: WriteMemoryInput): MemoryRef[] | undefined =>
+    cfg.refsEnabled === false ? undefined : input.refs
+
+  /** refs 的汇总视图（`/memory stats` 与 `memory_stats` 共用，含「无引用记录」条数）。 */
+  const refsSummary = (): RefsState & { withoutRefs: number } => ({
+    attached: state.refs.attached,
+    verified: state.refs.verified,
+    mismatched: state.refs.mismatched,
+    lastError: state.refs.lastError,
+    withoutRefs: [...state.records.values()].filter((record) => refsOf(record).length === 0).length,
+  })
+
+  /** 信息量 token：与捕获侧派生 subject 同一口径（长度 ≥ 2 且非纯数字）。 */
+  const informativeTokens = (text: unknown): string[] =>
+    [...new Set(tokenize(text))].filter((token) => token.length >= 2 && !/^\d+$/u.test(token))
+
+  /** 一条事件里可核对的文本：用户/助手消息正文 + 工具调用参数。 */
+  const refEventText = (event: DshSessionEvent): string => {
+    if (event.type === 'user/message') return textOfContent(event.data?.content)
+    if (event.type === 'assistant/message') return textOfContent(event.data?.message?.content)
+    if (event.type === 'tool/call') return `${String(event.data?.name ?? '')} ${String(event.data?.arguments ?? '')}`
+    return ''
+  }
+
+  /**
+   * `/memory verify <id>`：回到引用指向的事件，核对「记录正文在不在那里」。**只读**。
+   *
+   * 比对用信息量 token 覆盖率（阈值 `cfg.recallMinMatch`）而不是逐字相等：
+   * PII 脱敏、用户改口、日志重排都会让逐字判定误报。覆盖率 = 记录正文的信息量 token
+   * 中有多少能在引用区间的事件文本里找到。
+   */
+  const verifyRecord = async (idPrefix: string): Promise<DshCommandResult> => {
+    if (!idPrefix) return { kind: 'error', text: '用法：/memory verify <id 前缀>' }
+    const record = [...state.records.values()].find((candidate) => candidate.id.startsWith(idPrefix))
+    if (!record) return { kind: 'error', text: `未找到匹配 "${idPrefix}" 的记忆。` }
+    const refs = refsOf(record)
+    if (refs.length === 0) {
+      return {
+        kind: 'success',
+        text: `这条没有引用（可能是 0.5.9 之前写入的，或写入时 refsEnabled=false）。\n${record.text}`,
+      }
+    }
+    const sq = ctx.get<DshSessionQuery>('sessionQuery')
+    if (!sq || typeof sq.readSession !== 'function') {
+      return {
+        kind: 'error',
+        text: '当前宿主没有 sessionQuery 服务，`/memory verify` 需要它按引用回到会话日志核对；'
+          + '这条命令只读，记忆本身不受影响。',
+      }
+    }
+    const threshold = typeof cfg.recallMinMatch === 'number' && Number.isFinite(cfg.recallMinMatch)
+      ? cfg.recallMinMatch
+      : DEFAULTS.recallMinMatch
+    const recordTokens = informativeTokens(record.text)
+    const lines: string[] = []
+    let verified = 0
+    let mismatched = 0
+    for (const ref of refs) {
+      const label = formatRefs([ref], { short: true }) || String(ref.sessionId)
+      try {
+        const snapshot = await sq.readSession(ref.sessionId)
+        const events = Array.isArray(snapshot?.events) ? snapshot.events : []
+        const from = typeof ref.from === 'number' && Number.isFinite(ref.from) ? ref.from : null
+        const to = typeof ref.to === 'number' && Number.isFinite(ref.to) ? ref.to : null
+        const inRange = events.filter((event) => {
+          const seq = Number(event?.seq)
+          if (!Number.isFinite(seq)) return false
+          if (from !== null && to !== null) return seq >= from && seq <= to
+          if (from !== null) return seq === from
+          if (to !== null) return seq <= to
+          return true // 没有区间信息 = 会话级引用：核对整个会话
+        })
+        if (inRange.length === 0) {
+          mismatched += 1
+          lines.push(`${label} ⚠️ 会话或事件不存在（区间内没有事件）`)
+          continue
+        }
+        const eventTokens = new Set(informativeTokens(inRange.map(refEventText).filter(Boolean).join('\n')))
+        const hit = recordTokens.filter((token) => eventTokens.has(token)).length
+        const coverage = recordTokens.length === 0 ? 0 : hit / recordTokens.length
+        if (coverage >= threshold) {
+          verified += 1
+          lines.push(`${label} ✅ 命中（覆盖率 ${coverage.toFixed(2)}）`)
+        } else {
+          mismatched += 1
+          lines.push(`${label} ⚠️ 未命中（覆盖率 ${coverage.toFixed(2)}，阈值 ${threshold}）`)
+        }
+      } catch (error) {
+        mismatched += 1
+        state.refs.lastError = errorText(error)
+        lines.push(`${label} ⚠️ 会话或事件不存在（读取失败：${errorText(error)}）`)
+      }
+    }
+    state.refs.verified += verified
+    state.refs.mismatched += mismatched
+    return {
+      kind: 'success',
+      text: [
+        `核对 ${record.id.slice(0, 8)}：${refs.length} 条引用（命中 ${verified} / 未命中 ${mismatched}，覆盖率阈值 ${threshold}）`,
+        record.text,
+        ...lines,
+        '（只读核对：不修改任何记录。命中 = 记录正文的信息量 token 大部分能在引用区间的事件里找到。）',
+      ].join('\n'),
+    }
+  }
+
   // ---------------- M6：自画像写入收敛（契约 §4.1） ----------------
   //
   // 收敛只发生在**显式带 facet 的 `agent_self` 写入**上：`memory_write` 工具与 `/memory self set`
@@ -1049,6 +1269,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     plan: PortraitPlan,
     input: WriteMemoryInput,
     origin: MemoryOrigin,
+    incomingRefs: readonly MemoryRef[],
   ): Promise<WriteMemoryResult | null> => {
     const targetId = plan.decision.targetId
     const target = targetId ? state.records.get(targetId) : undefined
@@ -1067,7 +1288,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     const sessionId = input.sessionId ? String(input.sessionId) : ''
     const sessions = new Set([...(target.reinforcement?.sessions ?? []), ...(sessionId ? [sessionId] : [])])
     target.reinforcement = { sessions: [...sessions], count: (target.reinforcement?.count ?? 0) + 1 }
-    // 指纹必须重算：recordHash 覆盖 subject 与正文
+    // M9：reinforce / refine 是「同一件事又被说了一次」——新引用并入既有条目，旧引用保留（§4.2）。
+    attachRefs(target, incomingRefs)
+    // 指纹必须重算：recordHash 覆盖 subject 与正文（**不含 refs**，§5）
     target.hash = recordHash(target)
     await persist(target)
     state.writes.merged += 1
@@ -1085,10 +1308,12 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     input: WriteMemoryInput,
     text: string,
     origin: MemoryOrigin,
+    incomingRefs: readonly MemoryRef[],
   ): Promise<WriteMemoryResult> => {
     const target = plan.decision.targetId ? state.records.get(plan.decision.targetId) : undefined
     const record = makeRecord({
       ...input,
+      refs: refsForRecord(input),
       ...portraitRecordFields(plan.outcome.facet),
       kind: 'agent_self',
       text: plan.decision.text || text,
@@ -1098,6 +1323,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       supersedes: target ? [target.id] : [],
     })
     asPortrait(record).facet = plan.outcome.facet
+    // M9：新条目带自己的引用；被归档的旧条目引用不动（§4.2）。
+    attachRefs(record, incomingRefs)
     if (plan.decision.archiveTarget && target) {
       target.status = 'archived'
       asPortrait(target).supersededBy = record.id
@@ -1130,6 +1357,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     }
 
     // ---- 自画像收敛（仅显式 facet 的 agent_self 写入）----
+    // M9：引用只算一次（捕获走 live 区间、工具走单点、/sleep 透传候选自带）。
+    const incomingRefs = pendingRefs(input)
     let portraitPlan: PortraitPlan | null = null
     if (input.kind === 'agent_self' && input.facet !== undefined) {
       const planned = planPortraitWrite(input, text, origin)
@@ -1140,10 +1369,10 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           return { ok: false, error: `portrait_skipped: ${planned.decision.reason}`, portrait: planned.outcome }
         }
         if (planned.decision.action === 'reinforce' || planned.decision.action === 'refine') {
-          const updated = await applyPortraitUpdate(planned, input, origin)
+          const updated = await applyPortraitUpdate(planned, input, origin, incomingRefs)
           if (updated) return updated
         } else if (planned.decision.action === 'supersede') {
-          return await applyPortraitSupersede(planned, input, text, origin)
+          return await applyPortraitSupersede(planned, input, text, origin, incomingRefs)
         }
         portraitPlan = planned
       }
@@ -1151,6 +1380,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
 
     const record = makeRecord({
       ...input,
+      refs: refsForRecord(input),
       ...portraitRecordFields(portraitPlan ? portraitPlan.outcome.facet : input.facet),
       kind: input.kind as MemoryKind,
       text: portraitPlan ? (portraitPlan.decision.text || text) : text,
@@ -1159,6 +1389,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       confidence: portraitPlan ? portraitPlan.decision.confidence : input.confidence,
     })
     if (!record.text) return { ok: false, error: 'rejected_invalid: text 不能为空' }
+    // M9：新建的条目带上本次写入的引用（指纹不受影响，§5）。
+    attachRefs(record, incomingRefs)
     // 用户明确拒绝过的自我观察不再重复产生（/memory reject 会登记指纹）
     if (origin === 'model_proposed' && state.rejectedHashes.has(record.hash)) {
       state.writes.rejected += 1
@@ -1185,6 +1417,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         pinned: existing.pinned || record.pinned,
         reinforcement: { sessions: [...sessions], count: (existing.reinforcement?.count ?? 0) + 1 },
       }
+      // M9：合并（同一件事又被说了一次）时新引用并入既有条目，旧引用保留（§4.2）。
+      attachRefs(merged, incomingRefs)
       await persist(merged)
       state.writes.merged += 1
       flush()
@@ -1375,6 +1609,22 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       try {
         const type = event?.type
         state.lastSession = { id: String(_session?.id ?? ''), cwd: _session?.header?.cwd ?? null }
+        // M9：序号跟踪（零 I/O、纯内存赋值）——写路径靠它把记忆指回来源区间。
+        // 必须放在所有 early return **之前**：compaction/summary 也会提前 return。
+        {
+          const sessionId = String(_session?.id ?? '')
+          if (sessionId !== '' && sessionId !== state.seq.sessionId) {
+            // 换会话：上一会话的 seq 与 turnStart 都不能带过来。
+            state.seq.sessionId = sessionId
+            state.seq.last = null
+            state.seq.turnStart = null
+          }
+          const seq = Number(event?.seq)
+          if (Number.isFinite(seq)) {
+            state.seq.last = seq
+            if (type === 'turn/start') state.seq.turnStart = seq
+          }
+        }
         // 压缩固化：摘要事件只写日志、不进模型上下文，正好当记忆源（设计稿 §5.5）。
         if (type === 'compaction/summary') {
           void solidifyCompaction(event)
@@ -1506,6 +1756,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         sessionId,
         scope: { level, key: level === 'workspace' ? workspaceKey : '*' },
         source: sessionId ? { sessionId, seqStart: Number(agent?.session?.seq ?? 0), seqEnd: Number(agent?.session?.seq ?? 0) } : null,
+        // M9：live 区间 = 本回合 [turn/start, 最后一条事件]
+        refVia: 'live',
       })
       if (result.ok) {
         written += 1
@@ -1530,6 +1782,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         existing.observedAt = now
         existing.hash = recordHash(existing)
         existing.confidence = Math.min(0.6, (existing.confidence ?? 0.5) + 0.05)
+        // M9：刷新既有印象同样是「本回合观察到的」→ 并入 live 区间引用
+        attachRefs(existing, pendingRefs({ refVia: 'live' }))
         await persist(existing)
         state.capture.gistRefreshed += 1
         gist = 'refreshed'
@@ -1547,6 +1801,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           // 设计稿 I3：自动写入的记忆必须带来源，项目印象也不例外
           source: sessionId ? { sessionId, seqStart: Number(agent?.session?.seq ?? 0), seqEnd: Number(agent?.session?.seq ?? 0) } : null,
           scope: { level: 'workspace', key: workspaceKey },
+          refVia: 'live',
         })
         gist = created.ok ? 'created' : 'failed'
       }
@@ -1987,6 +2242,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           tags: ['compaction'],
           scope: { level: 'workspace', key: workspaceKey },
           source: { sessionId, seqStart, seqEnd },
+          // M9：固化是「压缩事件发生时」的一次写入 → 单点引用（from = 最近 seq）
+          refVia: 'solidify',
         })
         if (result.ok) written += 1
       }
@@ -2053,6 +2310,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       confidence: record.confidence,
       observedAt: new Date(record.observedAt).toISOString(),
       text: record.text,
+      // M9：记录视图带机器可读的引用串（`sessionId#from-to`，多条用 `;`）——空串即无引用。
+      refs: refsToString(refsOf(record)),
     }
     // 「若有」：只有被取代过的旧条目才有 supersededBy，只有取代过别人的条目才有 supersedes
     if (fields.supersededBy) view.supersededBy = fields.supersededBy
@@ -2129,6 +2388,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           scope: { level: scopeLevel, key: scopeKey },
           sessionId: exec?.agent?.session ? String(exec.agent.session.id) : undefined,
           source: exec?.agent?.session ? { sessionId: String(exec.agent.session.id), seqStart: Number(exec.agent.session.seq ?? 0), seqEnd: Number(exec.agent.session.seq ?? 0) } : null,
+          // M9：模型工具写入 → 单点引用（from = 最近一条事件的 seq）
+          refVia: 'tool',
         })
         return json(result)
       },
@@ -2236,8 +2497,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       execute: async () => {
         state.toolCalls.memory_stats = (state.toolCalls.memory_stats ?? 0) + 1
-        // 结构化字段与 `/memory stats` 的文本同步（契约 §5.4）：模型不必去解析那行中文。
-        return json({ ...handlers.stats(), sleep: { ...state.sleep } })
+        // 结构化字段与 `/memory stats` 的文本同步（契约 §5.4 / refs §4.5）：模型不必去解析那几行中文。
+        return json({ ...handlers.stats(), sleep: { ...state.sleep }, refs: refsSummary() })
       },
     },
     {
@@ -2352,7 +2613,19 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (!id) return { kind: 'error', text: '用法：/memory show <id 前缀>' }
       const record = [...state.records.values()].find((candidate) => candidate.id.startsWith(id))
       if (!record) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
-      return { kind: 'success', text: JSON.stringify(record, null, 2) }
+      // M9：把「凭什么这么说」摆出来（无引用时明确说明，而不是留一行空白）
+      const refs = refsOf(record)
+      const refLine = refs.length > 0
+        ? `来源：${formatRefs(refs)}`
+        : '来源：（无引用 —— 0.5.9 之前的记录或写入时 refsEnabled=false）'
+      return { kind: 'success', text: `${JSON.stringify(record, null, 2)}\n${refLine}` }
+    },
+    /**
+     * M9：`/memory verify <id>`（只读）——回到引用指向的事件核对正文。
+     * 四种结果：命中 / 未命中 / 无 sessionQuery（error 文案，不抛）/ 无引用。
+     */
+    async verify(args: string[]): Promise<DshCommandResult> {
+      return await verifyRecord(String(args[0] ?? ''))
     },
     async forget(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
@@ -2371,6 +2644,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       target.status = 'active'
       target.invalidAt = null
+      // M9：用户命令也是「出处」——把本次命令附着为单点引用
+      attachRefs(target, commandRefs())
       // 撤销推翻链：把当前正在推翻它的条目标为失效，否则下一次整合会立刻再推翻一次。
       const superseders = [...state.records.values()].filter((record) =>
         record.status === 'active' && record.id !== target.id && (record.supersedes ?? []).includes(target.id))
@@ -2391,6 +2666,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       target.pinned = !target.pinned
+      attachRefs(target, commandRefs())
       await persist(target)
       return { kind: 'success', text: `${target.pinned ? '已固定' : '已取消固定'} ${target.id}` }
     },
@@ -2400,6 +2676,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       target.status = 'archived'
+      attachRefs(target, commandRefs())
       await persist(target)
       return { kind: 'success', text: `已归档 ${target.id}（不再注入，但仍可检索）` }
     },
@@ -2425,6 +2702,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       target.observedAt = Date.now()
       if (target.kind === 'project_gist') target.confidence = Math.min(0.6, (target.confidence ?? 0.5) + 0.05)
+      attachRefs(target, commandRefs())
       await persist(target)
       return { kind: 'success', text: `已刷新 ${target.id}（衰减重新计时）` }
     },
@@ -2435,6 +2713,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       target.origin = 'user_explicit'
       target.confidence = Math.max(0.9, target.confidence ?? 0)
+      attachRefs(target, commandRefs())
       await persist(target)
       return { kind: 'success', text: `已确认 ${target.id}（origin → user_explicit，confidence ≥ 0.9）` }
     },
@@ -2446,6 +2725,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       target.status = 'invalid'
       target.invalidAt = Date.now()
       state.rejectedHashes.add(target.hash)
+      attachRefs(target, commandRefs())
       await persist(target)
       return { kind: 'success', text: `已拒绝 ${target.id}（同类自我观察不会再产生）` }
     },
@@ -2544,6 +2824,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     stats(): DshCommandResult {
       const byKind: Record<string, number> = {}
       for (const record of state.records.values()) byKind[record.kind] = (byKind[record.kind] ?? 0) + 1
+      const refs = refsSummary()
       return {
         kind: 'success',
         text: [
@@ -2562,6 +2843,10 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
             + (state.sleep.last
               ? `；最近 ${state.sleep.last.at}（${state.sleep.last.sessions} 会话 / ${state.sleep.last.messages} 消息 / ${state.sleep.last.chars} 字符）`
               : '；尚未运行'),
+          `引用：已附着 ${refs.attached} 次 / 无引用记录 ${refs.withoutRefs} 条`
+            + `（核对 命中 ${refs.verified} / 未命中 ${refs.mismatched}）`
+            + (cfg.refsEnabled === false ? '；refsEnabled=false（新写入不附着引用）' : '')
+            + (refs.lastError ? `；lastError=${refs.lastError}` : ''),
           `turn-stopping：plain=${state.turnStopping.plain}${state.turnStopping.last ? `，last=${state.turnStopping.last.at}（${state.turnStopping.last.channel}）` : '，last=none'}`,
           `设置页：${settingsLine()}`,
         ].join('\n'),
@@ -2660,6 +2945,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           confidence: 1,
           importance: 0.9,
           tags: ['self-portrait', 'user-set'],
+          // M9：用户命令写入 → 单点引用（from = 最近一条事件的 seq）
+          refVia: 'command',
         })
         if (!result.ok) return { kind: 'error', text: `未写入自画像：${result.error ?? '未知原因'}` }
         const action = result.portrait
@@ -2720,6 +3007,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         for (const record of victims) {
           // 归档而非删除：历史与检索都还在（契约 §4.3）。
           record.status = 'archived'
+          // M9：批量归档同样是用户命令 → 附着 command 引用（与 /memory archive 一致）
+          attachRefs(record, commandRefs())
           await persist(record)
           archived += 1
         }
@@ -2734,7 +3023,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       return { kind: 'error', text: `未知的 self 子命令「${sub}」。${SELF_USAGE}` }
     },
     help(): DshCommandResult {
-      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
+      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | verify <id> | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
     },
   }
 
@@ -2924,6 +3213,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         tags: ['sleep'],
         sessionId: candidate.sessionId,
         source: candidate.sessionId ? { sessionId: candidate.sessionId, seqStart: 0, seqEnd: 0 } : null,
+        // M9：补录的引用由纯函数层算好（用户消息所在的会话 + seq）——原样透传，宿主不自己编。
+        refs: (candidate as SleepCandidate & { refs?: MemoryRef[] }).refs,
+        refVia: 'sleep',
       })
       if (result.ok && result.status === 'created') counts.added += 1
       else if (result.ok) counts.skipped += 1 // 合并进既有条目（指纹命中）：不算新增
@@ -3143,7 +3435,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     ctx.commands.register({
       name: 'memory',
       description: '查看与管理长期记忆',
-      input: { hint: 'list | show <id> | self | forget <id> | export | stats' },
+      input: { hint: 'list | show <id> | verify <id> | self | forget <id> | export | stats' },
       handler: async (invocation) => {
         const parts = String(invocation?.rawInput ?? '').trim().split(/\s+/u).filter(Boolean)
         const sub = parts.shift() ?? 'list'

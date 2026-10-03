@@ -25,6 +25,16 @@ export interface MemoryReinforcement {
     sessions: string[];
     count: number;
 }
+/** M9：一条记忆的来源引用（会话 + 事件序号闭区间）。 */
+export interface MemoryRef {
+    sessionId: string;
+    /** 起始事件序号（含）。 */
+    from?: number;
+    /** 结束事件序号（含）；单点引用时省略。 */
+    to?: number;
+    /** 写入路径，便于区分来源与自查。 */
+    via?: 'live' | 'sleep' | 'tool' | 'command' | 'solidify' | 'import';
+}
 export interface MemoryRecord {
     id: string;
     kind: MemoryKind;
@@ -47,6 +57,11 @@ export interface MemoryRecord {
     facet?: SelfFacet;
     /** 本条被谁取代（归档时写入；与 `supersedes` 互为反向指针）。 */
     supersededBy?: string;
+    /**
+     * M9：来源引用（可核验：会话 + 事件序号区间）。
+     * **必须不参与 `recordHash`** —— 否则同一条记忆会因为来源不同被判成两条，破坏去重与幂等。
+     */
+    refs?: MemoryRef[];
     observedAt: number;
     eventTime: number | null;
     lastUsedAt: number | null;
@@ -156,6 +171,10 @@ export interface MemoryConfig {
     sleepAssistantContext: number;
     /** M8：最多重算几条项目印象。 */
     sleepMaxGists: number;
+    /** M9：是否为写入附着来源引用。 */
+    refsEnabled: boolean;
+    /** M9：每条记录最多保留几个引用。 */
+    refsMax: number;
     gistBudgetRatio: number;
     charsPerToken: number;
     sectionOrder: number;

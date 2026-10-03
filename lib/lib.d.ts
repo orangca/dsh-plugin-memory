@@ -1,8 +1,10 @@
-import type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet } from './types.js';
-export type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet, } from './types.js';
+import type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryRef, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet } from './types.js';
+export type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryRef, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet, } from './types.js';
 /** `makeRecord` 的入参：`MakeRecordInput` 再加 `sessionId`（types.ts 目前缺这个字段）。 */
 export interface MakeRecordInputWithSession extends MakeRecordInput {
     sessionId?: string;
+    /** M9：来源引用（契约 docs/refs.md §2）。**缺失时不写键**，保持存量记录形状。 */
+    refs?: MemoryRef[];
 }
 /** 指纹入参：只需要指纹相关字段，因此「尚未补上 hash 的记录」也能直接求指纹。 */
 export interface RecordHashInput {
@@ -367,6 +369,8 @@ export interface TranscriptMessage {
     role: 'user' | 'assistant';
     text: string;
     at: number | null;
+    /** M9：事件序号（来自会话日志）；缺失为 null。用于给补录候选填来源引用。 */
+    seq: number | null;
 }
 /** 一个会话的抽取结果。 */
 export interface SleepSource {
@@ -433,6 +437,11 @@ export interface SleepCandidate {
      */
     kind?: MemoryKind;
     subject?: string | null;
+    /**
+     * M9：来源引用（该用户消息所在的会话与事件序号，契约 §3）。
+     * 由 `buildSleepPlan` 填 `[{ sessionId, from: seq, via: 'sleep' }]`；`seq` 缺失时不给该键。
+     */
+    refs?: MemoryRef[];
 }
 /** 梳理计划：**只描述要做什么，不做任何写入**。 */
 export interface SleepPlan {
@@ -517,4 +526,19 @@ export declare function buildSleepPlan(input: SleepPlanInput): SleepPlan;
 export declare function formatSleepPlan(plan: SleepPlan, cfg: MemoryConfig): string;
 /** 计划是否无事可做（backfill/merges/conflicts/archive/gists 全空）。 */
 export declare function sleepPlanIsEmpty(plan: SleepPlan): boolean;
+/** 容错读取：非法/缺失一律返回空数组（0.5.8 及更早的记录没有 `refs` 字段）。 */
+export declare function refsOf(record: MemoryRecord | null | undefined): MemoryRef[];
+/**
+ * 规范化（去重 + 裁剪 + 字段校验）：非法项丢弃，结果**保持入参顺序**（约定「新引用在前」），
+ * 最多 `cfg.refsMax` 条。不去排序 —— 谁更新只有写入路径知道，纯函数不猜。
+ */
+export declare function normalizeRefs(value: unknown, cfg: MemoryConfig): MemoryRef[];
+/** 合并一个新引用（新在前）；`cfg.refsEnabled === false` 时**原样返回**（写入路径完全跳过）。 */
+export declare function withRef(refs: unknown, ref: MemoryRef, cfg: MemoryConfig): MemoryRef[];
+/** 展示：`ses-84a547da#120-180`；无引用返回空串。`{ short: true }` 时短化会话 id（存储始终是完整 id）。 */
+export declare function formatRefs(refs: readonly MemoryRef[] | undefined, options?: {
+    short?: boolean;
+}): string;
+/** 机器可读的引用串（写进工具输出/预览）：`sessionId#from-to`，多条用 `;` 分隔。 */
+export declare function refsToString(refs: readonly MemoryRef[] | undefined): string;
 //# sourceMappingURL=lib.d.ts.map

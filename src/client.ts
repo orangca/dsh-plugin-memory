@@ -113,6 +113,8 @@ const zh = {
   sleepEnabled: '空闲梳理开关',
   sleepSessions: '默认回看会话数',
   sleepMaxBackfill: '单次最多补录条数',
+  refsEnabled: '来源引用',
+  refsMax: '每条最多引用数',
   hintDomainName: '记忆库名（= 落盘目录名）。换成别的名字即启用一个空库，旧库仍留在磁盘上。',
   hintMaxInjectedTokens: '常驻注入的 token 硬上限；块头尾的固定文案也计入。',
   hintMaxItemTokens: '单条记忆注入时的截断长度。',
@@ -136,6 +138,8 @@ const zh = {
   hintSleepEnabled: '0=关、1=开；默认 1（开）。关掉后 /sleep 只返回一句说明、不做任何事；它不受 recallMode / autoRecall 影响。',
   hintSleepSessions: '不带 --sessions=N 时默认回看最近几个会话；上限 20。',
   hintSleepMaxBackfill: '一次 /sleep --apply 最多补录几条（只补用户明确要求记住的内容）；超出的候选计入计划的 truncated 并写进说明。',
+  hintRefsEnabled: '0=关、1=开；默认 1（开）。开着时每条记忆都会记下来源（会话 + 事件序号区间），可用 /memory verify <id> 回到原文核对；关掉后新记录不带引用，已有引用不受影响。',
+  hintRefsMax: '每条记录最多保留几个来源引用（默认 5，新的在前）；0 = 不保留引用，Infinity = 不限。',
 }
 
 const en = {
@@ -180,6 +184,8 @@ const en = {
   sleepEnabled: 'Idle review switch',
   sleepSessions: 'Sessions reviewed by default',
   sleepMaxBackfill: 'Backfill cap per run',
+  refsEnabled: 'Source references',
+  refsMax: 'References per record',
   hintDomainName: 'Memory store name (= on-disk directory). A new name starts an empty store; the old one stays on disk.',
   hintMaxInjectedTokens: 'Hard token cap for resident injection; the fixed block header/footer counts too.',
   hintMaxItemTokens: 'Truncation length for one injected memory.',
@@ -203,6 +209,8 @@ const en = {
   hintSleepEnabled: '0 = off, 1 = on; default 1 (on). When off, /sleep only explains that it is disabled and does nothing; it is not affected by recallMode / autoRecall.',
   hintSleepSessions: 'How many recent sessions /sleep reviews when --sessions=N is omitted; capped at 20.',
   hintSleepMaxBackfill: 'Maximum rows one /sleep --apply may backfill (only things the user explicitly asked to remember); candidates beyond it are reported as truncated in the plan and its notes.',
+  hintRefsEnabled: '0 = off, 1 = on; default 1 (on). While enabled every memory records where it came from (session + event seq range), and /memory verify <id> can check it against the original events. Turning it off only affects new rows; existing references stay.',
+  hintRefsMax: 'How many source references one record keeps (default 5, newest first); 0 = keep none, Infinity = unlimited.',
 }
 
 // ---------------------------------------------------------------- 字段定义
@@ -271,6 +279,9 @@ const FIELDS: readonly Field[] = [
   { name: 'sleepEnabled', kind: 'number', bool01: true, group: 'groupSleep' },
   { name: 'sleepSessions', kind: 'number', group: 'groupSleep' },
   { name: 'sleepMaxBackfill', kind: 'number', group: 'groupSleep' },
+  // M9：可核验引用（每条记忆指向来源会话与事件序号区间）
+  { name: 'refsEnabled', kind: 'number', bool01: true, group: 'groupRecall' },
+  { name: 'refsMax', kind: 'number', group: 'groupRecall' },
 ]
 
 /**

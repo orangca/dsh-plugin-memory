@@ -1898,3 +1898,369 @@ test('host#36 /sleep --apply 不碰自画像与用户所有物：模型侧候选
   assert.ok(rows.some((row) => String(row.text).includes('pnpm') && row.kind !== 'agent_self'))
 })
 
+// ================================================================ M9 可核验引用（refs）
+// 契约：docs/refs.md 第 4/5 节。宿主侧负责三件事：零 I/O 的序号跟踪、所有写路径附着引用、
+// `/memory verify` 的只读核对。这里用假 sessionQuery + 真实的事件回调把三条都钉死。
+
+/** 一次带 seq 的会话事件（`state.seq` 的唯一来源）。 */
+const emitSeqEvent = (harness: Harness, session: Json, event: Json): void => {
+  harness.emitSync('session/event', session, event)
+}
+
+/** 假会话视图（id + cwd）：序号跟踪只看 `_session.id`。 */
+const refsSession = (id = 'session-1'): Json => ({ id, header: { cwd: 'C:\\work\\demo' } })
+
+/** 一条真实用户消息事件。 */
+const seqUserEvent = (text: string, seq: number): Json =>
+  ({ type: 'user/message', seq, time: 1_000, data: { source: { kind: 'user' }, content: [{ type: 'text', text }] } })
+
+/** 一次 `memory_write` 工具调用。 */
+const writeViaTool = async (harness: Harness, text: string): Promise<Json> =>
+  JSON.parse(String(await harness.tool('memory_write').execute({ kind: 'semantic', text }))) as Json
+
+/** refs 的 `via` 分布（断言用）。 */
+const viasOf = (row: Json): string[] => ((row.refs as Json[] | undefined) ?? []).map((ref) => String(ref.via))
+
+// ---------------------------------------------------------------- 39. live 区间
+
+test('host#39 refs：live 捕获附着 turnStart..last 区间（via=live）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const agent = agentWith('C:\\work\\demo')
+  harness.roots.push(agent)
+  const session = refsSession()
+  // 一个完整回合：turn/start(10) → 用户消息(11) → 助手回复(12) → 回合收尾
+  emitSeqEvent(harness, session, { type: 'turn/start', seq: 10 })
+  emitSeqEvent(harness, session, seqUserEvent('记住：构建统一用 pnpm，产物输出到 dist 目录。', 11))
+  emitSeqEvent(harness, session, { type: 'assistant/message', seq: 12, data: { message: { content: [{ type: 'text', text: '好的，我会照做。' }] } } })
+  await harness.emit('agent/turn-stopping', { agent })
+  await harness.settle()
+
+  const rows = harness.memory().list() as Json[]
+  assert.equal(rows.length, 1, '本回合应捕获 1 条')
+  assert.deepEqual(rows[0]!.refs, [{ sessionId: 'session-1', from: 10, to: 12, via: 'live' }],
+    'live 引用必须是整个回合区间 [turnStart, lastSeq]')
+
+  // 换会话后不得把上一个会话的 turnStart 带过来
+  const other = refsSession('session-2')
+  emitSeqEvent(harness, other, seqUserEvent('记住：发布统一走 npm publish。', 3))
+  const agent2 = { session: { id: 'session-2', seq: 1, header: { cwd: 'C:\\work\\demo' } } }
+  harness.roots.push(agent2)
+  await harness.emit('agent/turn-stopping', { agent: agent2 })
+  await harness.settle()
+  const second = (harness.memory().list() as Json[]).find((row) => String(row.text).includes('发布'))
+  assert.deepEqual(second!.refs, [{ sessionId: 'session-2', from: 3, to: 3, via: 'live' }],
+    '换会话后 turnStart 必须清空：没有 turn/start 时区间退化成单点')
+})
+
+// ---------------------------------------------------------------- 40. tool 单点
+
+test('host#40 refs：memory_write 工具附着单点引用（via=tool，省略 to）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  emitSeqEvent(harness, refsSession(), seqUserEvent('这句话只是用来推进 seq 的。', 42))
+  const payload = await writeViaTool(harness, '构建产物统一放在 dist 目录下')
+  assert.equal(payload.ok, true)
+
+  const row = (harness.memory().list() as Json[])[0]!
+  assert.deepEqual(row.refs, [{ sessionId: 'session-1', from: 42, via: 'tool' }], '工具路径是单点引用（无 to）')
+  assert.equal('to' in ((row.refs as Json[])[0]!), false, '单点引用必须省略 to')
+  // 返回值里也要能看到引用（模型/用户当场就能看到出处）
+  assert.deepEqual((payload.record as Json).refs, row.refs)
+})
+
+// ---------------------------------------------------------------- 41. 合并并入引用
+
+test('host#41 refs：重复提及（hash 合并）时新引用并入既有条目，旧引用保留', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const session = refsSession()
+  emitSeqEvent(harness, session, seqUserEvent('先推进到 200。', 200))
+  const first = await writeViaTool(harness, '构建产物统一放在 dist 目录下')
+  emitSeqEvent(harness, session, seqUserEvent('再推进到 260。', 260))
+  const second = await writeViaTool(harness, '构建产物统一放在 dist 目录下')
+
+  assert.equal(second.status, 'merged', '同一指纹必须走合并而不是新建')
+  assert.equal(second.id, first.id)
+  const rows = harness.memory().list() as Json[]
+  assert.equal(rows.length, 1, '合并不得新建条目')
+  assert.deepEqual(rows[0]!.refs, [
+    { sessionId: 'session-1', from: 260, via: 'tool' },
+    { sessionId: 'session-1', from: 200, via: 'tool' },
+  ], '新引用在前、旧引用保留')
+})
+
+// ---------------------------------------------------------------- 42. refsEnabled=false
+
+test('host#42 refs：refsEnabled=false 时写路径完全不附着（live 与 tool 都不带）', async (t) => {
+  const harness = makeHarness({ config: { refsEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const agent = agentWith('C:\\work\\demo')
+  harness.roots.push(agent)
+  const session = refsSession()
+  emitSeqEvent(harness, session, { type: 'turn/start', seq: 5 })
+  emitSeqEvent(harness, session, seqUserEvent('记住：构建统一用 pnpm。', 6))
+  await harness.emit('agent/turn-stopping', { agent })
+  await harness.settle()
+  await writeViaTool(harness, '构建产物统一放在 dist 目录下')
+
+  const rows = harness.memory().list() as Json[]
+  assert.equal(rows.length, 2, '捕获 + 工具各写一条')
+  for (const row of rows) assert.equal(row.refs, undefined, `${String(row.text)} 不得带 refs`)
+  const stats = await harness.runCommand('stats')
+  assert.match(stats.text, /引用：已附着 0 次/u)
+  assert.match(stats.text, /refsEnabled=false/u, 'stats 必须说明开关已关')
+})
+
+// ---------------------------------------------------------------- 43~46. /memory verify
+
+test('host#43 /memory verify：命中（覆盖率 ≥ recallMinMatch），且只读', async (t) => {
+  // 用户消息必须命中显式祈使（「记住」）才会被捕获；正文与事件文本同源，覆盖率才会上阈值。
+  const text = '记住：构建统一用 pnpm，产物输出到 dist 目录。'
+  const fake = makeFakeSessionQuery([{
+    id: 'session-1',
+    cwd: 'C:\\work\\demo',
+    createdAt: 1_000,
+    events: [
+      { type: 'turn/start', seq: 10, time: 1, data: {} },
+      seqUserEvent(text, 11),
+    ],
+  }])
+  const harness = makeHarness({ sessionQuery: fake.query })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const agent = agentWith('C:\\work\\demo')
+  harness.roots.push(agent)
+  const session = refsSession()
+  emitSeqEvent(harness, session, { type: 'turn/start', seq: 10 })
+  emitSeqEvent(harness, session, seqUserEvent(text, 11))
+  await harness.emit('agent/turn-stopping', { agent })
+  await harness.settle()
+
+  const before = harness.memory().list() as Json[]
+  const record = before.find((row) => String(row.text).includes('pnpm'))!
+  assert.ok(record, '本回合应捕获 1 条记忆')
+  assert.equal((record.refs as Json[])[0]!.from, 10)
+
+  const result = await harness.runCommand(`verify ${String(record.id).slice(0, 8)}`)
+  assert.equal(result.kind, 'success', result.text)
+  assert.match(result.text, /✅ 命中（覆盖率 \d\.\d\d）/u)
+  assert.match(result.text, /命中 1 \/ 未命中 0/u)
+
+  // 只读：记录逐字不变（含 refs）
+  assert.deepEqual(harness.memory().list(), before, 'verify 不得修改任何记录')
+  assert.deepEqual(fake.read, ['session-1'], '必须按引用回读来源会话')
+  assert.match((await harness.runCommand('stats')).text, /核对 命中 1 \/ 未命中 0/u)
+})
+
+test('host#44 /memory verify：未命中（正文不在引用区间里）与计数', async (t) => {
+  // 会话里只有一句与记忆无关的话；工具写入记下的是这一点的单点引用
+  const fake = makeFakeSessionQuery([{
+    id: 'session-1',
+    cwd: 'C:\\work\\demo',
+    createdAt: 1_000,
+    events: [seqUserEvent('今天天气不错，出去走走。', 50)],
+  }])
+  const harness = makeHarness({ sessionQuery: fake.query })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  emitSeqEvent(harness, refsSession(), seqUserEvent('今天天气不错，出去走走。', 50))
+  const record = await writeViaTool(harness, '构建产物统一放在 dist 目录下')
+
+  const result = await harness.runCommand(`verify ${String(record.id).slice(0, 8)}`)
+  assert.equal(result.kind, 'success', result.text)
+  assert.match(result.text, /⚠️ 未命中（覆盖率 \d\.\d\d/u)
+  assert.match(result.text, /命中 0 \/ 未命中 1/u)
+  assert.match((await harness.runCommand('stats')).text, /核对 命中 0 \/ 未命中 1/u)
+})
+
+test('host#44b /memory verify：会话或事件不存在（读取失败不抛）', async (t) => {
+  // 假 sessionQuery 里没有 session-1：readSession 会抛，verify 必须如实降级
+  const fake = makeFakeSessionQuery([{
+    id: 'other-session',
+    cwd: 'C:\\work\\demo',
+    createdAt: 1_000,
+    events: [seqUserEvent('无关内容。', 1)],
+  }])
+  const harness = makeHarness({ sessionQuery: fake.query })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  emitSeqEvent(harness, refsSession(), seqUserEvent('先推进 seq。', 9))
+  const record = await writeViaTool(harness, '构建产物统一放在 dist 目录下')
+
+  const result = await harness.runCommand(`verify ${String(record.id).slice(0, 8)}`)
+  assert.equal(result.kind, 'success', result.text)
+  assert.match(result.text, /⚠️ 会话或事件不存在/u)
+  assert.match((await harness.runCommand('stats')).text, /核对 命中 0 \/ 未命中 1/u, '读不到的引用计入未命中')
+})
+
+test('host#45 /memory verify：无 sessionQuery 时返回 error 文案且不抛', async (t) => {
+  const harness = makeHarness() // 故意不提供 sessionQuery
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  emitSeqEvent(harness, refsSession(), seqUserEvent('先推进 seq。', 7))
+  const record = await writeViaTool(harness, '构建产物统一放在 dist 目录下')
+
+  const result = await harness.runCommand(`verify ${String(record.id).slice(0, 8)}`)
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /sessionQuery/u)
+  assert.match(result.text, /只读|不受影响/u, '要说明记忆本身不受影响')
+  assert.equal(harness.domain.puts.length, 1, 'verify 不得写盘（这里只有那次 memory_write）')
+})
+
+test('host#46 /memory verify：无引用的记录（0.5.9 之前的存量）给明确说明', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 没有任何 session/event → state.seq 为空 → 写出来的记录不带引用
+  const record = await writeViaTool(harness, '构建产物统一放在 dist 目录下')
+  assert.equal(record.refs, undefined)
+
+  const result = await harness.runCommand(`verify ${String(record.id).slice(0, 8)}`)
+  assert.equal(result.kind, 'success', result.text)
+  assert.match(result.text, /这条没有引用/u)
+  assert.match(result.text, /0\.5\.9/u, '要说明可能是老版本写入的')
+  // 用法错误与未找到也要有可读文案
+  assert.match((await harness.runCommand('verify')).text, /用法：\/memory verify/u)
+  assert.match((await harness.runCommand('verify definitely-absent')).text, /未找到/u)
+})
+
+// ---------------------------------------------------------------- 47~49. 展示
+
+test('host#47 /memory stats 与 memory_stats 都暴露引用行与结构化计数', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  emitSeqEvent(harness, refsSession(), seqUserEvent('先推进 seq。', 8))
+  await writeViaTool(harness, '构建产物统一放在 dist 目录下')
+
+  const stats = await harness.runCommand('stats')
+  assert.match(stats.text, /引用：已附着 1 次 \/ 无引用记录 0 条/u)
+  assert.match(stats.text, /核对 命中 0 \/ 未命中 0/u)
+
+  const raw = JSON.parse(String(await harness.tool('memory_stats').execute({}))) as Json
+  const refs = raw.refs as Json
+  assert.ok(refs, 'memory_stats 必须带 refs 字段')
+  assert.equal(Number(refs.attached), 1)
+  assert.equal(Number(refs.withoutRefs), 0)
+  assert.equal(Number(refs.verified), 0)
+  assert.equal(Number(refs.mismatched), 0)
+  assert.match(String(raw.text), /引用：已附着 1 次/u, '工具文本与 /memory stats 同步')
+
+  // 无引用记录数：新写入一条不带 seq 的记录（先清掉 seq 来源不可能，改用 import 造一条无引用的）
+  const file = join(harness.tempDir, 'norefs.json')
+  writeFileSync(file, JSON.stringify({ items: [{ kind: 'semantic', text: '导入的条目没有任何引用。' }] }))
+  assert.equal((await harness.runCommand(`import ${file}`)).kind, 'success')
+  const after = JSON.parse(String(await harness.tool('memory_stats').execute({}))) as Json
+  assert.equal(Number((after.refs as Json).withoutRefs), 1, 'import 不附着引用（数据副本，不是用户当场说的）')
+  assert.match((await harness.runCommand('stats')).text, /无引用记录 1 条/u)
+})
+
+test('host#48 /memory show：带「来源：」一行（有引用/无引用都明确）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  emitSeqEvent(harness, refsSession(), seqUserEvent('先推进 seq。', 5))
+  const record = await writeViaTool(harness, '构建产物统一放在 dist 目录下')
+  const shown = await harness.runCommand(`show ${String(record.id).slice(0, 8)}`)
+  assert.equal(shown.kind, 'success', shown.text)
+  assert.match(shown.text, /来源：session-1#5/u)
+
+  // 无引用时不留空白行，而是明确说明
+  const file = join(harness.tempDir, 'plain.json')
+  writeFileSync(file, JSON.stringify({ items: [{ kind: 'semantic', text: '导入的条目没有任何引用。', subject: 'legacy.import' }] }))
+  await harness.runCommand(`import ${file}`)
+  const plain = (harness.memory().list() as Json[]).find((row) => String(row.text).includes('没有任何引用'))!
+  // 用完整 id：同一毫秒创建的两条记录前 8 位会撞前缀（show 是按前缀找第一条）
+  assert.match((await harness.runCommand(`show ${String(plain.id)}`)).text, /来源：（无引用/u)
+  assert.match((await harness.runCommand('help')).text, /verify <id>/u, 'help 要提到新命令')
+  const hint = String((harness.command() as unknown as { input?: { hint?: string } }).input?.hint ?? '')
+  assert.match(hint, /verify/u, '命令的 input.hint 也要提到 verify')
+})
+
+test('host#49 memory_explain：记录视图带机器可读的 refs 串', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  emitSeqEvent(harness, refsSession(), seqUserEvent('先推进 seq。', 12))
+  const written = await writeSelf(harness, {
+    kind: 'agent_self', facet: 'persona', subject: 'voice',
+    text: '我在解释概念时会先给出结论，再补充理由。',
+  })
+  assert.equal(written.ok, true)
+
+  const explain = JSON.parse(String(await harness.tool('memory_explain').execute({ text: '我回答问题的风格是什么' }))) as Json
+  const records = (explain.portrait as Json).records as Json[]
+  const active = records.find((row) => row.status === 'active')!
+  assert.equal(active.refs, 'session-1#12', 'refs 用 refsToString 的机器可读形式')
+})
+
+// ---------------------------------------------------------------- 50~51. /sleep 透传
+
+test('host#50 refs：/sleep 预览与补录都带候选自带的引用（via=sleep）', async (t) => {
+  const { harness } = sleepHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const preview = await harness.runCommand('', 'sleep')
+  assert.match(preview.text, /sess-new#1/u, '预览的补录候选要能看出指回哪条消息')
+
+  assert.equal((await harness.runCommand('--apply', 'sleep')).kind, 'success')
+  const rows = harness.memory().list() as Json[]
+  const backfilled = rows.find((row) => String(row.text).includes('pnpm'))!
+  assert.deepEqual(backfilled.refs, [{ sessionId: 'sess-new', from: 1, via: 'sleep' }],
+    '补录必须透传纯函数层算好的引用')
+  assert.ok(Number((harness.reportState().refs as Json).attached) >= 1, '附着计数要落进自报告')
+})
+
+test('host#51 refs：refsEnabled=false 时 /sleep 补录也不带引用（连透传的也不落库）', async (t) => {
+  const { harness } = sleepHarness({ config: { refsEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  assert.equal((await harness.runCommand('--apply', 'sleep')).kind, 'success')
+  const rows = harness.memory().list() as Json[]
+  assert.ok(rows.length > 0, '补录本身要照常发生')
+  for (const row of rows) assert.equal(row.refs, undefined, `${String(row.text)} 不得带 refs`)
+  assert.match((await harness.runCommand('stats')).text, /引用：已附着 0 次/u)
+})
+
+test('host#52 refs：用户命令路径附着单点引用（self set 与 pin 都算「出处」）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  emitSeqEvent(harness, refsSession(), seqUserEvent('先推进 seq。', 30))
+  const set = await harness.runCommand('self set persona 我在解释概念时会先给出结论')
+  assert.equal(set.kind, 'success', set.text)
+  const row = (harness.memory().list() as Json[])[0]!
+  assert.deepEqual(row.refs, [{ sessionId: 'session-1', from: 30, via: 'command' }], '/memory self set 是 command 单点引用')
+
+  // pin 是既有条目上的用户命令：新引用并入（新在前），旧引用保留
+  emitSeqEvent(harness, refsSession(), seqUserEvent('再推进 seq。', 44))
+  assert.equal((await harness.runCommand(`pin ${String(row.id).slice(0, 8)}`)).kind, 'success')
+  const pinned = (harness.memory().list() as Json[]).find((item) => item.id === row.id)!
+  assert.deepEqual(pinned.refs, [
+    { sessionId: 'session-1', from: 44, via: 'command' },
+    { sessionId: 'session-1', from: 30, via: 'command' },
+  ])
+  assert.match((await harness.runCommand('stats')).text, /引用：已附着 2 次/u)
+})
+
+

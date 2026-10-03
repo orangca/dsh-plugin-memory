@@ -105,6 +105,7 @@ ordinary persona rows under three subjects:
 /memory self set <persona|work> [name|address_user|address_self] <text>   set/override (user-side, pinned, confidence 1); a naming key on persona settles the names
 /memory self history [subject]           revision chain, old → new (with archival time)
 /memory self reset [persona|work]        archive the current self-portrait (history is kept, nothing is deleted)
+/memory verify <id prefix>               walk back to the cited events and check where this memory came from (read-only)
 ```
 
 ## `/sleep`: idle review
@@ -146,6 +147,26 @@ up what was missed at the time, then reorders the whole store.
 With `sleepEnabled` (default `true`) off, the command only explains that it is disabled and does nothing. `/sleep`
 is a maintenance action the user triggers explicitly, so it is **not** affected by `recallMode` / `autoRecall`. The
 run counters and the watermark (`lastSleepAt`) are visible in `/memory stats` and `memory_stats`.
+
+## Verifiable references: every memory can say where it came from
+
+Each memory records its **source**: which session, and which event-sequence range.
+
+- **Free to collect**: the sequence numbers come from the `session/event` callback we already subscribe to — no
+  extra reads, no extra model calls.
+- **Every write path is covered**: turn-end capture stores the `turnStart..last` range; model tools, user commands
+  and compaction solidification store the single point `last`; `/sleep` backfill stores the sequence of **the user
+  message it came from**. On a merge (reinforce/refine) the new reference is added to the existing row and old ones
+  are kept.
+- **Checkable**: `/memory verify <id>` walks back to the cited events and compares them with the row's text using
+  informative-token coverage, printing `✅ hit (coverage x)` / `⚠️ miss` / `⚠️ session or events missing`. Read-only.
+- **Visible**: `/memory show <id>` gains a `source:` line, and `memory_explain` exposes `refs` too.
+- **Never part of the fingerprint**: `recordHash` ignores `refs` — otherwise the same memory would count as two rows
+  just because it came from somewhere else, breaking deduplication and idempotency. Rows written before 0.5.9 have no
+  references; every read path tolerates that (`/memory verify` says so explicitly).
+
+`refsEnabled` (default `true`) turns collection off for new rows (existing references stay); `refsMax` (default `5`)
+caps how many references one row keeps.
 
 ## Guarding against memory pollution / self-reinforcement
 
@@ -204,9 +225,9 @@ Add this package to the profile's `dependencies`, append `dsh-plugin-memory` to
 
 ## The settings form
 
-The plugin exports a schemastery `Config` whose **23 fields** are declared `volatile()` (hot-applied when edited);
+The plugin exports a schemastery `Config` whose **25 fields** are declared `volatile()` (hot-applied when edited);
 everything else is patch-row only. It ships a small browser half (`src/client.ts`, built to `lib/client.js`) that
-renders those 23 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
+renders those 25 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
 also shows a one-line summary).
 
 Under the hood the client half registers into the keyed `plugins.row.config` slot with
@@ -255,7 +276,7 @@ whole Config through the settings service and persists it into the profile patch
 
 ## Configuration
 
-Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 23 fields exposed in
+Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 25 fields exposed in
 the settings form:
 
 | Field | Default | Meaning |
@@ -283,6 +304,8 @@ the settings form:
 | `sleepEnabled` | `true` | Idle review (`/sleep`) switch; in the form `0` = off, `1` = on. When off, the command only explains itself and does nothing |
 | `sleepSessions` | `3` | Sessions reviewed by default when `--sessions=N` is omitted (capped at 20) |
 | `sleepMaxBackfill` | `20` | Maximum rows one `/sleep --apply` may backfill (only things you explicitly asked to remember) |
+| `refsEnabled` | `true` | Record where each memory came from (session + event seq range); in the form `0` = off, `1` = on. Off only affects new rows |
+| `refsMax` | `5` | How many source references one row keeps (newest first); `0` = none, `Infinity` = unlimited |
 
 Additional knobs available only through the patch row (with their defaults): `maxItemTokens` neighbours such as
 `selfPortraitMaxItems` 12 / `selfPortraitMaxSelfObserved` 4, capture tuning (`capturePerHour` 20,

@@ -9,6 +9,7 @@ import type {
   MakeRecordInput,
   MemoryConfig,
   MemoryRecord,
+  MemoryRef,
   MemoryScope,
   PortraitCandidate,
   ReflectInput,
@@ -43,6 +44,7 @@ import {
   facetOf,
   findConflicts,
   fnv1a,
+  formatRefs,
   formatSleepPlan,
   isEcho,
   isSelfPortraitEligible,
@@ -55,6 +57,7 @@ import {
   NAMING_SUBJECTS,
   namingSettled,
   normalizeFacet,
+  normalizeRefs,
   normalizeText,
   pickMergeGroups,
   planPortraitUpdate,
@@ -62,6 +65,8 @@ import {
   portraitSubjectFor,
   recallRecords,
   recordHash,
+  refsOf,
+  refsToString,
   renderContextBlock,
   renderSelfBlock,
   scanSensitive,
@@ -73,6 +78,7 @@ import {
   tokenCacheSize,
   tokenize,
   transcriptOf,
+  withRef,
   workspaceKeyOf,
 } from '../lib/lib.js'
 
@@ -1599,4 +1605,247 @@ test('formatSleepPlan：非空计划把 notes 逐条渲染，并给出裁剪提�
   assert.match(text, /裁剪：补录候选超出上限/)
   assert.match(text, /说明：/)
   assert.match(text, /超过上限 1 条/)
+})
+
+// ---------------------------------------------------------------- M9 可核验引用（refs）
+
+test('DEFAULTS：M9 新增 2 个 refs 键与默认值（契约 §2.1）', () => {
+  assert.equal(DEFAULTS.refsEnabled, true)
+  assert.equal(DEFAULTS.refsMax, 5)
+})
+
+test('recordHash：refs 不参与指纹（同文本 + 不同 refs → 同 hash）', () => {
+  const base: MakeRecordInput = {
+    kind: 'user_profile', scope: { level: 'profile', key: '*' }, subject: 'lang', text: '偏好中文注释',
+  }
+  const none = makeRecord(base)
+  const live = makeRecord({ ...base, refs: [{ sessionId: 'ses-a', from: 120, to: 180, via: 'live' }] })
+  const tool = makeRecord({ ...base, refs: [{ sessionId: 'ses-b', from: 9, via: 'tool' }] })
+  assert.equal(live.hash, none.hash)
+  assert.equal(tool.hash, none.hash)
+  // `recordHash` 自己的入参形状里根本没有 refs：直接求指纹也不受引用影响
+  const withRefs = { ...base, refs: [{ sessionId: 'ses-c', from: 1 }] }
+  assert.equal(recordHash(withRefs), recordHash(base))
+})
+
+test('makeRecord：缺失 refs 时不写键（存量形状不变）；给了就透传并清洗', () => {
+  const base: MakeRecordInput = {
+    kind: 'user_profile', scope: { level: 'profile', key: '*' }, subject: 'lang', text: '偏好中文注释',
+  }
+  assert.equal('refs' in makeRecord(base), false, '没有 refs 就不许出现 refs 键')
+  const kept = makeRecord({ ...base, refs: [{ sessionId: 'ses-a', from: 120, to: 180, via: 'live' }] })
+  assert.deepEqual(kept.refs, [{ sessionId: 'ses-a', from: 120, to: 180, via: 'live' }])
+  // 脏数据在同一批里逐条丢弃，合法项保留（写路径不因为引用而变脆）
+  const dirty = makeRecord({ ...base, refs: [null, { sessionId: '' }, { sessionId: 'ses-b', from: 3 }] as unknown as MemoryRef[] })
+  assert.deepEqual(dirty.refs, [{ sessionId: 'ses-b', from: 3 }])
+  // 空数组是「显式给了空引用」：键在、值为空（与「缺失」区分）
+  assert.deepEqual(makeRecord({ ...base, refs: [] }).refs, [])
+})
+
+test('refsOf：缺失/非数组/全非法一律返回空数组（0.5.8 存量记录向后兼容）', () => {
+  assert.deepEqual(refsOf(null), [])
+  assert.deepEqual(refsOf(undefined), [])
+  const legacy = makeRecord({ kind: 'user_profile', text: '存量记录没有 refs 字段' })
+  assert.deepEqual(refsOf(legacy), [])
+  assert.deepEqual(refsOf({ refs: 'not-an-array' } as unknown as MemoryRecord), [])
+  assert.deepEqual(refsOf({ refs: [null, 7, 'x', [], {}, { sessionId: '' }, { sessionId: 42 }] } as unknown as MemoryRecord), [])
+})
+
+test('refsOf：逐条容错（非法项丢弃、合法项保留），且不改动原记录', () => {
+  const record = {
+    refs: [
+      { sessionId: 'ses-a', from: 1, to: 2, via: 'live' },
+      { sessionId: 'ses-b', from: Number.NaN },
+      null,
+      { sessionId: 'ses-c' },
+    ],
+  } as unknown as MemoryRecord
+  assert.deepEqual(refsOf(record), [
+    { sessionId: 'ses-a', from: 1, to: 2, via: 'live' },
+    { sessionId: 'ses-c' },
+  ])
+  assert.equal((record.refs as unknown[]).length, 4, '读取不修改原数组')
+})
+
+test('normalizeRefs：去重键是 sessionId|from|to（via 不参与），保持入参顺序（新在前）', () => {
+  const out = normalizeRefs([
+    { sessionId: 'ses-a', from: 120, to: 180, via: 'live' },
+    { sessionId: 'ses-a', from: 120, to: 180, via: 'command' },
+    { sessionId: 'ses-b', from: 9 },
+  ], cfg)
+  assert.deepEqual(out, [
+    { sessionId: 'ses-a', from: 120, to: 180, via: 'live' },
+    { sessionId: 'ses-b', from: 9 },
+  ])
+  // 缺 to 与 to=undefined 是同一条；单点(1) 与区间(1-2) 是两条
+  assert.equal(normalizeRefs([{ sessionId: 's', from: 1 }, { sessionId: 's', from: 1, to: undefined }], cfg).length, 1)
+  assert.equal(normalizeRefs([{ sessionId: 's', from: 1 }, { sessionId: 's', from: 1, to: 2 }], cfg).length, 2)
+  // 只有 sessionId 与只有 to 也是两条不同的引用
+  assert.equal(normalizeRefs([{ sessionId: 's' }, { sessionId: 's', to: 5 }], cfg).length, 2)
+})
+
+test('normalizeRefs：裁剪到 cfg.refsMax（超出丢弃尾部）', () => {
+  const refs = [1, 2, 3, 4, 5, 6].map((seq) => ({ sessionId: `ses-${seq}`, from: seq }))
+  assert.equal(normalizeRefs(refs, cfg).length, 5, '默认上限 5')
+  assert.deepEqual(normalizeRefs(refs, { ...cfg, refsMax: 2 }).map((ref) => ref.sessionId), ['ses-1', 'ses-2'])
+  assert.deepEqual(normalizeRefs(refs, { ...cfg, refsMax: 0 }), [], '0 = 不保留引用')
+  assert.equal(normalizeRefs(refs, { ...cfg, refsMax: Number.NaN }).length, 5, 'NaN 回落默认')
+  assert.equal(normalizeRefs(refs, { ...cfg, refsMax: -1 }).length, 5, '负数回落默认')
+  assert.equal(normalizeRefs(refs, { ...cfg, refsMax: Number.POSITIVE_INFINITY }).length, 6, 'Infinity = 不限')
+})
+
+test('normalizeRefs：非法项丢弃而不是抛（非对象 / sessionId 非字符串或空 / seq 非有限数）', () => {
+  const out = normalizeRefs([
+    null, undefined, 42, 'ses-a', [], { sessionId: 42 }, { sessionId: '' }, { sessionId: '   ' },
+    { from: 1 }, { to: 2 },
+    { sessionId: 'bad-from', from: Number.NaN },
+    { sessionId: 'bad-to', to: Number.POSITIVE_INFINITY },
+    { sessionId: 'bad-str', from: '120' },
+    { sessionId: 'ses-ok', from: 3 },
+  ], cfg)
+  assert.deepEqual(out, [{ sessionId: 'ses-ok', from: 3 }])
+  assert.deepEqual(normalizeRefs('not-an-array', cfg), [])
+  assert.deepEqual(normalizeRefs(null, cfg), [])
+})
+
+test('normalizeRefs：via 认不出时只丢字段、不丢整条引用；六个合法 via 原样保留', () => {
+  assert.deepEqual(normalizeRefs([{ sessionId: 'ses-a', from: 1, via: 'bogus' }], cfg), [{ sessionId: 'ses-a', from: 1 }])
+  const vias = ['live', 'sleep', 'tool', 'command', 'solidify', 'import']
+  const out = normalizeRefs(vias.map((via, index) => ({ sessionId: `ses-${index}`, from: index, via })), { ...cfg, refsMax: vias.length })
+  assert.deepEqual(out.map((ref) => ref.via), vias)
+})
+
+test('normalizeRefs：会话 id 存完整值（不截断），只去首尾空白', () => {
+  const long = 'session-091c2134-fe41-4be0-a576-255b06f4f1f1'
+  assert.deepEqual(normalizeRefs([{ sessionId: ` ${long} `, from: 1 }], cfg), [{ sessionId: long, from: 1 }])
+})
+
+test('withRef：新引用在前，与既有引用合并去重，并受 refsMax 约束', () => {
+  const existing: MemoryRef[] = [{ sessionId: 'ses-a', from: 1, to: 2 }]
+  const out = withRef(existing, { sessionId: 'ses-b', from: 9, via: 'tool' }, cfg)
+  assert.deepEqual(out, [
+    { sessionId: 'ses-b', from: 9, via: 'tool' },
+    { sessionId: 'ses-a', from: 1, to: 2 },
+  ])
+  // 重复引用只留一条，且是**新**的那条在前（reinforce 合并时旧引用不重复堆积）
+  assert.deepEqual(withRef(out, { sessionId: 'ses-a', from: 1, to: 2, via: 'command' }, cfg), [
+    { sessionId: 'ses-a', from: 1, to: 2, via: 'command' },
+    { sessionId: 'ses-b', from: 9, via: 'tool' },
+  ])
+  assert.deepEqual(existing, [{ sessionId: 'ses-a', from: 1, to: 2 }], '既有数组不被改动')
+  assert.deepEqual(withRef([{ sessionId: 'old' }], { sessionId: 'new' }, { ...cfg, refsMax: 1 }), [{ sessionId: 'new' }])
+  assert.deepEqual(withRef(undefined, { sessionId: 'ses-c' }, cfg), [{ sessionId: 'ses-c' }])
+  assert.deepEqual(withRef('bogus', { sessionId: 'ses-c' }, cfg), [{ sessionId: 'ses-c' }])
+})
+
+test('withRef：refsEnabled=false 时原样返回（不新增引用，也不清洗既有值）', () => {
+  const off: MemoryConfig = { ...cfg, refsEnabled: false }
+  const existing: MemoryRef[] = [{ sessionId: 'ses-a', from: 1 }]
+  const out = withRef(existing, { sessionId: 'ses-b', from: 9 }, off)
+  assert.deepEqual(out, existing)
+  assert.equal(out.length, 1, '关掉开关后一条都不许新增')
+  // 「原样」= 连脏数据都不动：写入路径完全不碰引用（§5）
+  const dirty = [{ sessionId: '' }] as unknown as MemoryRef[]
+  assert.deepEqual(withRef(dirty, { sessionId: 'ses-b' }, off), dirty)
+  assert.deepEqual(withRef(undefined, { sessionId: 'ses-b' }, off), [])
+})
+
+test('formatRefs：展示 sessionId#from-to（契约 §3 示例原文）；无引用返回空串', () => {
+  assert.equal(formatRefs([{ sessionId: 'ses-84a547da', from: 120, to: 180 }]), 'ses-84a547da#120-180')
+  assert.equal(formatRefs([{ sessionId: 'ses-84a547da', from: 120 }]), 'ses-84a547da#120')
+  assert.equal(formatRefs([{ sessionId: 'ses-84a547da', to: 180 }]), 'ses-84a547da#180')
+  assert.equal(formatRefs([{ sessionId: 'ses-84a547da', from: 120, to: 120 }]), 'ses-84a547da#120', '起止相同即单点')
+  assert.equal(formatRefs([{ sessionId: 'ses-84a547da' }]), 'ses-84a547da')
+  assert.equal(formatRefs([]), '')
+  assert.equal(formatRefs(undefined), '')
+  assert.equal(formatRefs([{ sessionId: '' }] as MemoryRef[]), '', '非法项被丢弃而不是渲染成怪串')
+  assert.equal(formatRefs([{ sessionId: 'ses-a', from: 1 }, { sessionId: 'ses-b', from: 2, to: 3 }]), 'ses-a#1; ses-b#2-3')
+})
+
+test('formatRefs：{short:true} 短化会话 id，默认保留完整 id（存储不截断）', () => {
+  const long = 'session-091c2134-fe41-4be0-a576-255b06f4f1f1'
+  assert.equal(formatRefs([{ sessionId: long, from: 7, to: 9 }]), `${long}#7-9`)
+  assert.equal(formatRefs([{ sessionId: long, from: 7, to: 9 }], { short: true }), 'session-091c2134#7-9')
+  // 直接 slice(0, 8) 会把每个会话都截成 "session-"，所以短化规则是「前缀 + 后面 8 个字符」
+  assert.equal(formatRefs([{ sessionId: 'ses-84a547da-11aa', from: 1 }], { short: true }), 'ses-84a547da#1')
+  assert.equal(formatRefs([{ sessionId: '0123456789abcdef', from: 1 }], { short: true }), '01234567#1')
+})
+
+test('refsToString：机器可读串（完整 id + 区间），多条用 ; 分隔', () => {
+  assert.equal(refsToString([{ sessionId: 'ses-a', from: 120, to: 180 }, { sessionId: 'ses-b', from: 5 }]), 'ses-a#120-180;ses-b#5')
+  assert.equal(refsToString([{ sessionId: 'ses-a' }]), 'ses-a')
+  assert.equal(refsToString([]), '')
+  assert.equal(refsToString(undefined), '')
+  const long = 'session-091c2134-fe41-4be0-a576-255b06f4f1f1'
+  assert.equal(refsToString([{ sessionId: long, from: 1 }]), `${long}#1`, '机器串不短化（核对要用完整 id）')
+})
+
+test('写入路径串联：makeRecord 的 refs 能被 refsOf 读回，再用 withRef 继续合并（reinforce 语义）', () => {
+  const record = makeRecord({
+    kind: 'user_profile',
+    subject: 'lang',
+    text: '偏好中文注释',
+    refs: [{ sessionId: 'ses-a', from: 1, to: 2, via: 'live' }],
+  })
+  assert.deepEqual(refsOf(record), [{ sessionId: 'ses-a', from: 1, to: 2, via: 'live' }])
+  assert.deepEqual(withRef(refsOf(record), { sessionId: 'ses-b', from: 9, via: 'tool' }, cfg), [
+    { sessionId: 'ses-b', from: 9, via: 'tool' },
+    { sessionId: 'ses-a', from: 1, to: 2, via: 'live' },
+  ])
+})
+
+test('transcriptOf：TranscriptMessage 带事件 seq（缺失为 null）—— /sleep 引用的基础', () => {
+  const out = transcriptOf([sessionOf('s1', [assistantEvent(8, '好的。'), userEvent(9, '记住：第二条。')])], cfg)
+  assert.deepEqual(out.sources[0]!.messages.map((message) => `${message.role}:${message.seq}`), ['assistant:8', 'user:9'])
+  const legacy = transcriptOf([sessionOf('s2', [{
+    type: 'user/message',
+    time: 1,
+    data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '记住：老日志没有 seq。' }] },
+  }])], cfg)
+  assert.deepEqual(legacy.sources[0]!.messages.map((message) => message.seq), [null])
+})
+
+test('buildSleepPlan：补录候选带 refs（sessionId + from=seq + via:"sleep"）', () => {
+  const events = [
+    assistantEvent(2, '好的。'),
+    userEvent(3, '记住：以后都用 pnpm。'),
+    userEvent(4, '今天天气不错。'),
+  ]
+  const plan = buildSleepPlan({ records: [], sources: transcriptOf([sessionOf('ses-sleep-1', events)], cfg).sources, cfg, now: 5 })
+  assert.equal(plan.backfill.length, 1)
+  const candidate = plan.backfill[0]!
+  assert.deepEqual(candidate.refs, [{ sessionId: 'ses-sleep-1', from: 3, via: 'sleep' }])
+  // refs 不参与指纹：候选 hash 与「同一文本 + 同 kind/scope/subject」的记录一致
+  assert.equal(candidate.hash, recordHash({
+    kind: candidate.kind!,
+    scope: candidate.scope,
+    subject: candidate.subject ?? null,
+    text: candidate.text,
+  }))
+})
+
+test('buildSleepPlan：seq 缺失时不给候选写 refs 键（保持存量候选形状）', () => {
+  const events = [{
+    type: 'user/message',
+    time: 1,
+    data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '记住：以后都用 pnpm。' }] },
+  }]
+  const plan = buildSleepPlan({ records: [], sources: transcriptOf([sessionOf('s1', events)], cfg).sources, cfg, now: 5 })
+  assert.equal(plan.backfill.length, 1)
+  assert.equal('refs' in plan.backfill[0]!, false)
+})
+
+test('formatSleepPlan：补录候选行带引用（指回原消息 seq）；无引用的候选退回短 id', () => {
+  const plan = buildSleepPlan({
+    records: [],
+    sources: transcriptOf([sessionOf('ses-sleep-1', [userEvent(12, '记住：以后都用 pnpm。')])], cfg).sources,
+    cfg,
+    now: 5,
+  })
+  assert.match(formatSleepPlan(plan, cfg), /会话 ses-sleep-1#12/u)
+  const bare: SleepCandidate = {
+    text: 't', sessionId: 'ses-legacy-1', at: null, scope: { level: 'profile', key: '*' },
+    origin: 'user_explicit', confidence: 1, hash: 'h',
+  }
+  assert.match(formatSleepPlan({ ...plan, backfill: [bare] }, cfg), /会话 ses-lega/u)
 })

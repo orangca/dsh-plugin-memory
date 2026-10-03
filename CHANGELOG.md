@@ -3,6 +3,32 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.9 — 2026-10-02
+
+**Verifiable references.** Two independent memory plugins in the community directory lead with provenance
+("verifiable citations", "facts carry sessionId/eventRange"), and our rows did not even record which session they
+came from. Every memory can now say where it came from.
+
+### Added
+
+- `MemoryRecord.refs`: a list of `{ sessionId, from?, to?, via? }`, capped by `refsMax` (default 5, newest first).
+  Collection is free — the sequence numbers come from the `session/event` callback the plugin already subscribes to.
+- Every write path attaches a reference: turn-end capture stores the `turnStart..last` range; model tools, user
+  commands and compaction solidification store the single point `last`; `/sleep` backfill stores the sequence of the
+  **user message it came from**. Merges add the new reference and keep the old ones.
+- `/memory verify <id>`: read-only. Walks back to the cited events and compares them with the row's text using
+  informative-token coverage, reporting `✅ hit (coverage x)` / `⚠️ miss` / `⚠️ session or events missing`, and says
+  plainly when a row has no references (written before 0.5.9) or the host has no `sessionQuery`.
+- `/memory show <id>` prints a `source:` line; `memory_explain` exposes `refs`; `/memory stats` and `memory_stats`
+  report how many rows carry references.
+- Config: `refsEnabled` (default `true`) and `refsMax` (default `5`), both in the settings form (25 fields now).
+
+### Notes
+
+- **`refs` deliberately does not join `recordHash`** — otherwise the same memory would count twice just because it
+  came from somewhere else, which would break deduplication and make `/sleep` non-idempotent. There is a test for it.
+- Backward compatible: rows written earlier have no `refs` and every read path tolerates that.
+
 ## 0.5.8 — 2026-10-02
 
 Found while building `/sleep`: DSH session logs are streams of **independent zstd frames**, one JSONL line each,

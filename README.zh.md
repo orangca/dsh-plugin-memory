@@ -92,6 +92,7 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 /memory self set <persona|work> [name|address_user|address_self] <正文>    用户直接设定/覆盖（用户侧、固定、置信度 1）；带命名 key 时同时定下称呼
 /memory self history [subject]            修订链：由旧到新（含归档时间）
 /memory self reset [persona|work]         归档当前自画像（保留历史，不删除）
+/memory verify <id prefix>                    回到引用指向的事件核对这条记忆的来源（只读）
 ```
 
 ## `/sleep`：空闲梳理
@@ -129,6 +130,21 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 `sleepEnabled`（默认 `true`）关掉后命令只返回一句说明、不做任何事；`/sleep` 是用户显式触发的维护动作，
 **不受** `recallMode` / `autoRecall` 影响。跑完的计数与水位（`lastSleepAt`）在 `/memory stats` 与
 `memory_stats` 里可见。
+
+## 可核验引用：每条记忆都能回答「你凭什么这么说」
+
+每条记忆都会记下**来源**：哪个会话、哪段事件序号区间。
+
+- **零成本**：序号来自已经订阅的 `session/event` 回调，不额外读盘、不额外调用模型。
+- **写路径全覆盖**：回合收尾捕获记 `turnStart..last` 区间；模型工具、用户命令、压缩固化记单点 `last`；
+  `/sleep` 补录记**用户当时那条消息**的序号。合并（reinforce/refine）时新引用并入旧条目，旧引用保留。
+- **可核对**：`/memory verify <id>` 回到引用指向的事件，用信息量 token 覆盖率判断「记录正文在不在那里」，
+  输出 `✅ 命中（覆盖率 x）` / `⚠️ 未命中` / `⚠️ 会话或事件不存在`。只读，不改任何数据。
+- **展示**：`/memory show <id>` 会多一行「来源：…」；`memory_explain` 的记录视图也带 `refs`。
+- **不参与指纹**：`recordHash` 不吃 `refs` —— 否则同一条记忆会因为来源不同被判成两条，破坏去重与幂等。
+  0.5.9 之前的记录没有引用，一切读取路径都容错（`/memory verify` 会说明「这条没有引用」）。
+
+`refsEnabled`（默认 `true`）关掉后新记录不再带引用（已有引用不受影响）；`refsMax`（默认 `5`）限制每条保留几个。
 
 ## 防「记忆污染 / 自激」
 
@@ -183,8 +199,8 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置表单在哪
 
-插件导出 schemastery `Config`，其中 **23 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
-同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 23 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
+插件导出 schemastery `Config`，其中 **25 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
+同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 25 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
 （列表里的行卡片上还有一行摘要）。
 
 实现上，客户端半边注册进 **keyed** 插槽 `plugins.row.config`，key 为
@@ -208,6 +224,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 /memory self set <persona|work> [name|address_user|address_self] <正文>            直接设定/覆盖自画像（用户侧、固定、置信度 1）；带命名 key 时同时定下称呼
 /memory self history [subject]                   自画像修订链（旧 → 新，含归档时间）
 /memory self reset [persona|work]                归档当前自画像（保留历史，不删除）
+/memory verify <id prefix>                    回到引用指向的事件核对这条记忆的来源（只读）
 /memory export [path]                            导出 JSON
 /memory import <path>                            导入 JSON（按指纹去重；逐字段校验、数值夹取、`pinned` 强制关闭、来源一律降级为 `observed`）
 /memory clear --all --yes                        永久清空全部（`--all` 与下面的筛选条件互斥）
@@ -233,7 +250,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置
 
-在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 23 个字段：
+在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 25 个字段：
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -260,6 +277,8 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 | `sleepEnabled` | `true` | 空闲梳理（`/sleep`）开关；表单里 `0`=关、`1`=开。关掉后命令只说明一句、不做任何事 |
 | `sleepSessions` | `3` | 不带 `--sessions=N` 时默认回看最近几个会话（上限 20） |
 | `sleepMaxBackfill` | `20` | 一次 `/sleep --apply` 最多补录几条（只补你明确要求记住的内容） |
+| `refsEnabled` | `true` | 是否为每条记忆记下来源（会话 + 事件序号区间）；表单里 `0`=关、`1`=开。关掉只影响新记录 |
+| `refsMax` | `5` | 每条记录最多保留几个来源引用（新的在前）；`0` = 不保留，`Infinity` = 不限 |
 
 只能通过 patch 行设置的进阶旋钮（含默认值）：自画像条数 `selfPortraitMaxItems` 12 /
 `selfPortraitMaxSelfObserved` 4；捕获调优 `capturePerHour` 20、`captureMinConfidence` 0.6、
