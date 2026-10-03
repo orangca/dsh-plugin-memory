@@ -237,6 +237,40 @@ terminal stays Chinese. `language` is `'zh'` (default) or `'en'`.
 - **The switch is visible.** `/memory stats` prints the effective `language` (that line, like every other command
   output, stays Chinese) — useful when asking "why is the model still reading Chinese?".
 
+## Branch-aware project memory (`branch`): feature-branch decisions stay on their branch
+
+A memory can carry a **branch tag**, and injection/recall then filter by the branch you are actually on. A convention
+that holds only on `feat/x` should not keep steering the model after you switch back to `main`.
+
+| Memory | Current branch matches | Current branch differs | Branch unknown (not a git repo / `.git/HEAD` unreadable) |
+|---|---|---|---|
+| **No branch tag** (default) | injected | injected | injected |
+| **Has a branch tag** (explicit) | injected | **not injected** | **not injected** (fail-closed) |
+
+- **Fail-closed on purpose.** Injecting a feature-branch-only convention on `main` makes the model reason from a false
+  premise, while missing one branch-specific memory is merely one less reference. The two mistakes are not symmetric,
+  so we pick the safer one. **This rule only ever touches tagged rows**: an untagged row is injected in every case.
+- **Only an explicit tag tags a row.** The model may pass `branch: true` (use the current branch) or
+  `branch: '<name>'` to `memory_write`; rule capture, `/sleep` backfill and import **never** tag — most project
+  memories hold across branches. If `branch: true` is passed while the branch is unknown, the row is stored untagged
+  and the tool result says so, rather than guessing a name.
+- **`branch` participates in `recordHash`**: it changes a row's *scope of applicability*, not just its provenance, so
+  "the general build convention" and "the temporary convention that holds only on `feat/x`" are two rows even when the
+  text is identical. (Unlike `refs`, which is provenance evidence and stays out of the fingerprint.)
+- Names are normalized: trimmed, a leading `refs/heads/` is dropped and the name is capped at 100 characters; an
+  illegal name (empty or containing control characters) is treated as **no tag**.
+- **Visible and debuggable.** `/memory branch` prints the current branch, how many tagged rows exist and the groups;
+  `/memory branch --all` also lists rows tagged for other branches. `/memory stats` and `memory_stats` carry a
+  `分支：…（branchAware=…）` line, and `memory_explain` shows a row that branch filtering blocked and why.
+- **Zero shell.** The plugin only reads `.git/HEAD` (and a `.git` *file*'s `gitdir:` pointer for
+  worktrees/submodules), with a short 5-second cache. It **never runs a git command**; anything it cannot read is
+  simply "branch unknown".
+- **The default is a no-op.** `branchAware` defaults to `true`, but no existing row is tagged, so resident injection,
+  per-turn recall, listing and search are **byte-for-byte identical** to 0.5.12. Turning `branchAware` off ignores
+  tags altogether: every row is injected again.
+
+`branchAware` (default `true`) appears in the settings form as a `0` / `1` toggle.
+
 ## Guarding against memory pollution / self-reinforcement
 
 - Capture reads **real user messages only** — the plugin's own injected context does not count.
@@ -294,9 +328,9 @@ Add this package to the profile's `dependencies`, append `dsh-plugin-memory` to
 
 ## The settings form
 
-The plugin exports a schemastery `Config` whose **28 fields** are declared `volatile()` (hot-applied when edited);
+The plugin exports a schemastery `Config` whose **29 fields** are declared `volatile()` (hot-applied when edited);
 everything else is patch-row only. It ships a small browser half (`src/client.ts`, built to `lib/client.js`) that
-renders those 28 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
+renders those 29 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
 also shows a one-line summary).
 
 Under the hood the client half registers into the keyed `plugins.row.config` slot with
@@ -309,6 +343,7 @@ whole Config through the settings service and persists it into the profile patch
 /memory list [--kind=agent_self] [--archived]   list memories (--archived includes archived rows)
 /memory search <keywords>                        lexical search (includes archived, never invalid)
 /memory show <id prefix>                         full record with origin and timeline
+/memory branch [--all]                           current branch, tagged-row count and groups (--all adds other branches)
 /memory forget <id prefix>                       permanently delete one memory
 /memory restore <id prefix>                      revive an invalid/archived row (and undo its superseders)
 /memory pin <id prefix>                          pin (never decays, never auto-archives)
@@ -338,7 +373,7 @@ whole Config through the settings service and persists it into the profile patch
 
 | Tool | Purpose |
 |---|---|
-| `memory_write` | Structured write (`kind` + `text`, optional `subject` / `field` / `value` / `scopeLevel`; with `kind='agent_self'` also an optional `facet: 'persona' \| 'work'`). **The origin is decided by the plugin — the model cannot claim "the user asked for this"** |
+| `memory_write` | Structured write (`kind` + `text`, optional `subject` / `field` / `value` / `scopeLevel`; with `kind='agent_self'` also an optional `facet: 'persona' \| 'work'`; and an optional `branch`: `true` = the current git branch, a string = that branch, omitted = no tag, which applies on every branch). **The origin is decided by the plugin — the model cannot claim "the user asked for this"** |
 | `memory_recall` | Search by query / kind / scope / tag |
 | `memory_list` | List in deterministic order |
 | `memory_forget` | Delete by id; deleting by query needs `confirm: true` (stricter preview threshold) |
@@ -348,7 +383,7 @@ whole Config through the settings service and persists it into the profile patch
 
 ## Configuration
 
-Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 28 fields exposed in
+Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 29 fields exposed in
 the settings form:
 
 | Field | Default | Meaning |
@@ -381,6 +416,7 @@ the settings form:
 | `writePolicy` | `auto` | Approval gate for model-origin writes: `auto` (apply immediately, default) / `ask` (queue for confirmation) / `off` (reject outright); rule capture, user commands and `/sleep` are never gated |
 | `pendingMax` | `50` | Cap for the pending queue; when full a new write is rejected with a structured error, never silently dropped; `0` = unlimited |
 | `language` | `zh` | Language of the **model-visible** text (`zh` / `en`): injection blocks and their headers/footers, injection prompts, the per-turn recall block and the tool descriptions. Command output stays Chinese either way; the default `zh` is byte-for-byte identical to 0.5.10 |
+| `branchAware` | `true` | Filter branch-tagged rows by the current git branch; in the form `0` = off, `1` = on. Off ignores tags entirely; the default `true` is byte-for-byte identical to 0.5.12 because no existing row is tagged |
 
 Additional knobs available only through the patch row (with their defaults): `maxItemTokens` neighbours such as
 `selfPortraitMaxItems` 12 / `selfPortraitMaxSelfObserved` 4, capture tuning (`capturePerHour` 20,

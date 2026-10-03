@@ -60,6 +60,11 @@ export interface MemoryRecord {
     pinned: boolean;
     status: MemoryStatus;
     invalidAt: number | null;
+    /**
+     * M12：分支标签。`null`/缺失 = 跨分支成立（默认）；字符串 = 只在该 git 分支适用。
+     * **要参与 `recordHash`** —— 它改变的是适用范围（不只是来源）。
+     */
+    branch?: string | null;
     supersedes: string[];
     /** 仅 `agent_self` 使用；缺失时按 `'work'` 处理（0.5.x 的存量条目都是工作约定）。 */
     facet?: SelfFacet;
@@ -189,6 +194,8 @@ export interface MemoryConfig {
     pendingMax: number;
     /** M11：模型可见文本的语言（`zh` 默认；命令输出仍为中文）。 */
     language: Language;
+    /** M12：是否按 git 分支过滤带 `branch` 标签的记录（默认 true，但无标签记录行为不变）。 */
+    branchAware: boolean;
     gistBudgetRatio: number;
     charsPerToken: number;
     sectionOrder: number;

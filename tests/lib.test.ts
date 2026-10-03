@@ -17,6 +17,7 @@ import type {
   MemoryScope,
   ModelWriteDecision,
   PortraitCandidate,
+  RecordHashInput,
   ReflectInput,
   SelfFacet,
   SleepCandidate,
@@ -26,6 +27,7 @@ import type {
 } from '../lib/lib.js'
 
 import {
+  BRANCH_MAX_CHARS,
   DEFAULTS,
   EXPLICIT_SIGNAL_RE,
   PERSONA_FOOTER,
@@ -34,6 +36,8 @@ import {
   WORK_CONFIRMED_HEADER,
   WORK_OBSERVED_FOOTER,
   WORK_OBSERVED_HEADER,
+  branchFromHeadContent,
+  branchOf,
   buildSleepPlan,
   clampText,
   clearTokenCache,
@@ -51,9 +55,11 @@ import {
   facetOf,
   findConflicts,
   fnv1a,
+  formatBranchSummary,
   formatPendingQueue,
   formatRefs,
   formatSleepPlan,
+  isBranchVisible,
   isEcho,
   isSelfPortraitEligible,
   INTRO_NOTICE,
@@ -66,6 +72,7 @@ import {
   memoryMatch,
   NAMING_SUBJECTS,
   namingSettled,
+  normalizeBranch,
   normalizeFacet,
   normalizeLanguage,
   normalizeRefs,
@@ -2292,4 +2299,244 @@ test('M11 回归：英文默认预算下人格与工作两节都必须有内容�
   assert.ok(personaRoom >= 25, `英文人格小节内容空间 ${personaRoom} token 过小`)
   assert.ok(workRoom >= 40, `英文工作小节内容空间 ${workRoom} token 过小`)
   // 中文不受余量影响：同样的条目在 zh 下的渲染结果与「不加余量」一致（逐字节回归由上一例覆盖）
+})
+
+// ---------------------------------------------------------------------------
+// M12：git 分支感知（契约 docs/branch.md §2/§3/§5）
+//
+// 这一节钉住三件最容易做错的事：
+//  1. `recordHash` **只在该记录确实有非空 branch 时**才追加一段 —— 否则 0.5.12 的存量记录
+//     指纹会集体改变，去重、`/sleep` 补录幂等、`memory_write` 幂等同时失效（有固定算例）；
+//  2. 非法/缺失标签一律回落 `null` ＝ 跨分支成立，绝不写 "unknown" 之类的假标签；
+//  3. fail-closed 只针对**带标签**的记录：无标签记录在分支未知时也照常注入。
+// ---------------------------------------------------------------------------
+
+/** 分支感知配置（默认 `branchAware: true`）。 */
+function branchCfg(patch: Partial<MemoryConfig> = {}): MemoryConfig {
+  return { ...DEFAULTS, ...patch }
+}
+
+test('DEFAULTS：M12 新增 branchAware，默认 true（契约 §2.1）', () => {
+  assert.equal(DEFAULTS.branchAware, true, '默认开启分支感知，但无标签记录行为不变')
+})
+
+test('branchFromHeadContent：普通分支与带斜杠分支（契约 §3）', () => {
+  assert.equal(branchFromHeadContent('ref: refs/heads/main\n'), 'main')
+  assert.equal(branchFromHeadContent('ref: refs/heads/feat/x'), 'feat/x', '带斜杠的分支名要保留')
+  assert.equal(branchFromHeadContent('ref: refs/heads/feat/x\r\n'), 'feat/x')
+  assert.equal(branchFromHeadContent('ref: refs/heads/release/v0.5.13'), 'release/v0.5.13')
+  assert.equal(branchFromHeadContent('  ref: refs/heads/main  \n'), 'main', '容忍首尾空白')
+})
+
+test('branchFromHeadContent：分离头指针 → 短 sha（前 8 位），长度不对即未知（契约 §3）', () => {
+  const sha1 = '0123456789abcdef0123456789abcdef01234567'
+  assert.equal(branchFromHeadContent(sha1), '01234567')
+  assert.equal(branchFromHeadContent(`${sha1}\n`), '01234567')
+  assert.equal(branchFromHeadContent('F'.repeat(64)), 'FFFFFFFF', 'sha-256 分离头指针同样是短 sha')
+  assert.equal(branchFromHeadContent('a'.repeat(39)), null, '39 位不是合法 commit id')
+  assert.equal(branchFromHeadContent(`${sha1}0`), null, '41 位不是合法 commit id')
+  assert.equal(branchFromHeadContent('z'.repeat(40)), null, '非十六进制字符不算 commit id')
+})
+
+test('branchFromHeadContent：gitdir（.git 是文件）与垃圾/空/非字符串 → null（契约 §3）', () => {
+  assert.equal(branchFromHeadContent('gitdir: ../.git/worktrees/wt1'), null)
+  assert.equal(branchFromHeadContent('GITDIR: C:/repo/.git/modules/sub'), null)
+  assert.equal(branchFromHeadContent('gitdir: C:/repo/.git/modules/sub'), null)
+  assert.equal(branchFromHeadContent('ref: refs/tags/v0.5.13'), null, 'tag 不是分支')
+  assert.equal(branchFromHeadContent('ref: refs/remotes/origin/main'), null, '远程跟踪分支不是当前分支')
+  assert.equal(branchFromHeadContent('ref: refs/heads/'), null, '前缀后为空 → 未知')
+  assert.equal(branchFromHeadContent('ref: '), null)
+  assert.equal(branchFromHeadContent('nonsense'), null)
+  assert.equal(branchFromHeadContent(''), null)
+  assert.equal(branchFromHeadContent('   \n\t '), null)
+  for (const bad of [null, undefined, 42, 0, true, false, {}, [], Number.NaN]) {
+    assert.equal(branchFromHeadContent(bad), null, `${String(bad)} 应为分支未知`)
+  }
+})
+
+test('normalizeBranch：trim / 去 refs/heads/ 前缀 / 超长截断到 100（契约 §2/§3）', () => {
+  assert.equal(BRANCH_MAX_CHARS, 100, '长度上限是契约里的 100')
+  assert.equal(normalizeBranch('main'), 'main')
+  assert.equal(normalizeBranch('  main  '), 'main')
+  assert.equal(normalizeBranch('main\n'), 'main')
+  assert.equal(normalizeBranch('refs/heads/main'), 'main')
+  assert.equal(normalizeBranch('refs/heads/feat/x'), 'feat/x')
+  assert.equal(normalizeBranch('  refs/heads/feat/x \n'), 'feat/x')
+  assert.equal(normalizeBranch('refs/tags/v1'), 'refs/tags/v1', '只脱 refs/heads/ 一层（通用规范化器）')
+  assert.equal(normalizeBranch('c'.repeat(100)), 'c'.repeat(100), '恰好 100 不截断')
+  const overlong = normalizeBranch('b'.repeat(150))
+  assert.equal(overlong, 'b'.repeat(100), '超长截断到 100')
+  assert.equal(overlong?.length, 100)
+})
+
+test('normalizeBranch：空/控制字符/非字符串 → null（契约 §2/§3）', () => {
+  assert.equal(normalizeBranch('refs/heads/'), null, '前缀后为空 → 无标签')
+  assert.equal(normalizeBranch('ma\nin'), null, '内部换行是控制字符 → 无标签')
+  assert.equal(normalizeBranch('main\u0000'), null)
+  assert.equal(normalizeBranch('main\u001b[31m'), null, 'ANSI 转义序列非法')
+  assert.equal(normalizeBranch('main\u007f'), null)
+  assert.equal(normalizeBranch(`${'d'.repeat(120)}\u0000`), null, '控制字符在任何位置都非法（截断不会把它切掉）')
+  for (const bad of [undefined, null, '', '   ', '\n', '\t', 42, 0, true, false, {}, [], Number.NaN, Symbol('b')]) {
+    assert.equal(normalizeBranch(bad), null, `${String(bad)} 应为无标签`)
+  }
+})
+
+test('branchOf：容错读取记录的分支标签（契约 §3）', () => {
+  assert.equal(branchOf(makeRecord({ kind: 'user_profile', text: 'x', branch: 'feat/x' })), 'feat/x')
+  assert.equal(branchOf(makeRecord({ kind: 'user_profile', text: 'x', branch: 'refs/heads/main' })), 'main', '读取时同样规范化')
+  assert.equal(branchOf(makeRecord({ kind: 'user_profile', text: 'x' })), null, '缺失 → 跨分支')
+  assert.equal(branchOf(makeRecord({ kind: 'user_profile', text: 'x', branch: null })), null)
+  assert.equal(branchOf(makeRecord({ kind: 'user_profile', text: 'x', branch: '   ' })), null)
+  assert.equal(branchOf(makeRecord({ kind: 'user_profile', text: 'x', branch: 'ma\nin' })), null)
+  assert.equal(branchOf(null), null)
+  assert.equal(branchOf(undefined), null)
+})
+
+test('makeRecord：透传 branch；缺失时不写键，保持存量形状（契约 §3/§5）', () => {
+  const legacy = makeRecord({ kind: 'user_profile', text: '通用约定' })
+  assert.equal('branch' in legacy, false, '缺失 branch 时不得写键（否则存量形状改变）')
+  assert.equal(legacy.branch, undefined)
+
+  assert.equal(makeRecord({ kind: 'user_profile', text: 'x', branch: 'feat/x' }).branch, 'feat/x')
+  assert.equal(makeRecord({ kind: 'user_profile', text: 'x', branch: 'refs/heads/watch' }).branch, 'watch')
+  // 非法标签 → null ＝ 跨分支（宁可通用化，也绝不写 "unknown" 之类的假标签）
+  assert.equal(makeRecord({ kind: 'user_profile', text: 'x', branch: '   ' }).branch, null)
+  assert.equal(makeRecord({ kind: 'user_profile', text: 'x', branch: 'ma\nin' }).branch, null)
+})
+
+test('recordHash：无标签记录的指纹与 0.5.12 逐字节相同（固定算例，契约 §2/§5）', () => {
+  const base: RecordHashInput = {
+    kind: 'user_profile',
+    scope: { level: 'profile', key: '*' },
+    subject: 'lang',
+    text: '偏好中文。',
+  }
+  // 0.5.12 的实现：fnv1a([kind, scope.level, scope.key, subject, normalizeText(text)].join('|'))
+  const legacy = fnv1a(['user_profile', 'profile', '*', 'lang', normalizeText('偏好中文。')].join('|'))
+  assert.equal(legacy, '1e6njv7', '固定算例：存量记录的指纹值（改动不得动摇它）')
+  assert.equal(recordHash(base), '1e6njv7', '没有 branch 时指纹必须与改动前完全相同')
+  assert.equal(recordHash({ ...base, branch: null }), '1e6njv7', 'branch: null ＝ 无标签，指纹不变')
+  assert.equal(recordHash({ ...base, branch: '' }), '1e6njv7', '空标签 ＝ 无标签，指纹不变')
+  assert.equal(recordHash({ ...base, branch: '   ' }), '1e6njv7', '非法标签 ＝ 无标签，指纹不变')
+  assert.equal(
+    makeRecord({
+      id: 'm_legacy',
+      kind: 'user_profile',
+      scope: { level: 'profile', key: '*' },
+      subject: 'lang',
+      text: '偏好中文。',
+      observedAt: 0,
+    }).hash,
+    '1e6njv7',
+    'makeRecord 与 recordHash 同口径',
+  )
+})
+
+test('recordHash：branch 参与指纹（同文本不同分支 → 不同 hash，契约 §2）', () => {
+  const base: RecordHashInput = {
+    kind: 'semantic',
+    scope: { level: 'workspace', key: 'k1' },
+    subject: 'build.cmd',
+    text: 'pnpm build',
+  }
+  const text = normalizeText('pnpm build')
+  const untagged = recordHash(base)
+  const main = recordHash({ ...base, branch: 'main' })
+  const feat = recordHash({ ...base, branch: 'feat/x' })
+
+  assert.notEqual(main, untagged, '带标签与不带标签是两条记录（适用范围不同）')
+  assert.notEqual(main, feat, '不同分支是两条记录')
+  assert.notEqual(feat, untagged)
+  // 标签先规范化再入指纹：'refs/heads/main' / ' main ' 与 'main' 同一条
+  assert.equal(recordHash({ ...base, branch: 'refs/heads/main' }), main)
+  assert.equal(recordHash({ ...base, branch: ' main ' }), main)
+  // 追加位置在末尾（固定算例钉住拼接形状）
+  assert.equal(main, fnv1a(['semantic', 'workspace', 'k1', 'build.cmd', text, 'main'].join('|')))
+})
+
+test('isBranchVisible：2×3 矩阵（有/无标签 × 匹配/不匹配/未知）+ branchAware:false（契约 §1/§3）', () => {
+  const on = branchCfg()
+  const untagged = makeRecord({ kind: 'user_profile', text: '跨分支成立的通用约定' })
+  const tagged = makeRecord({ kind: 'semantic', text: '只在 feat/x 成立', branch: 'feat/x' })
+
+  // 无标签：任何分支状态下都照常注入（含分支未知）
+  assert.equal(isBranchVisible(untagged, 'feat/x', on), true)
+  assert.equal(isBranchVisible(untagged, 'main', on), true)
+  assert.equal(isBranchVisible(untagged, null, on), true)
+  assert.equal(isBranchVisible(untagged, '', on), true)
+  // 有标签：当前分支非空且相等才可见
+  assert.equal(isBranchVisible(tagged, 'feat/x', on), true)
+  assert.equal(isBranchVisible(tagged, 'main', on), false)
+  assert.equal(isBranchVisible(tagged, 'feat', on), false)
+  assert.equal(isBranchVisible(tagged, null, on), false, '分支未知 → fail-closed（带标签的记录挡下）')
+  assert.equal(isBranchVisible(tagged, '', on), false)
+  assert.equal(isBranchVisible(tagged, 'refs/heads/feat/x', on), true, '当前分支同样先规范化')
+  assert.equal(isBranchVisible(tagged, ' feat/x ', on), true)
+
+  // branchAware:false → 忽略标签，一律注入
+  const off = branchCfg({ branchAware: false })
+  assert.equal(isBranchVisible(tagged, 'main', off), true)
+  assert.equal(isBranchVisible(tagged, null, off), true)
+  assert.equal(isBranchVisible(untagged, null, off), true)
+
+  // 容错：null/undefined 记录视为无标签
+  assert.equal(isBranchVisible(null, 'main', on), true)
+  assert.equal(isBranchVisible(undefined, null, on), true)
+})
+
+test('formatBranchSummary：当前分支/条数/分组清单，任何情况下都不得空白（契约 §3/§4）', () => {
+  // 无仓库：当前分支不明说 unknown，且给出「没有任何分支专属记忆」
+  const empty = formatBranchSummary([], null)
+  assert.ok(empty.length > 0, '空输入也必须给出文字，而不是空白')
+  assert.match(empty, /当前分支：unknown/u)
+  assert.match(empty, /没有任何分支专属记忆/u)
+
+  const records = [
+    makeRecord({ kind: 'user_profile', text: '跨分支成立的通用约定' }),
+    makeRecord({ kind: 'semantic', text: '主干上的构建约定', branch: 'main' }),
+    makeRecord({ kind: 'semantic', subject: 'build.test', text: '主干上的测试约定', branch: 'main' }),
+    makeRecord({ kind: 'procedural', text: '特性分支上的临时约定', branch: 'feat/x' }),
+  ]
+
+  const onMain = formatBranchSummary(records, 'main')
+  assert.match(onMain, /当前分支：main/u)
+  assert.match(onMain, /带分支标签的记忆：3 条（库内共 4 条）/u)
+  assert.match(onMain, /按分支分组/u)
+  assert.match(onMain, /^ {2}- main：2 条（当前分支）$/mu)
+  assert.match(onMain, /^ {2}- feat\/x：1 条$/mu)
+  assert.equal(onMain.includes('fail-closed'), false, '分支已知时无需提示 fail-closed')
+
+  // 当前分支未知：明说 unknown、仍列清单、不标「当前分支」、并说明带标签记录此刻不注入
+  const unknown = formatBranchSummary(records, null)
+  assert.match(unknown, /当前分支：unknown/u)
+  assert.match(unknown, /^ {2}- main：2 条$/mu)
+  assert.equal(unknown.includes('（当前分支）'), false)
+  assert.match(unknown, /fail-closed/u)
+
+  // 只有无标签记录：给出「没有任何分支专属记忆」而不是空白
+  const noTag = formatBranchSummary([records[0]!], 'main')
+  assert.match(noTag, /带分支标签的记忆：0 条（库内共 1 条）/u)
+  assert.match(noTag, /没有任何分支专属记忆/u)
+  // 非法当前分支名按未知处理（不写假分支名）
+  assert.match(formatBranchSummary(records, '   '), /当前分支：unknown/u)
+})
+
+test('branchAware 默认 true 且库内无标签：行为与改动前逐字节相同（契约 §5）', () => {
+  assert.equal(DEFAULTS.branchAware, true)
+  const workspaceKey = workspaceKeyOf('C:/proj/a')!
+  const records = [
+    makeRecord({ id: 'f1', kind: 'user_profile', text: '偏好中文。', importance: 0.9, observedAt: 10 }),
+    makeRecord({ id: 'g1', kind: 'project_gist', text: '这个工作区涉及 pnpm。', scope: { level: 'workspace', key: workspaceKey }, observedAt: 20 }),
+  ]
+  // 无标签记录一条都不能被挡（分支已知 / 未知 / 分支感知关闭 都一样）
+  for (const current of ['main', 'feat/x', null, ''] as const) {
+    const visible = records.filter((record) => isBranchVisible(record, current, { ...DEFAULTS }))
+    assert.deepEqual(visible.map((record) => record.id), ['f1', 'g1'], `currentBranch=${String(current)} 时无标签记录必须全部可见`)
+  }
+  // 常驻渲染逐字节不变：过滤后的集合与过滤前渲染结果完全相同
+  const visible = records.filter((record) => isBranchVisible(record, 'main', { ...DEFAULTS }))
+  assert.equal(
+    renderContextBlock(visible, { ...DEFAULTS }, workspaceKey).text,
+    renderContextBlock(records, { ...DEFAULTS }, workspaceKey).text,
+  )
 })

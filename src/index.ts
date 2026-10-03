@@ -12,7 +12,7 @@
 // 只 inject 确定存在的服务；所有渲染/工具路径不得抛异常影响主流程。
 
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 import type {
   DshAgent,
@@ -38,6 +38,8 @@ import type {
 } from './types.js'
 import {
   DEFAULTS,
+  branchFromHeadContent,
+  branchOf,
   buildSleepPlan,
   clampText,
   composeGistText,
@@ -55,11 +57,13 @@ import {
   fillWithinBudget,
   findConflicts,
   fnv1a,
+  formatBranchSummary,
   formatRefs,
   formatSleepPlan,
   decideModelWrite,
   formatPendingQueue,
   isEcho,
+  isBranchVisible,
   isExcluded,
   isUserSideOrigin,
   listActive,
@@ -67,6 +71,7 @@ import {
   makeRecord,
   maskPii,
   normalizeFacet,
+  normalizeBranch,
   normalizeLanguage,
   normalizeText,
   normalizeWritePolicy,
@@ -190,6 +195,11 @@ interface MemoryWriteArgs {
   pinned?: boolean
   /** 仅 `kind === 'agent_self'` 有意义：'persona' | 'work'，缺省按 'work'（存量兼容）。 */
   facet?: string
+  /**
+   * M12（契约 docs/branch.md §4.3）：可选的分支标签。
+   * `true` = 当前分支；字符串 = 指定分支；缺省 = 不打标签（跨分支成立）。
+   */
+  branch?: boolean | string
 }
 
 interface MemoryRecallArgs {
@@ -577,6 +587,12 @@ interface WriteMemoryInput {
   refVia?: MemoryRef['via']
   /** M9：调用方**直接给出**的引用（`/sleep` 补录透传候选自带 refs）：优先于 `refVia` 推导。 */
   refs?: MemoryRef[]
+  /**
+   * M12：要写入的分支标签（契约 §4.3）。`undefined` = **不打标签**（保持存量记录形状：
+   * `makeRecord` 只在 `input.branch !== undefined` 时才写这个键）。
+   * 规则捕获 / `/sleep` 补录 / 导入一律不传它 —— 那三条路径保持 0.5.12 的行为。
+   */
+  branch?: string
 }
 
 /** `writeMemory` 的返回：工具与命令共用（成功带 status，失败带 error）。 */
@@ -603,6 +619,8 @@ type CommandHandler = (args: string[]) => DshCommandResult | Promise<DshCommandR
 
 interface MemoryCommandHandlers extends Record<string, CommandHandler> {
   list(args: string[]): DshCommandResult
+  /** M12：分支视图（`/memory branch [--all]`，只读）。 */
+  branch(args: string[]): DshCommandResult
   show(args: string[]): DshCommandResult
   /** M9：核对引用的只读命令（`/memory verify <id>`）。 */
   verify(args: string[]): Promise<DshCommandResult>
@@ -662,6 +680,48 @@ function errorText(error: unknown): string {
   return String(message ?? error)
 }
 
+// ---------------------------------------------------------------- M12：git 目录 / 当前分支（零 shell）
+//
+// 契约 docs/branch.md §4.1：只读 `.git`（目录或 `gitdir:` 文件）与 `<gitdir>/HEAD`，
+// **绝不执行 git 命令**；任何失败（不是仓库、读不到、权限、路径不存在）一律当「分支未知」→ `null`，不抛。
+// 两个函数放在模块层：它们不依赖 ctx / state / cfg，纯粹是「哪儿是 git 目录」的解析。
+
+/** `.git` 是文件时（worktree / submodule）里面那一行 `gitdir: <path>`。 */
+const GITDIR_LINE_RE = /^\s*gitdir:\s*(.+?)\s*$/imu
+
+/**
+ * 解析 cwd 对应的 git 目录（契约 §4.1）：
+ *   · `<cwd>/.git` 是目录 → 直接用它；
+ *   · 是文件 → 读 `gitdir: <path>`，相对路径**相对 cwd** 解析；
+ *   · 都没有 / 读失败 → `null`（不是仓库）。
+ */
+function resolveGitDir(cwd: string | null | undefined): string | null {
+  if (typeof cwd !== 'string' || cwd.length === 0) return null
+  try {
+    const dotGit = join(cwd, '.git')
+    const stat = statSync(dotGit)
+    if (stat.isDirectory()) return dotGit
+    if (!stat.isFile()) return null
+    const match = GITDIR_LINE_RE.exec(readFileSync(dotGit, 'utf8'))
+    const raw = match?.[1]?.trim() ?? ''
+    if (raw.length === 0) return null
+    return isAbsolute(raw) ? raw : resolve(cwd, raw)
+  } catch {
+    return null
+  }
+}
+
+/** 从 `<gitdir>/HEAD` 读当前分支（契约 §4.1）；目录不可解析或读失败 → `null`。 */
+function readBranchFromCwd(cwd: string | null | undefined): string | null {
+  const gitDir = resolveGitDir(cwd)
+  if (gitDir === null) return null
+  try {
+    return branchFromHeadContent(readFileSync(join(gitDir, 'HEAD'), 'utf8'))
+  } catch {
+    return null
+  }
+}
+
 export const name = 'dsh-memory'
 
 // compaction 在本 profile 不可达（spike 实测），故不 inject；M3 走 session/event 的 compaction/summary。
@@ -710,6 +770,9 @@ function buildConfig(useVolatile: boolean): ReturnType<SchemaFactory['object']> 
     // 两个键都进设置页表单（与 src/client.ts 的字段一一对应：volatile 集合 +2）。
     refsEnabled: field(Schema!.boolean().default(true)),
     refsMax: field(Schema!.number().default(5)),
+    // M12：git 分支感知（契约 docs/branch.md §2.1）—— 默认 true，但存量记录都没有标签，
+    // 因此开箱行为与 0.5.12 逐字节相同（有测试）。标 volatile：用户要能在设置页里关掉它。
+    branchAware: field(Schema!.boolean().default(true)),
     recallMode: field(Schema!.union(['off', 'dry', 'inject']).default('inject')),
     recallTopK: field(Schema!.number().default(8)),
     captureMode: field(Schema!.union(['off', 'rule']).default('rule')),
@@ -814,6 +877,8 @@ interface ToolTexts {
   writeTextParam: string
   writeSubjectParam: string
   writeFacetParam: string
+  /** M12：`memory_write.branch` 的参数说明（契约 §4.3）。 */
+  writeBranchParam: string
   recallDescription: string
   listDescription: string
   forgetDescription: string
@@ -830,6 +895,7 @@ const TOOL_TEXTS: Record<Language, ToolTexts> = Object.freeze({
     writeTextParam: '单句、面向模型可读的记忆内容',
     writeSubjectParam: '归一化主题键，用于去重与冲突判定，例如 editor.theme',
     writeFacetParam: '仅 kind=agent_self 有意义：自画像面（persona=人格/表达，work=工作倾向），缺省 work。',
+    writeBranchParam: '可选分支标签：true = 记在当前 git 分支；字符串 = 指定分支；缺省不打标签（跨分支成立）。只在某分支成立的临时约定才需要它。',
     recallDescription: '按查询或过滤条件检索长期记忆，返回带来源与重要度的条目。',
     listDescription: '列出长期记忆（不做相关性打分，按确定性顺序）。',
     forgetDescription: '删除长期记忆。给 id 前缀直接删；给 query 时默认只预览命中，需要 confirm=true 才真正删除。',
@@ -844,6 +910,7 @@ const TOOL_TEXTS: Record<Language, ToolTexts> = Object.freeze({
     writeTextParam: 'A single sentence of model-readable memory text',
     writeSubjectParam: 'Normalized topic key used for dedup and conflict checks, for example editor.theme',
     writeFacetParam: 'Only meaningful for kind=agent_self: the self-portrait facet (persona=personality/expression, work=working style); defaults to work.',
+    writeBranchParam: 'Optional branch tag: true = the current git branch; a string = that branch; omit for no tag (applies to every branch). Use it only for conventions that hold on one branch alone.',
     recallDescription: 'Search long-term memory by query or filters; returns items with their source and importance.',
     listDescription: 'List long-term memory (no relevance scoring, deterministic order).',
     forgetDescription: 'Delete long-term memory. With an id prefix it deletes directly; with a query it only previews matches unless confirm=true.',
@@ -1202,6 +1269,128 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     lastError: state.refs.lastError,
     withoutRefs: [...state.records.values()].filter((record) => refsOf(record).length === 0).length,
   })
+
+  // ---------------- M12：git 分支感知（契约 docs/branch.md §4） ----------------
+  //
+  // 宿主侧只做三件事：解析当前分支（零 shell、5 秒 TTL 缓存）、在**取记录集合的那一处**统一过滤、
+  // 以及把「当前分支是什么」暴露给用户（`/memory branch`、stats 行、`memory_explain`）。
+  // 过滤只影响带标签的记录（fail-closed）：无标签记录在任何情况下都照常注入（§5）。
+
+  /** 分支缓存的短 TTL（契约 §4.1）：避免每个 step 都读盘，同时不至于切分支后长时间失准。 */
+  const BRANCH_TTL_MS = 5000
+
+  /**
+   * 解析分支用的 cwd：既有来源优先（`state.lastSession.cwd`，由 `session/event` 维护），
+   * 缺席时回落到调用点给的装配上下文（pre-step / 工具 exec 的 `header.cwd`，契约 §4.1）。
+   */
+  const currentCwd = (fallback?: string | null): string | null => {
+    const fromState = state.lastSession?.cwd
+    if (typeof fromState === 'string' && fromState.length > 0) return fromState
+    return typeof fallback === 'string' && fallback.length > 0 ? fallback : null
+  }
+
+  /** 单条缓存：cwd 变化即失效（不同 cwd 必须重新解析，否则切项目会读到上一个仓库的分支）。 */
+  let branchCache: { at: number; cwd: string | null; value: string | null } | null = null
+
+  /** 当前 git 分支（契约 §4.1）：读 `<gitdir>/HEAD`；任何失败 → `null`，绝不抛。 */
+  const currentBranch = (cwdHint?: string | null): string | null => {
+    const cwd = currentCwd(cwdHint)
+    const now = Date.now()
+    if (branchCache && branchCache.cwd === cwd && now - branchCache.at < BRANCH_TTL_MS) return branchCache.value
+    let value: string | null = null
+    try {
+      value = readBranchFromCwd(cwd)
+    } catch {
+      value = null
+    }
+    branchCache = { at: now, cwd, value }
+    return value
+  }
+
+  /**
+   * **统一过滤点**（契约 §4.2）：所有「读记录集合」的路径都经这里，避免逐个补过滤漏点。
+   * 返回数组（调用方原本就要遍历/排序）；`branchAware === false` 时原样返回全部记录。
+   */
+  const branchVisible = (records: Iterable<MemoryRecord>, cwdHint?: string | null): MemoryRecord[] => {
+    const list = [...records]
+    if (cfg.branchAware === false) return list
+    const current = currentBranch(cwdHint)
+    return list.filter((record) => isBranchVisible(record, current, cfg))
+  }
+
+  /** 库内带标签的条数（不区分状态：`/memory branch` 与 stats 都要说清「标签有多少」）。 */
+  const taggedCount = (): number => [...state.records.values()].filter((record) => branchOf(record) !== null).length
+
+  /**
+   * `memory_explain` 的分支诊断（契约 §5「诊断可见」）：
+   * 必须能看到「这条因为分支不匹配被挡下了」——否则用户无法排查「我的记忆去哪了」。
+   * 这里用**未过滤**的库集合，与所有注入路径的 `branchVisible` 形成显式对照。
+   */
+  const branchDiagnostics = (): Record<string, unknown> => {
+    const aware = cfg.branchAware !== false
+    try {
+      const current = currentBranch()
+      const blocked = aware
+        ? [...state.records.values()].filter((record) => !isBranchVisible(record, current, cfg))
+        : []
+      return {
+        current: current ?? null,
+        branchAware: aware,
+        blockedCount: blocked.length,
+        reason: blocked.length > 0
+          ? `以下 ${blocked.length} 条带分支标签的记忆与当前分支（${current ?? 'unknown'}）不匹配：`
+            + '不进常驻块 / 召回 / 列表（fail-closed；无标签的记录不受影响）。'
+          : null,
+        blocked: blocked.map((record) => ({
+          id: record.id,
+          kind: record.kind,
+          status: record.status,
+          branch: branchOf(record),
+          text: record.text,
+        })),
+      }
+    } catch (error) {
+      return { current: null, branchAware: aware, blockedCount: 0, reason: null, blocked: [], error: errorText(error) }
+    }
+  }
+
+  /**
+   * 把 `memory_write` 的 `branch` 参数收敛成要写的标签（契约 §4.3/§5）。
+   *
+   * 三条硬约束：
+   *   · `true` 而当前分支未知 → **不打标签**，并给一句说明（宁可通用化，也不要瞎标）；
+   *   · 非法字符串（空/控制字符）→ 不打标签并说明；
+   *   · `branchAware === false` → 一律不打标签（§5「不打错标签」：关了过滤还写标签，
+   *     用户之后一开就会静默丢记忆）。
+   */
+  const writeBranchOf = (arg: unknown, cwdHint: string | null): { branch: string | null; notice: string | null } => {
+    if (arg === undefined || arg === null || arg === false) return { branch: null, notice: null }
+    if (cfg.branchAware === false) {
+      return {
+        branch: null,
+        notice: 'branchAware=false：本次未写分支标签（该配置下标签不生效，写上去只会在以后开启时静默丢记忆）。',
+      }
+    }
+    if (arg === true) {
+      const current = currentBranch(cwdHint)
+      return current === null
+        ? { branch: null, notice: '当前分支未知（不在 git 仓库或读不到 HEAD）：本次未写分支标签，这条记忆按跨分支成立保存。' }
+        : { branch: current, notice: null }
+    }
+    if (typeof arg === 'string') {
+      const normalized = normalizeBranch(arg)
+      return normalized === null
+        ? { branch: null, notice: `分支名「${arg}」非法（空或含控制字符）：本次未写分支标签。` }
+        : { branch: normalized, notice: null }
+    }
+    return { branch: null, notice: null }
+  }
+
+  /** stats 行的分支口径（`/memory stats` 与 `memory_stats` 共用，契约 §4.5）。 */
+  const branchStatsLine = (): string => {
+    const current = currentBranch() ?? 'unknown'
+    return `分支：${current}｜带标签 ${taggedCount()} 条（branchAware=${cfg.branchAware !== false}）`
+  }
 
   /** 信息量 token：与捕获侧派生 subject 同一口径（长度 ≥ 2 且非纯数字）。 */
   const informativeTokens = (text: unknown): string[] =>
@@ -1719,7 +1908,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       text: () => {
         const began = Date.now()
         try {
-          const block = renderSelfBlock(state.records.values(), cfg)
+          const block = renderSelfBlock(branchVisible(state.records.values()), cfg)
           state.renders.section += 1
           state.renderMs.last = Date.now() - began
           state.renderMs.max = Math.max(state.renderMs.max, state.renderMs.last)
@@ -1744,7 +1933,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         const began = Date.now()
         try {
           const cwd = assembleContext?.agent?.session?.header?.cwd
-          const block = renderContextBlock(state.records.values(), cfg, workspaceKeyOf(cwd))
+          const block = renderContextBlock(branchVisible(state.records.values(), cwd), cfg, workspaceKeyOf(cwd))
           state.renders.context += 1
           state.renderMs.last = Date.now() - began
           state.renderMs.max = Math.max(state.renderMs.max, state.renderMs.last)
@@ -2037,7 +2226,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       // （markUsed 给了 recency 加成，分数最高）会霸占前 K 个名额、随即被冷却过滤掉，
       // 把它们后面的相关条目全挤走 —— 表现就是后续回合「0 命中」。
       const topK = cfg.recallTopK ?? 8
-      const hits = recallRecords(state.records.values(), {
+      const hits = recallRecords(branchVisible(state.records.values(), payload?.agent?.session?.header?.cwd), {
         query,
         mode: 'memory',
         minHits: cfg.recallMinHits ?? 2,
@@ -2291,7 +2480,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     const budget = cfg.consolidateMaxRecords ?? 200
     try {
       // 1) 合并同 subject 的近似条目：保留最优者，其余归档（不删除）
-      for (const group of pickMergeGroups(state.records.values(), cfg)) {
+      for (const group of pickMergeGroups(branchVisible(state.records.values()), cfg)) {
         if (summary.merged >= budget) break
         const [lead, ...rest] = [...group].sort(compareRecords) as [MemoryRecord, ...MemoryRecord[]]
         for (const extra of rest) {
@@ -2306,7 +2495,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         await persist(lead)
       }
       // 2) 冲突：旧条目置 invalid（可恢复），新条目记 supersedes；模型自评不能推翻用户侧条目
-      for (const { winner, loser, blocked } of findConflicts(state.records.values())) {
+      for (const { winner, loser, blocked } of findConflicts(branchVisible(state.records.values()))) {
         if (blocked) continue
         loser.status = 'invalid'
         loser.invalidAt = now
@@ -2316,7 +2505,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         summary.invalidated += 1
       }
       // 3) 衰减与归档
-      for (const record of listActive(state.records.values())) {
+      for (const record of listActive(branchVisible(state.records.values()))) {
         if (summary.archived >= budget) break
         if (shouldArchive(record, cfg, now)) {
           record.status = 'archived'
@@ -2325,7 +2514,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         }
       }
       // 4) 规则式摘要（零模型调用；摘要条目标记 summary，不再参与后续整合）
-      for (const item of composeSubjectSummary(state.records.values(), cfg)) {
+      for (const item of composeSubjectSummary(branchVisible(state.records.values()), cfg)) {
         const result = await writeMemory({
           kind: item.kind,
           text: item.text,
@@ -2535,6 +2724,12 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
             enum: ['persona', 'work'],
             description: tt.writeFacetParam,
           },
+          // M12：可选分支标签（契约 §4.3）。`boolean | string` 用 JSON Schema 的类型数组表达；
+          // 参数名/结构属于工具契约的一部分，切语言时一字不动。
+          branch: {
+            type: ['boolean', 'string'],
+            description: tt.writeBranchParam,
+          },
         },
         required: ['kind', 'text'],
         additionalProperties: false,
@@ -2548,6 +2743,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         // facet 只对 agent_self 有意义；其余类型一律不带（否则等于给普通记忆加了一个无意义的自画像字段）。
         // 注意这里**总是**给 agent_self 补上缺省 'work'：正是这个显式 facet 让写入走自画像收敛（契约 §4.1）。
         const facet = args.kind === 'agent_self' ? normalizeFacet(args.facet, 'work') : undefined
+        // M12：分支标签只在这里收敛；缺省（未传）时**一个键都不加**，存量记录形状不变。
+        const tag = writeBranchOf(args.branch, exec?.agent?.session?.header?.cwd ?? null)
         const result = await writeMemory({
           kind: args.kind,
           text: args.text,
@@ -2564,16 +2761,21 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           source: exec?.agent?.session ? { sessionId: String(exec.agent.session.id), seqStart: Number(exec.agent.session.seq ?? 0), seqEnd: Number(exec.agent.session.seq ?? 0) } : null,
           // M9：模型工具写入 → 单点引用（from = 最近一条事件的 seq）
           refVia: 'tool',
+          // M12：只在确实拿到标签时才传；`undefined` 时 makeRecord 不写 branch 键。
+          ...(tag.branch !== null ? { branch: tag.branch } : {}),
         })
         // M10：`ask` 模式下写入没有生效，而是带着 id 进了待确认队列 —— 必须如实说明，
         // 否则模型会以为「我已经记住了」，此后不再重提，用户也就永远看不到这条提议。
-        return json(result.pending === true
-          ? {
-            ...result,
-            notice: '已提议，尚未生效：writePolicy=ask 时模型来源的写入进待确认队列，'
-              + `只有用户能用 /memory approve ${String(result.id)} 让它生效（模型无法自我批准）。`,
-          }
-          : result)
+        // M12：`branch: true` 而分支未知时也要说明「没打标签」（宁可通用化，也不要瞎标）。
+        const notices = [
+          tag.notice,
+          result.pending === true
+            ? '已提议，尚未生效：writePolicy=ask 时模型来源的写入进待确认队列，'
+              + `只有用户能用 /memory approve ${String(result.id)} 让它生效（模型无法自我批准）。`
+            : null,
+        ].filter((text): text is string => typeof text === 'string' && text.length > 0)
+        const view = tag.branch !== null ? { ...result, branch: tag.branch } : result
+        return json(notices.length > 0 ? { ...view, notice: notices.join(' ') } : view)
       },
     },
     {
@@ -2590,11 +2792,14 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         },
         additionalProperties: false,
       },
-      execute: async (rawArgs) => {
+      execute: async (rawArgs, exec) => {
         const args = rawArgs as MemoryRecallArgs
         state.toolCalls.memory_recall = (state.toolCalls.memory_recall ?? 0) + 1
         // 归档条目（设计稿 §4.4）只是不常驻注入，模型主动检索时应当可见
-        const hits = recallRecords(state.records.values(), { ...(args ?? {}), includeArchived: true })
+        const hits = recallRecords(
+          branchVisible(state.records.values(), exec?.agent?.session?.header?.cwd),
+          { ...(args ?? {}), includeArchived: true },
+        )
         markUsed(hits.map((hit) => hit.record))
         return jsonList('items', hits.map(({ record, score }) => ({
           id: record.id, kind: record.kind, scope: record.scope, origin: record.origin,
@@ -2615,11 +2820,11 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         },
         additionalProperties: false,
       },
-      execute: async (rawArgs) => {
+      execute: async (rawArgs, exec) => {
         const args = rawArgs as MemoryListArgs
         state.toolCalls.memory_list = (state.toolCalls.memory_list ?? 0) + 1
         const status = args?.status ?? 'active'
-        const rows = [...state.records.values()]
+        const rows = branchVisible(state.records.values(), exec?.agent?.session?.header?.cwd)
           .filter((record) => (status === 'all' ? true : record.status === status))
           // M10：`pending` 只有 `/memory pending` 与 `memory_explain` 能看到（契约 §4.3）。
           // 这里必须显式排除：`status:'all'` 会把待确认记录顺带列出来，而 `list()` 服务面又是
@@ -2700,6 +2905,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           ...handlers.stats(),
           sleep: { ...state.sleep },
           refs: refsSummary(),
+          // M12：分支的结构化字段（与 stats 文本里那一行同口径，契约 §4.5）
+          branch: { current: currentBranch(), tagged: taggedCount(), branchAware: cfg.branchAware !== false },
           writePolicy: normalizeWritePolicy(cfg.writePolicy),
           pending: pendingPool().length,
           pendingMax: Number.isFinite(cfg.pendingMax) ? cfg.pendingMax : DEFAULTS.pendingMax,
@@ -2754,7 +2961,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           return view
         })
         if (args?.apply !== true) {
-          return jsonList('candidates', candidateViews, { skipped, portrait: portraitDiagnostics() })
+          return jsonList('candidates', candidateViews, { skipped, portrait: portraitDiagnostics(), branch: branchDiagnostics() })
         }
         const origin = cfg.trustToolWrites ? 'user_explicit' : deriveOriginFromMessages(toolMessages(exec))
         const written: Array<{ ok: boolean; status?: string; id?: string; error?: string; portrait?: PortraitOutcome }> = []
@@ -2774,7 +2981,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         }
         // 诊断是**应用之后**再取一次：这样输出里能直接看到 supersede 的结果
         // （旧条目 status='archived' 且带 supersededBy，新条目带 facet）。
-        return jsonList('candidates', candidateViews, { skipped, applied: true, written, portrait: portraitDiagnostics() })
+        return jsonList('candidates', candidateViews, { skipped, applied: true, written, portrait: portraitDiagnostics(), branch: branchDiagnostics() })
       },
     },
   ]
@@ -2852,12 +3059,44 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     list(args: string[]): DshCommandResult {
       const kind = args.find((part) => part.startsWith('--kind='))?.slice(7)
       const includeArchived = args.includes('--archived')
-      const rows = [...state.records.values()]
+      const rows = branchVisible(state.records.values())
         .filter((record) => record.status === 'active' || (includeArchived && record.status === 'archived'))
         .filter((record) => (kind ? record.kind === kind : true))
         .sort(compareRecords)
       if (rows.length === 0) return { kind: 'success', text: includeArchived ? '长期记忆为空。' : '没有 active 记忆（试试 /memory list --archived）。' }
       return { kind: 'success', text: `${rows.length} 条记忆：\n${rows.map((record) => `${listLine(record)}${record.status === 'archived' ? ' [archived]' : ''}`).join('\n')}` }
+    },
+    /**
+     * M12（契约 §4.4）：`/memory branch [--all]`（只读）——当前分支、带标签条数与清单。
+     *
+     * 无 `--all` 时只列**当前分支**的标签记录（跨分支的记忆不在这里重复列），
+     * `--all` 附带其它分支的标签记录 —— 诊断「这条记忆为什么没进来」时一眼能看到它在哪个分支上。
+     * 分支未知时 `formatBranchSummary` 已经写了 fail-closed 说明，这里再补一句去向提示。
+     */
+    branch(args: string[]): DshCommandResult {
+      const all = args.includes('--all')
+      const current = currentBranch()
+      const records = [...state.records.values()]
+      const labeled = (record: MemoryRecord): string =>
+        `${listLine(record)}${record.status === 'archived' ? ' [archived]' : ''}  ← ${branchOf(record)}`
+      const tagged = records.filter((record) => branchOf(record) !== null)
+      const mine = current === null ? [] : tagged.filter((record) => branchOf(record) === current)
+      const others = tagged.filter((record) => current === null || branchOf(record) !== current)
+      const lines: string[] = [formatBranchSummary(records, current)]
+      if (mine.length > 0) {
+        lines.push(`[当前分支（${current}）的标签记录]`)
+        lines.push(...[...mine].sort(compareRecords).map(labeled))
+      }
+      if (all) {
+        lines.push(others.length > 0 ? '[其它分支的标签记录]' : '（没有其它分支的标签记录。）')
+        if (others.length > 0) lines.push(...[...others].sort(compareRecords).map(labeled))
+      } else if (others.length > 0) {
+        lines.push(`（其它分支还有 ${others.length} 条标签记录：/memory branch --all 查看）`)
+      }
+      if (current === null && tagged.length > 0) {
+        lines.push(`当前分支未知：这 ${tagged.length} 条标签记录都不参与注入 / 召回 / 列表；/memory branch --all 可查看它们。`)
+      }
+      return { kind: 'success', text: lines.join('\n') }
     },
     show(args: string[]): DshCommandResult {
       const id = args[0]
@@ -3109,7 +3348,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     search(args: string[]): DshCommandResult {
       const query = args.join(' ')
       if (query.length === 0) return { kind: 'error', text: '用法：/memory search <关键词>' }
-      const hits = recallRecords(state.records.values(), { query, limit: 10, includeArchived: true })
+      const hits = recallRecords(branchVisible(state.records.values()), { query, limit: 10, includeArchived: true })
       if (hits.length === 0) return { kind: 'success', text: `没有匹配「${query}」的记忆。` }
       return { kind: 'success', text: hits.map(({ record, score }) => `${record.id.slice(0, 8)}  ${score.toFixed(2)}  ${record.text}`).join('\n') }
     },
@@ -3264,6 +3503,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           // M11：语言排在最前面 —— 「为什么模型看到中文/英文」是第一诊断问题。
           // 命令输出本轮**仍为中文**（契约 §4.3），只有这一行显示 language 的值。
           `语言：language=${normalizeLanguage(cfg.language)}`,
+          // M12：分支排在同一片诊断区 —— 「我的记忆去哪了」的第一问就是当前分支是什么。
+          branchStatsLine(),
           `记录数：${state.records.size}（active ${listActive(state.records.values()).length}，播种 ${state.seeded}）`,
           `按类型：${JSON.stringify(byKind)}`,
           `写入：创建 ${state.writes.created} / 合并 ${state.writes.merged} / 拒写 ${state.writes.rejected} / 删除 ${state.writes.deleted}`,
@@ -3461,7 +3702,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       return { kind: 'error', text: `未知的 self 子命令「${sub}」。${SELF_USAGE}` }
     },
     help(): DshCommandResult {
-      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | verify <id> | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | pending | approve <id> | reject-pending <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
+      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | verify <id> | branch [--all] | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | pending | approve <id> | reject-pending <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
     },
   }
 
@@ -3796,7 +4037,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     const collected = await collectSleepSources(sq, request)
     const transcript = transcriptOf(collected.sources, limits)
     const plan = buildSleepPlan({
-      records: state.records.values(),
+      // M12：候选集合同样按分支过滤（契约 §4.2）—— 别把特性分支上的临时约定当成本分支的既有条目去合并/失效。
+      records: branchVisible(state.records.values()),
       sources: transcript.sources,
       cfg: limits,
       // 会话整体级说明（预算超限 / 跳过的子代理会话）透传给计划，由 formatSleepPlan 统一渲染。
@@ -3873,7 +4115,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     ctx.commands.register({
       name: 'memory',
       description: '查看与管理长期记忆',
-      input: { hint: 'list | show <id> | verify <id> | pending | self | forget <id> | export | stats' },
+      input: { hint: 'list | show <id> | verify <id> | branch [--all] | pending | self | forget <id> | export | stats' },
       handler: async (invocation) => {
         const parts = String(invocation?.rawInput ?? '').trim().split(/\s+/u).filter(Boolean)
         const sub = parts.shift() ?? 'list'

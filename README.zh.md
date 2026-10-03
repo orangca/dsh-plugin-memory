@@ -206,6 +206,35 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 - **切换可见可查**：`/memory stats` 会显示当前生效的 `language`（这一行和所有命令输出一样仍是中文），
   用来回答「模型为什么还在读中文」。
 
+## 分支感知的项目记忆（branch）：特性分支上的决定留在那条分支上
+
+一条记忆可以带**分支标签**，注入与召回会按**你当前所在的分支**过滤。只在 `feat/x` 上成立的约定，
+不该在你切回 `main` 之后继续左右模型的判断。
+
+| 记录 | 当前分支匹配 | 当前分支不匹配 | 分支未知（不在 git 仓库 / 读不到 `.git/HEAD`） |
+|---|---|---|---|
+| **没有分支标签**（默认） | 注入 | 注入 | 注入 |
+| **有分支标签**（显式标记） | 注入 | **不注入** | **不注入**（fail-closed） |
+
+- **fail-closed 的理由**：把「特性分支上的临时约定」在主干上注入，会让模型基于错误前提给建议；
+  而漏掉一条分支专属记忆只是少一条参考。两者不对称，所以选更安全的那个。
+  **这条规则只针对带标签的记录**：无标签记录在任何情况下都照常注入。
+- **只有显式标记才打标签**：模型可以在 `memory_write` 里传 `branch: true`（用当前分支）或
+  `branch: '<名字>'`；规则捕获、`/sleep` 补录与导入**一律不打标签** —— 大多数项目记忆是跨分支成立的。
+  当前分支未知而传了 `true` 时不打标签，并在工具返回文案里说明「宁可通用化，也不要瞎标」。
+- **`branch` 参与 `recordHash`**：它改变的是记录的**适用范围**（不只是来源），所以「主干上通用的构建约定」
+  与「只在 `feat/x` 成立的临时约定」即使正文相同也是两条记录。（`refs` 是来源证据，故不参与指纹。）
+- 分支名做**规范化**：trim、去掉 `refs/heads/` 前缀、最长 100 字符；非法（空、含控制字符）→ 视为无标签。
+- **可见可排查**：`/memory branch` 显示当前分支、带标签条数与分组；`/memory branch --all` 附带列出其它分支的
+  标签记录。`/memory stats` 与 `memory_stats` 会多一行「分支：…（branchAware=…）」，
+  `memory_explain` 能看到「这条因为分支不匹配被挡住了」以及原因。
+- **零 shell**：插件只读 `.git/HEAD`（worktree/submodule 场景再读 `.git` 文件里的 `gitdir:` 指针），
+  带 5 秒短缓存；**绝不执行任何 git 命令**，读不到一律当「分支未知」。
+- **默认即零变化**：`branchAware` 默认 `true`，但存量记录都没有标签，所以常驻注入、按轮召回、列表与检索
+  **与 0.5.12 逐字节相同**；把 `branchAware` 关掉则完全忽略标签，所有记录照常注入。
+
+`branchAware`（默认 `true`）在设置页表单里以 `0` / `1` 表达。
+
 ## 防「记忆污染 / 自激」
 
 - 自动捕获**只读真实用户消息**（插件自己注入的上下文不算）；
@@ -259,8 +288,8 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置表单在哪
 
-插件导出 schemastery `Config`，其中 **28 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
-同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 28 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
+插件导出 schemastery `Config`，其中 **29 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
+同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 29 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
 （列表里的行卡片上还有一行摘要）。
 
 实现上，客户端半边注册进 **keyed** 插槽 `plugins.row.config`，key 为
@@ -273,6 +302,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 /memory list [--kind=agent_self] [--archived]   列出记忆（归档条目需 --archived）
 /memory search <关键词>                          词面检索（含归档，不含已失效）
 /memory show <id 前缀>                           查看完整记录（含来源与时间线）
+/memory branch [--all]                           当前分支、带标签条数与分组（--all 附带其它分支的标签记录）
 /memory forget <id 前缀>                         永久删除一条
 /memory restore <id 前缀>                        恢复被失效/归档的条目（并撤销推翻它的条目）
 /memory pin <id 前缀>                            固定（不衰减、不自动归档）
@@ -303,7 +333,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 | 工具 | 用途 |
 |---|---|
-| `memory_write` | 结构化写入（`kind` + `text`，可选 `subject` / `field` / `value` / `scopeLevel`；`kind='agent_self'` 时可选 `facet: 'persona' \| 'work'`）。**写入来源由插件判定，模型不能自称「用户要求的」** |
+| `memory_write` | 结构化写入（`kind` + `text`，可选 `subject` / `field` / `value` / `scopeLevel`；`kind='agent_self'` 时可选 `facet: 'persona' \| 'work'`；另有可选 `branch`：`true` = 当前 git 分支、字符串 = 指定分支、缺省 = 不打标签（跨分支成立））。**写入来源由插件判定，模型不能自称「用户要求的」** |
 | `memory_recall` | 按查询 / 类型 / 作用域 / 标签检索 |
 | `memory_list` | 按确定性顺序列出 |
 | `memory_forget` | 按 id 删除；按 query 删除需 `confirm: true`（预览阈值更严） |
@@ -313,7 +343,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置
 
-在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 28 个字段：
+在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 29 个字段：
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -345,6 +375,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 | `writePolicy` | `auto` | 模型来源写入的审批门：`auto`（立刻生效，默认）/ `ask`（进待确认队列）/ `off`（直接拒绝）；规则捕获、用户命令与 `/sleep` 不受影响 |
 | `pendingMax` | `50` | 待确认队列上限；满了拒绝新写入并报结构化错误，绝不静默丢弃；`0` = 不设上限 |
 | `language` | `zh` | **模型可见文本**的语言（`zh` / `en`）：注入块与块头/页脚、注入提示词、按轮召回块、工具描述。命令输出两种取值下都仍是中文；默认 `zh` 与 0.5.10 逐字节相同 |
+| `branchAware` | `true` | 按当前 git 分支过滤带标签的记录；表单里 `0`=关、`1`=开。关掉即完全忽略标签；默认 `true` 因存量记录都没有标签而与 0.5.12 逐字节相同 |
 
 只能通过 patch 行设置的进阶旋钮（含默认值）：自画像条数 `selfPortraitMaxItems` 12 /
 `selfPortraitMaxSelfObserved` 4；捕获调优 `capturePerHour` 20、`captureMinConfidence` 0.6、

@@ -26,10 +26,11 @@
 //    · 用户所有物保护：模型不能覆盖 user_explicit / pinned 的自画像
 //    · /memory self 的四个子命令（list / set / history / reset）与 help 同步
 //    · 反思提示：每会话次数上限、间隔与最小回合、dry/off 不注入也不推进计数、R2 之后单独一条
+//  17–19. M10/M11/M12 的宿主半边（写入审批门、模型可见文本多语言、git 分支感知）
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -3174,6 +3175,439 @@ test('host#67 language 只在显式配置时生效：会话内容/域名等其�
   assert.ok(text.startsWith(ZH_INJECT_LITERALS.recallHeader), '语言不得从对话内容推断')
   assert.ok(text.endsWith(ZH_INJECT_LITERALS.recallFooter))
   assert.match(text, /pnpm/u, '英文记忆内容照旧注入')
+})
+
+// ================================================================ M12 git 分支感知（branch）
+// 契约：docs/branch.md 第 4/5 节。宿主侧只做三件事：解析当前分支（零 shell、5 秒 TTL 缓存）、
+// 在「取记录集合的那一处」统一过滤、把当前分支暴露给用户（`/memory branch`、stats 行、explain）。
+//
+// 关键纪律（§5）：
+//   · 分支**只**来自 `<cwd>/.git/HEAD`（或 `.git` 文件里的 `gitdir:`）—— 绝不执行任何 git 命令；
+//   · fail-closed 只针对带标签的记录：无标签记录在任何分支（含未知）下都照常注入；
+//   · 库内没有标签时，注入输出必须与改动前逐字节相同（本节的最后两例专门钉死这一点）。
+// 测试全部用**临时目录里的真 `.git/HEAD`** 驱动，不依赖本机仓库状态。
+
+/** 造一个「零 shell 能解析」的临时 git 仓库：`<dir>/.git/HEAD` → `ref: refs/heads/<branch>`。 */
+const makeGitRepo = (branch: string): string => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-memory-branch-'))
+  mkdirSync(join(dir, '.git'), { recursive: true })
+  writeFileSync(join(dir, '.git', 'HEAD'), `ref: refs/heads/${branch}\n`)
+  return dir
+}
+
+/** 一个没有 `.git` 的临时目录（＝不在 git 仓库里 → 分支未知）。 */
+const makeNonRepo = (): string => mkdtempSync(join(tmpdir(), 'dsh-memory-norepo-'))
+
+/** 清掉测试自己造的目录（`harness.dispose()` 只清它自己的 tempDir）。 */
+const useTempDirs = (t: { after(callback: () => unknown): void }, ...dirs: string[]): void => {
+  t.after(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true })
+  })
+}
+
+/**
+ * 把「当前会话的 cwd」换成给定目录。
+ *
+ * 宿主按 `state.lastSession.cwd` 解析分支（契约 §4.1），而它只由 `session/event` 维护 ——
+ * 用一条无害事件同步它，就能在不跑 git、不重启实例的前提下模拟「切到另一个仓库/分支」。
+ */
+const setSessionCwd = (harness: Harness, cwd: string | null): void => {
+  harness.emitSync('session/event', { id: 'session-branch', header: { cwd } }, { type: 'branch-probe' })
+}
+
+/** 指定 cwd 的一次 pre-step（`stepTurn` 把 cwd 写死成 C:\work\demo，分支用例需要自己的仓库）。 */
+const stepTurnAt = async (harness: Harness, turn: number, cwd: string, query: string): Promise<Json[]> => {
+  const decision = { kind: 'continue', messages: [{ role: 'user', content: [{ type: 'text', text: query }] }] }
+  const result = await harness.preStep(
+    { turn, agent: { session: { id: 'session-branch', seq: turn, header: { cwd } } }, signal: { aborted: false } },
+    async () => decision,
+  ) as Json
+  return ((result.messages ?? []) as Json[]).slice(1)
+}
+
+/** 两条只差「有没有分支标签」的记录：正文共享同一串高频词，因此同一个查询会同时命中它们。
+ *  这样「B 分支上只少了带标签的那条」就不可能被误读成「召回本身没生效」。 */
+const BRANCH_TAGGED_TEXT = '分支专属约定：这个特性分支上的构建流程统一用 pnpm 输出到 dist 目录'
+const BRANCH_PLAIN_TEXT = '跨分支约定：这个项目的构建流程统一用 pnpm 输出到 dist 目录'
+const BRANCH_QUERY = '请继续按构建流程用 pnpm 输出到 dist 目录'
+
+test('host#68 memory_write 的 branch：true 打当前分支、字符串指定分支、缺省不打；分支未知时不打并说明（契约 §4.3）', async (t) => {
+  const feat = makeGitRepo('feature/x')
+  const nonRepo = makeNonRepo()
+  useTempDirs(t, feat, nonRepo)
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 参数声明：可选，boolean|string；既有参数一个不动
+  const properties = (harness.tool('memory_write').parameters as Json).properties as Record<string, Json>
+  assert.ok(properties.branch, 'memory_write 必须声明可选参数 branch')
+  assert.deepEqual(properties.branch!.type, ['boolean', 'string'])
+  assert.equal(properties.branch!.enum, undefined)
+  assert.equal(String(properties.branch!.description ?? '').length > 0, true, 'branch 必须有参数说明')
+
+  setSessionCwd(harness, feat)
+  const tagged = await writeToolInWorkspace(harness, { kind: 'semantic', text: BRANCH_TAGGED_TEXT, branch: true }, feat)
+  assert.equal(tagged.ok, true)
+  assert.equal(tagged.branch, 'feature/x', 'true = 当前分支，并回显给模型')
+  assert.equal(rowsOf(harness).find((row) => row.id === tagged.id)!.branch, 'feature/x')
+
+  // 字符串：指定分支，`refs/heads/` 前缀照 lib 的规范化收敛
+  const explicit = await writeToolInWorkspace(harness, { kind: 'semantic', text: '发布分支专属：打 tag 一律加 v 前缀', branch: 'refs/heads/release/1.0' }, feat)
+  assert.equal(explicit.branch, 'release/1.0')
+  assert.equal(rowsOf(harness).find((row) => row.id === explicit.id)!.branch, 'release/1.0')
+
+  // 缺省：记录里**一个键都不写**（存量记录形状不变）
+  const plain = await writeToolInWorkspace(harness, { kind: 'semantic', text: BRANCH_PLAIN_TEXT }, feat)
+  assert.equal(plain.branch, undefined, '缺省不得回显分支')
+  assert.equal('branch' in rowsOf(harness).find((row) => row.id === plain.id)!, false, '缺省时不得写 branch 键')
+
+  // 分支未知（不在 git 仓库）而传 true：不写标签 + 说明，绝不写 "unknown" 之类的假值
+  setSessionCwd(harness, nonRepo)
+  const unknown = await writeToolInWorkspace(harness, { kind: 'semantic', text: '分支未知时写入的约定：先按通用规则处理', branch: true }, nonRepo)
+  assert.equal(unknown.ok, true)
+  assert.equal(unknown.branch, undefined)
+  assert.match(String(unknown.notice), /分支未知/u)
+  assert.match(String(unknown.notice), /未写分支标签/u)
+  assert.equal('branch' in rowsOf(harness).find((row) => row.id === unknown.id)!, false)
+
+  // 非法分支名（空白 / 控制字符）：同样不写标签并说明
+  const bogus = await writeToolInWorkspace(harness, { kind: 'semantic', text: '分支名非法的写入', branch: '   ' }, feat)
+  assert.equal(bogus.branch, undefined)
+  assert.match(String(bogus.notice), /非法/u)
+  assert.equal('branch' in rowsOf(harness).find((row) => row.id === bogus.id)!, false)
+})
+
+test('host#69 分支 A 的标签记录在 A 上进常驻块与 R2，在 B 下全部被挡；无标签记录两处都照常（契约 §4.2/§5）', async (t) => {
+  const repoA = makeGitRepo('feature/x')
+  const repoB = makeGitRepo('main')
+  useTempDirs(t, repoA, repoB)
+  const harness = makeHarness({ config: { recallMode: 'inject', selfIntroEnabled: false, selfReflectEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  setSessionCwd(harness, repoA)
+  const tagged = await writeToolInWorkspace(harness, {
+    kind: 'semantic', scopeLevel: 'profile', text: BRANCH_TAGGED_TEXT, branch: true,
+  }, repoA)
+  await writeToolInWorkspace(harness, { kind: 'semantic', scopeLevel: 'profile', text: BRANCH_PLAIN_TEXT }, repoA)
+  assert.equal(tagged.branch, 'feature/x')
+
+  // A：R2 能召回。**先跑 R2**：常驻渲染会把条目登记进 state.injected，之后 R2 会把它当「已在常驻块里」剔掉。
+  const onA = appendedText(await stepTurnAt(harness, 10, repoA, BRANCH_QUERY))
+  assert.match(onA, /分支专属约定/u, `A 分支上标签记录必须能召回：${onA}`)
+  assert.match(onA, /跨分支约定/u)
+
+  // B：带标签的记录在 R2 里必须消失，而无标签的照常 —— 证明是「分支过滤」而不是「召回没命中」
+  setSessionCwd(harness, repoB)
+  const onB = appendedText(await stepTurnAt(harness, 20, repoB, BRANCH_QUERY))
+  assert.doesNotMatch(onB, /分支专属约定/u, `B 分支上标签记录不得进 R2：${onB}`)
+  assert.match(onB, /跨分支约定/u, 'fail-closed 只针对带标签的记录')
+
+  // 常驻块（section + context 两条通道）：B 下不得出现，切回 A 必须重新出现
+  const residentB = residentText(harness)
+  assert.doesNotMatch(residentB, /分支专属约定/u, `B 分支上标签记录不得进常驻块：${residentB}`)
+  assert.match(residentB, /跨分支约定/u)
+  setSessionCwd(harness, repoA)
+  assert.match(residentText(harness), /分支专属约定/u, '切回 A 后标签记录必须重新可见')
+
+  // 其它读取路径：B 下全部被挡，A 下可见
+  setSessionCwd(harness, repoB)
+  assert.doesNotMatch(String(await harness.tool('memory_recall').execute({ query: BRANCH_QUERY })), /分支专属约定/u)
+  assert.match(String(await harness.tool('memory_recall').execute({ query: BRANCH_QUERY })), /跨分支约定/u)
+  assert.doesNotMatch(String(await harness.tool('memory_list').execute({ status: 'all' })), /分支专属约定/u)
+  assert.doesNotMatch((await harness.runCommand('list --archived')).text, /分支专属约定/u)
+  assert.doesNotMatch((await harness.runCommand(`search 分支专属约定`)).text, /分支专属约定/u)
+  setSessionCwd(harness, repoA)
+  assert.match(String(await harness.tool('memory_list').execute({ status: 'all' })), /分支专属约定/u)
+  assert.match((await harness.runCommand('list --archived')).text, /分支专属约定/u)
+  assert.match((await harness.runCommand(`search 分支专属约定`)).text, /分支专属约定/u)
+})
+
+test('host#70 分支未知（不在 git 仓库）：标签记录被挡（fail-closed），无标签记录照常（契约 §1/§5）', async (t) => {
+  const repo = makeGitRepo('feature/x')
+  const nonRepo = makeNonRepo()
+  useTempDirs(t, repo, nonRepo)
+  const harness = makeHarness({ config: { recallMode: 'inject', selfIntroEnabled: false, selfReflectEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  setSessionCwd(harness, repo)
+  await writeToolInWorkspace(harness, { kind: 'semantic', scopeLevel: 'profile', text: BRANCH_TAGGED_TEXT, branch: true }, repo)
+  await writeToolInWorkspace(harness, { kind: 'semantic', scopeLevel: 'profile', text: BRANCH_PLAIN_TEXT }, repo)
+
+  // 切到非仓库目录：分支未知 → 标签记录一律不注入，无标签照常
+  setSessionCwd(harness, nonRepo)
+  // 先 R2：常驻渲染会把条目登记进 state.injected，之后 R2 会把它当「已在常驻块里」剔掉
+  const r2 = appendedText(await stepTurnAt(harness, 5, nonRepo, BRANCH_QUERY))
+  assert.doesNotMatch(r2, /分支专属约定/u)
+  assert.match(r2, /跨分支约定/u)
+  const resident = residentText(harness)
+  assert.doesNotMatch(resident, /分支专属约定/u, '分支未知时带标签的记录必须被挡下')
+  assert.match(resident, /跨分支约定/u)
+  assert.doesNotMatch(String(await harness.tool('memory_recall').execute({ query: BRANCH_QUERY })), /分支专属约定/u)
+  assert.doesNotMatch(String(await harness.tool('memory_list').execute({ status: 'all' })), /分支专属约定/u)
+  assert.doesNotMatch((await harness.runCommand('search 分支专属约定')).text, /分支专属约定/u)
+  // 诊断命令必须说清「当前分支未知」与后果
+  const summary = (await harness.runCommand('branch')).text
+  assert.match(summary, /当前分支：unknown/u)
+  assert.match(summary, /fail-closed/u)
+})
+
+test('host#71 /memory branch：当前分支、带标签条数与清单；--all 附带其它分支（契约 §4.4）', async (t) => {
+  const repoA = makeGitRepo('feature/x')
+  const repoB = makeGitRepo('main')
+  const nonRepo = makeNonRepo()
+  useTempDirs(t, repoA, repoB, nonRepo)
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  setSessionCwd(harness, repoA)
+  await writeToolInWorkspace(harness, { kind: 'semantic', text: BRANCH_TAGGED_TEXT, branch: true }, repoA)
+  await writeToolInWorkspace(harness, { kind: 'semantic', text: BRANCH_PLAIN_TEXT }, repoA)
+  setSessionCwd(harness, repoB)
+  await writeToolInWorkspace(harness, { kind: 'semantic', text: '主干专属：main 上打 tag 用 v 前缀', branch: true }, repoB)
+
+  setSessionCwd(harness, repoA)
+  const base = (await harness.runCommand('branch')).text
+  assert.match(base, /\[记忆分支 · 当前分支：feature\/x\]/u)
+  assert.match(base, /带分支标签的记忆：2 条/u)
+  assert.match(base, /- feature\/x：1 条（当前分支）/u)
+  assert.match(base, /- main：1 条/u)
+  assert.match(base, /分支专属约定/u, '当前分支的标签记录要列出来')
+  assert.doesNotMatch(base, /主干专属/u, '无 --all 时不得列出其它分支的记录')
+  assert.match(base, /其它分支还有 1 条标签记录/u)
+  assert.match(base, /\/memory branch --all/u)
+
+  const all = (await harness.runCommand('branch --all')).text
+  assert.match(all, /主干专属/u, '--all 必须附带其它分支的标签记录')
+  assert.match(all, /← main/u)
+  assert.match(all, /← feature\/x/u)
+  assert.equal(all.includes('当前分支（feature/x）的标签记录'), true)
+
+  // 分支未知：明说 unknown、说明后果，--all 仍能列出全部标签记录（诊断不能因未知而瞎）
+  setSessionCwd(harness, nonRepo)
+  const unknown = (await harness.runCommand('branch')).text
+  assert.match(unknown, /当前分支：unknown/u)
+  assert.match(unknown, /fail-closed/u)
+  assert.match(unknown, /这 2 条标签记录都不参与注入/u)
+  assert.match((await harness.runCommand('branch --all')).text, /主干专属/u)
+})
+
+test('host#72 /memory stats 与 memory_stats 的分支行：当前分支、带标签条数、branchAware（契约 §4.5）', async (t) => {
+  const repoA = makeGitRepo('feature/x')
+  const nonRepo = makeNonRepo()
+  useTempDirs(t, repoA, nonRepo)
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 空库 + 分支未知：这一行也必须存在（不能等有标签才渲染）
+  assert.match((await harness.runCommand('stats')).text, /分支：unknown｜带标签 0 条（branchAware=true）/u)
+
+  setSessionCwd(harness, repoA)
+  await writeToolInWorkspace(harness, { kind: 'semantic', text: BRANCH_TAGGED_TEXT, branch: true }, repoA)
+  await writeToolInWorkspace(harness, { kind: 'semantic', text: BRANCH_PLAIN_TEXT }, repoA)
+  assert.match((await harness.runCommand('stats')).text, /分支：feature\/x｜带标签 1 条（branchAware=true）/u)
+
+  const raw = JSON.parse(String(await harness.tool('memory_stats').execute({}))) as Json
+  assert.match(String(raw.text), /分支：feature\/x｜带标签 1 条（branchAware=true）/u, '工具文本与 /memory stats 同步')
+  assert.deepEqual(raw.branch, { current: 'feature/x', tagged: 1, branchAware: true })
+
+  setSessionCwd(harness, nonRepo)
+  assert.match((await harness.runCommand('stats')).text, /分支：unknown｜带标签 1 条（branchAware=true）/u)
+
+  // branchAware=false 要如实显示（诊断「标签为什么不起作用」的第一线索）
+  const off = makeHarness({ config: { branchAware: false } })
+  t.after(() => off.dispose())
+  await off.settle()
+  assert.match((await off.runCommand('stats')).text, /分支：unknown｜带标签 0 条（branchAware=false）/u)
+})
+
+test('host#73 memory_explain 必须能看到被分支挡下的记录与原因（契约 §5「诊断可见」）', async (t) => {
+  const repoA = makeGitRepo('feature/x')
+  const repoB = makeGitRepo('main')
+  const nonRepo = makeNonRepo()
+  useTempDirs(t, repoA, repoB, nonRepo)
+  const harness = makeHarness({ config: { selfIntroEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  setSessionCwd(harness, repoA)
+  await writeToolInWorkspace(harness, { kind: 'semantic', scopeLevel: 'profile', text: BRANCH_TAGGED_TEXT, branch: true }, repoA)
+  await writeToolInWorkspace(harness, { kind: 'semantic', scopeLevel: 'profile', text: BRANCH_PLAIN_TEXT }, repoA)
+
+  // 在 B 上：标签记录被挡，诊断必须能看到「它为什么没进来」
+  setSessionCwd(harness, repoB)
+  const explain = JSON.parse(String(await harness.tool('memory_explain').execute({ text: '随便一句用于诊断的文本' }))) as Json
+  const branch = explain.branch as Json
+  assert.ok(branch, 'memory_explain 必须输出 branch 诊断区')
+  assert.equal(branch.current, 'main')
+  assert.equal(branch.branchAware, true)
+  assert.equal(branch.blockedCount, 1)
+  assert.match(String(branch.reason), /分支/u)
+  assert.match(String(branch.reason), /fail-closed/u)
+  const blocked = branch.blocked as Json[]
+  assert.equal(blocked.length, 1)
+  assert.equal(blocked[0]!.branch, 'feature/x')
+  assert.match(String(blocked[0]!.text), /分支专属约定/u)
+  assert.ok(!JSON.stringify(branch).includes('跨分支约定'), '被挡清单不得混进无标签记录')
+
+  // 分支未知时同样能看到（否则「我的记忆去哪了」在仓库外无法排查）
+  setSessionCwd(harness, nonRepo)
+  const outside = JSON.parse(String(await harness.tool('memory_explain').execute({ text: '再诊断一次' }))) as Json
+  assert.equal((outside.branch as Json).current, null)
+  assert.equal((outside.branch as Json).blockedCount, 1)
+  assert.match(String((outside.branch as Json).reason), /unknown/u)
+
+  // 回到标签所在分支：没有被挡下的记录，清单为空
+  setSessionCwd(harness, repoA)
+  const same = JSON.parse(String(await harness.tool('memory_explain').execute({ text: '同一分支再诊断' }))) as Json
+  assert.equal((same.branch as Json).blockedCount, 0)
+  assert.equal((same.branch as Json).reason, null)
+})
+
+test('host#74 branchAware=false：忽略标签（被挡的记录重新可见），且不写新标签（契约 §2.1/§5）', async (t) => {
+  const repoA = makeGitRepo('feature/x')
+  const repoB = makeGitRepo('main')
+  useTempDirs(t, repoA, repoB)
+  const harness = makeHarness({
+    config: { branchAware: false, recallMode: 'inject', selfIntroEnabled: false, selfReflectEnabled: false },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 直接走服务面种一条带标签的记录：工具在 branchAware=false 下刻意不打标签（见下方断言）
+  setSessionCwd(harness, repoA)
+  const seeded = await harness.memory().write({
+    kind: 'semantic', text: BRANCH_TAGGED_TEXT, scope: { level: 'profile', key: '*' }, branch: 'feature/x', origin: 'user_explicit',
+  })
+  assert.equal(seeded.ok, true)
+  assert.equal(rowsOf(harness).find((row) => row.id === seeded.id)!.branch, 'feature/x')
+
+  // 在 B 下：标签被忽略 → 照常召回、照常进列表与常驻块
+  setSessionCwd(harness, repoB)
+  const r2 = appendedText(await stepTurnAt(harness, 3, repoB, BRANCH_QUERY))
+  assert.match(r2, /分支专属约定/u, 'branchAware=false 时忽略标签，一律注入')
+  assert.match(residentText(harness), /分支专属约定/u)
+  assert.match(String(await harness.tool('memory_list').execute({ status: 'all' })), /分支专属约定/u)
+  const explain = JSON.parse(String(await harness.tool('memory_explain').execute({ text: '诊断' }))) as Json
+  assert.equal((explain.branch as Json).branchAware, false)
+  assert.equal((explain.branch as Json).blockedCount, 0)
+
+  // 写入侧：关掉过滤时**不打任何标签**（打上去只会在以后开启过滤时静默丢记忆）
+  const viaBool = await writeToolInWorkspace(harness, { kind: 'semantic', text: '关闭分支感知时传 true 的写入', branch: true }, repoB)
+  assert.equal(viaBool.branch, undefined)
+  assert.match(String(viaBool.notice), /branchAware=false/u)
+  assert.equal('branch' in rowsOf(harness).find((row) => row.id === viaBool.id)!, false)
+  const viaString = await writeToolInWorkspace(harness, { kind: 'semantic', text: '关闭分支感知时指定分支的写入', branch: 'feature/x' }, repoB)
+  assert.equal(viaString.branch, undefined)
+  assert.equal('branch' in rowsOf(harness).find((row) => row.id === viaString.id)!, false)
+})
+
+test('host#75 默认（库内无标签）：仓库（分支 main）与无仓库两种 cwd 下，常驻块与 R2 逐字节相同（契约 §5）', async (t) => {
+  const repo = makeGitRepo('main')
+  const nonRepo = makeNonRepo()
+  useTempDirs(t, repo, nonRepo)
+  const collected: string[] = []
+  for (const cwd of [repo, nonRepo]) {
+    const harness = makeHarness({ config: { recallMode: 'inject', selfIntroEnabled: false, selfReflectEnabled: false } })
+    try {
+      await harness.settle()
+      setSessionCwd(harness, cwd)
+      // 两条无标签记录，importance 不同 → 渲染顺序确定（不依赖随机 id）
+      await harness.memory().write({ kind: 'user_profile', text: '用户偏好中文回答与英文标识符', importance: 0.9 })
+      await harness.memory().write({
+        kind: 'semantic', text: '构建流程统一用 pnpm，产物输出到 dist 目录', importance: 0.5, scope: { level: 'profile', key: '*' },
+      })
+      // 先 R2（常驻渲染会把条目登记进 state.injected，R2 之后会剔除它）
+      const r2 = appendedText(await stepTurnAt(harness, 3, cwd, '请继续按构建流程用 pnpm 输出到 dist 目录'))
+      const resident = residentText(harness)
+      assert.match(r2, /pnpm/u, '前提：R2 确实注入了内容（否则「逐字节相同」可能只是两个空串）')
+      assert.match(resident, /构建流程统一用 pnpm/u, '前提：常驻块确实渲染了内容')
+      assert.ok(!resident.includes('分支'), `默认渲染不得出现任何分支文案：${resident}`)
+      collected.push([r2, resident].join('\n===\n'))
+    } finally {
+      await harness.dispose()
+    }
+  }
+  assert.equal(collected[0], collected[1], '分支解析（仓库 vs 非仓库）不得改变任何一个字节的注入输出')
+})
+
+test('host#76 零 shell：分支解析只读 .git 目录，源码里不得出现任何子进程 / 命令执行（契约 §5）', async () => {
+  const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8')
+  for (const banned of ['node:child_process', 'execSync', 'spawnSync', 'execFileSync', 'spawn(']) {
+    assert.ok(!source.includes(banned), `分支解析必须是零 shell：不允许出现 ${banned}`)
+  }
+  // `.git` 是文件（worktree / submodule）时要读 `gitdir:` 再去解析真实 git 目录
+  assert.match(source, /gitdir:/iu, 'resolveGitDir 必须处理 `.git` 文件里的 gitdir: 行')
+  assert.match(source, /BRANCH_TTL_MS\s*=\s*5000/u, '契约 §4.1：当前分支必须带 5 秒 TTL 缓存')
+})
+
+test('host#77 .git 是文件（worktree/submodule）：读 gitdir: 并相对 cwd 解析；坏文件 → 分支未知（契约 §4.1）', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-memory-worktree-'))
+  useTempDirs(t, root)
+  // 「真实」git 目录：HEAD 指向 wt/x（模拟主仓库里的 .git/worktrees/wt1）
+  const realGit = join(root, 'main-git', 'worktrees', 'wt1')
+  mkdirSync(realGit, { recursive: true })
+  writeFileSync(join(realGit, 'HEAD'), 'ref: refs/heads/wt/x\n')
+  // worktree A：.git 是文件，gitdir 用绝对路径
+  const worktreeAbs = join(root, 'wt-abs')
+  mkdirSync(worktreeAbs, { recursive: true })
+  writeFileSync(join(worktreeAbs, '.git'), `gitdir: ${realGit}\n`)
+  // worktree B：gitdir 用**相对 cwd** 的路径
+  const worktreeRel = join(root, 'wt-rel')
+  mkdirSync(worktreeRel, { recursive: true })
+  writeFileSync(join(worktreeRel, '.git'), 'gitdir: ../main-git/worktrees/wt1\n')
+  // 坏 .git 文件（没有 gitdir: 行）→ 必须当分支未知，绝不猜
+  const broken = join(root, 'broken')
+  mkdirSync(broken, { recursive: true })
+  writeFileSync(join(broken, '.git'), 'not a gitdir line\n')
+
+  const harness = makeHarness({ config: { recallMode: 'inject', selfIntroEnabled: false, selfReflectEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  for (const cwd of [worktreeAbs, worktreeRel]) {
+    setSessionCwd(harness, cwd)
+    const written = await writeToolInWorkspace(harness, { kind: 'semantic', text: `worktree 专属约定：${cwd} 上的构建流程`, branch: true }, cwd)
+    assert.equal(written.branch, 'wt/x', `${cwd} 的 gitdir 必须被解析成真实 git 目录`)
+    assert.equal(rowsOf(harness).find((row) => row.id === written.id)!.branch, 'wt/x')
+  }
+
+  setSessionCwd(harness, broken)
+  const unknown = await writeToolInWorkspace(harness, { kind: 'semantic', text: '坏 .git 文件下的写入', branch: true }, broken)
+  assert.equal(unknown.branch, undefined, '读不出 gitdir 时不打标签')
+  assert.match(String(unknown.notice), /分支未知/u)
+})
+
+test('host#78 当前分支带 5 秒 TTL 缓存：TTL 内不重读，换 cwd 立即失效（契约 §4.1）', async (t) => {
+  const repo = makeGitRepo('main')
+  const other = makeGitRepo('feat/y')
+  useTempDirs(t, repo, other)
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  setSessionCwd(harness, repo)
+  const first = await writeToolInWorkspace(harness, { kind: 'semantic', text: '主干缓存探针', branch: true }, repo)
+  assert.equal(first.branch, 'main')
+
+  // TTL 内改写**同一个仓库**的 HEAD：解析结果必须仍是缓存值（否则每个 step 都在读盘）
+  writeFileSync(join(repo, '.git', 'HEAD'), 'ref: refs/heads/switched\n')
+  const cached = await writeToolInWorkspace(harness, { kind: 'semantic', text: 'TTL 内的第二次写入', branch: true }, repo)
+  assert.equal(cached.branch, 'main', '5 秒 TTL 内不得重新读盘')
+
+  // 换 cwd（另一个仓库）立即失效：缓存只有一条、按 cwd 记账
+  setSessionCwd(harness, other)
+  const otherWrite = await writeToolInWorkspace(harness, { kind: 'semantic', text: '另一个仓库的写入', branch: true }, other)
+  assert.equal(otherWrite.branch, 'feat/y')
+
+  // 切回被改写 HEAD 的仓库：缓存已被别的 cwd 顶掉 → 这次必须读到新分支
+  setSessionCwd(harness, repo)
+  const reread = await writeToolInWorkspace(harness, { kind: 'semantic', text: '切回后的写入', branch: true }, repo)
+  assert.equal(reread.branch, 'switched')
 })
 
 

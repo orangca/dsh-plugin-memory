@@ -3,6 +3,40 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.13 — 2026-10-03
+
+**Branch-aware project memory: feature-branch decisions stay on their branch.** The fourth competitive direction — a
+memory can now carry an optional `branch` tag, and injection/recall filter tagged rows by the branch you are actually
+on, so a convention that holds only on `feat/x` does not keep steering the model after you switch back to `main`.
+Contract: `docs/branch.md`.
+
+### Added
+
+- `branchAware` (`boolean`, default `true`): filter branch-tagged rows by the current git branch; `false` ignores tags
+  entirely. It is the **29th** field of the settings form (**28 → 29**), an English/Chinese-labelled `0` / `1` toggle
+  that writes back a real boolean.
+- `memory_write` gained an optional `branch` parameter: `true` = the current branch, a string = that branch, omitted =
+  no tag (applies on every branch). A row's `branch` **participates in `recordHash`**, because it changes the row's
+  scope of applicability rather than merely its provenance; branch names are normalized (trimmed, `refs/heads/`
+  dropped, capped at 100 characters, illegal → no tag).
+- `/memory branch [--all]`: the current branch, the number of tagged rows and the per-branch groups; `--all` also
+  lists rows tagged for other branches. `/memory stats` and `memory_stats` gained a
+  `分支：<current or unknown>｜带标签 N 条（branchAware=…）` line, and `memory_explain` shows which rows branch
+  filtering blocked and why.
+- Both READMEs gained a "branch-aware project memory" section with the four-case filter table, the fail-closed
+  rationale, the explicit-tag-only rule, the `memory_write` parameter, the command and the zero-shell note, plus the
+  new configuration row.
+
+### Changed
+
+- **The default changes nothing, byte for byte.** `branchAware: true` is the default, but no existing row carries a
+  tag, so resident injection, per-turn recall, listing and search are identical to 0.5.12. Untagged rows are injected
+  in every case — fail-closed only ever applies to explicitly tagged rows.
+- **Branch resolution is read-only and shell-free**: only `.git/HEAD` (plus the `gitdir:` pointer when `.git` is a
+  file, for worktrees/submodules) is read, behind a 5-second cache; no git command is ever executed. Any read failure
+  means "branch unknown", in which case tagged rows are **not** injected (fail-closed) and a `branch: true` write is
+  stored untagged with an explanatory tool result rather than mislabelled.
+
 ## 0.5.12 — 2026-10-02
 
 Immediate follow-up to 0.5.11, found by rendering the new English texts for real rather than only asserting on them.

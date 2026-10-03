@@ -45,6 +45,11 @@ export interface MakeRecordInputWithSession extends MakeRecordInput {
   sessionId?: string
   /** M9：来源引用（契约 docs/refs.md §2）。**缺失时不写键**，保持存量记录形状。 */
   refs?: MemoryRef[]
+  /**
+   * M12：分支标签（契约 docs/branch.md §2/§3）。**缺失时不写键**，保持存量记录形状；
+   * 非法值（空/控制字符）经 `normalizeBranch` 收敛为 `null` ＝ 跨分支。
+   */
+  branch?: string | null
 }
 
 /** 指纹入参：只需要指纹相关字段，因此「尚未补上 hash 的记录」也能直接求指纹。 */
@@ -53,6 +58,11 @@ export interface RecordHashInput {
   scope?: MemoryScope | null
   subject?: string | null
   text: string
+  /**
+   * M12：分支标签（契约 §2「`branch` 要参与 `recordHash`」）。
+   * **只在非空时才追加** —— 存量记录没有这个字段，指纹必须一字不变。
+   */
+  branch?: string | null
 }
 
 /** `CAPTURE_SIGNALS` 的一行。 */
@@ -155,6 +165,9 @@ export const DEFAULTS: MemoryConfig = {
   pendingMax: 50,
   // M11：**模型可见文本**的语言（契约 docs/i18n.md §2）。默认 'zh' 必须与 0.5.10 逐字节等价。
   language: 'zh',
+  // M12：git 分支感知（契约 docs/branch.md §2.1）。默认 true —— 但**存量记录都没有标签**，
+  // 因此开箱即用的输出与 0.5.12 逐字节相同（有测试钉住）。
+  branchAware: true,
   gistBudgetRatio: 0.3,
   charsPerToken: 2.5,
   sectionOrder: 9000,
@@ -263,15 +276,23 @@ export function clampText(text: unknown, maxTokens: number, charsPerToken: numbe
   return flat.length <= maxChars ? flat : `${flat.slice(0, maxChars - 1)}…`
 }
 
-/** 去重指纹：kind|scope.level|scope.key|subject|归一化文本。
- *  必须含 `scope.key`：否则 A 项目里写的同一句话会被判成「B 项目已有」而合并到错误的 scope。 */
+/** 去重指纹：kind|scope.level|scope.key|subject|归一化文本[|分支]。
+ *  必须含 `scope.key`：否则 A 项目里写的同一句话会被判成「B 项目已有」而合并到错误的 scope。
+ *
+ *  M12（契约 docs/branch.md §2）：`branch` **要参与指纹** —— 它改变的是**适用范围**，
+ *  所以「主干上通用的构建约定」与「只在 feature/x 成立的临时约定」即使正文相同也是两条记录。
+ *  ⚠ 但**只能在记录确实有非空 branch 时追加**：0.5.12 及更早的记录没有 `branch` 字段，
+ *  无条件多拼一段会让**全库指纹集体改变**，去重、`/sleep` 补录幂等、`memory_write` 幂等
+ *  会同时失效（同一条记忆被反复写成新条目）。因此这里是 `...(branch ? [branch] : [])`。 */
 export function recordHash(record: RecordHashInput): string {
+  const branch = normalizeBranch(record.branch)
   return fnv1a([
     record.kind,
     record.scope?.level ?? '',
     record.scope?.key ?? '',
     record.subject ?? '',
     normalizeText(record.text),
+    ...(branch ? [branch] : []),
   ].join('|'))
 }
 
@@ -313,6 +334,9 @@ export function makeRecord(input: MakeRecordInputWithSession, now: number = Date
   // M9：来源引用透传（同样是「缺失时不写键」；写了就过一遍清洗，非法项丢弃）。
   // 注意：refs **绝不参与** `recordHash` —— 否则同一条记忆会因为引用不同被判成两条。
   if (input.refs !== undefined) record.refs = normalizeRefs(input.refs, DEFAULTS)
+  // M12：分支标签透传（可选字段；**缺失时不写键**，保持存量形状）。
+  // 非法的分支名由 `normalizeBranch` 收敛成 null（＝跨分支成立）：宁可不打标签，也不写假标签。
+  if (input.branch !== undefined) record.branch = normalizeBranch(input.branch)
   record.hash = recordHash(record)
   return record
 }
@@ -2510,4 +2534,144 @@ export function localizedTexts(language?: unknown): InjectedTexts {
 /** 便利：`localizedTexts(cfg.language)`。 */
 export function textsFor(cfg: MemoryConfig): InjectedTexts {
   return localizedTexts(cfg?.language)
+}
+
+// ---------------------------------------------------------------------------
+// M12：git 分支感知（branch）—— 契约 docs/branch.md §2/§3
+//
+// 与上面几节一样，整节是**纯函数**：不依赖 ctx、不碰文件系统、不执行 git 命令、不做 I/O。
+// 三条不可妥协（§5）：
+//  · 默认行为零变化：库内没有标签时，指纹/渲染/召回结果与 0.5.12 逐字节相同；
+//  · 不打错标签：分支解析拿不到就**不写标签**（绝不写 "unknown" 之类的值）；
+//  · fail-closed 只针对带标签的记录：无标签记录在任何情况下都照常注入。
+// ---------------------------------------------------------------------------
+
+/** 分支名长度上限（契约 §2：「最长 100 字符」）。 */
+export const BRANCH_MAX_CHARS = 100
+
+/** 分支名的 refs 前缀：`normalizeBranch` 只脱这一层（`refs/tags/…` 不是分支）。 */
+const HEADS_PREFIX = 'refs/heads/'
+
+/**
+ * 控制字符（C0 + DEL/C1）：分支名里出现即视为非法（契约 §2）。
+ * 不额外剔除零宽字符：那类字符只会让标签**匹配不上真分支**（fail-closed），不会造成误注入。
+ */
+const BRANCH_CONTROL_RE = /[\u0000-\u001F\u007F-\u009F]/u
+
+/**
+ * 规范化分支名（契约 §3）：trim → 去 `refs/heads/` 前缀 → 截断到 100 字符。
+ * 非字符串、空、含控制字符 → `null`（＝无标签）。
+ *
+ * 「无标签」是本模块**唯一的失败形态**：回到「跨分支成立」是安全的默认，
+ * 而写一个永远匹配不上的假分支名会让这条记忆在任何分支下都不再注入（静默丢数据）。
+ */
+export function normalizeBranch(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  // 顺序与契约一致：先 trim（HEAD 往往带换行），再看控制字符 —— 否则正常的行尾换行会被判非法。
+  let text = value.trim()
+  if (text.startsWith(HEADS_PREFIX)) text = text.slice(HEADS_PREFIX.length).trim()
+  if (BRANCH_CONTROL_RE.test(text)) return null
+  if (text.length > BRANCH_MAX_CHARS) text = text.slice(0, BRANCH_MAX_CHARS)
+  return text.length === 0 ? null : text
+}
+
+/** 分离头指针：HEAD 内容直接是 commit id（sha-1 = 40 位、sha-256 = 64 位十六进制）。 */
+const DETACHED_HEAD_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu
+
+/** 符号引用行：`ref: refs/heads/<name>`。 */
+const SYMREF_RE = /^ref:\s*(.+)$/u
+
+/**
+ * 从 `.git/HEAD` 的内容解析分支名（**纯函数**，不碰文件系统，契约 §3）：
+ *   · `ref: refs/heads/main\n` → `'main'`；`ref: refs/heads/feat/x` → `'feat/x'`（带斜杠分支保留）；
+ *   · 分离头指针（40/64 位 hex）→ 短 sha（前 8 位）；
+ *   · `gitdir: …`（`.git` 是文件：worktree/submodule）或其它内容 → `null`（调用方去解析真实 gitdir）。
+ *
+ * 只认 `refs/heads/` 下的引用：`refs/tags/v1` / `refs/remotes/origin/main` 都不是「当前分支」，
+ * 与其猜一个名字去贴标签，不如当作分支未知（fail-closed）。
+ */
+export function branchFromHeadContent(content: unknown): string | null {
+  if (typeof content !== 'string') return null
+  const text = content.trim()
+  if (text.length === 0) return null
+  // `.git` 是文件时 HEAD 指向真实 gitdir，需要调用方相对 cwd 解析后再读那个目录的 HEAD。
+  if (/^gitdir:/iu.test(text)) return null
+  // 分离头指针：没有分支名，用短 sha 当标签（同一个 commit 上写的记忆仍然能按位置收敛）。
+  if (DETACHED_HEAD_RE.test(text)) return text.slice(0, 8)
+  const match = SYMREF_RE.exec(text)
+  if (!match) return null
+  const ref = match[1]!.trim()
+  if (ref.startsWith('refs/') && !ref.startsWith(HEADS_PREFIX)) return null
+  return normalizeBranch(ref)
+}
+
+/** 记录的分支标签（契约 §3；容错：非法/缺失/空 → `null` ＝ 跨分支成立）。 */
+export function branchOf(record: MemoryRecord | null | undefined): string | null {
+  if (record === null || record === undefined || typeof record !== 'object') return null
+  return normalizeBranch((record as { branch?: unknown }).branch)
+}
+
+/**
+ * 这条记录在当前分支下是否可见（纯函数，契约 §3）：
+ *   · `cfg.branchAware === false` → 永远 true（忽略标签）；
+ *   · 记录无标签 → true（存量记录在任何情况下都照常注入）；
+ *   · 有标签 → `currentBranch` 非空且相等。
+ *
+ * **fail-closed 的理由**（契约 §1）：把「特性分支上的临时约定」在主干上注入，会让模型基于错误前提给建议；
+ * 而漏掉一条分支专属记忆只是少一条参考。两者不对称，所以分支未知时挡下带标签的记录。
+ */
+export function isBranchVisible(
+  record: MemoryRecord | null | undefined,
+  currentBranch: string | null,
+  cfg: MemoryConfig,
+): boolean {
+  if (cfg?.branchAware === false) return true
+  const branch = branchOf(record)
+  if (branch === null) return true
+  // 当前分支同样先规范化：调用方传 `refs/heads/main` 时也要能和标签 `main` 对上。
+  const current = normalizeBranch(currentBranch)
+  return current !== null && current === branch
+}
+
+/**
+ * `/memory branch` 的渲染（契约 §3/§4）：当前分支、带标签条数、按分支分组的清单。
+ *
+ * 三条硬要求：
+ *  · 当前分支未知时必须**明说**（渲染成 `unknown`），否则用户无法判断「记忆去哪了」；
+ *  · 无标签时给出「没有任何分支专属记忆」，而不是空白 —— 空白会被读成渲染失败；
+ *  · 分组按「条数多→少、同名按字典序」输出，结果确定性可测。
+ */
+export function formatBranchSummary(records: Iterable<MemoryRecord>, currentBranch: string | null): string {
+  const list = records === null || records === undefined
+    ? []
+    : [...records].filter((record) => record !== null && record !== undefined)
+  const current = normalizeBranch(currentBranch)
+
+  const counts = new Map<string, number>()
+  for (const record of list) {
+    const branch = branchOf(record)
+    if (branch === null) continue
+    counts.set(branch, (counts.get(branch) ?? 0) + 1)
+  }
+  let tagged = 0
+  for (const count of counts.values()) tagged += count
+
+  const lines: string[] = [
+    `[记忆分支 · 当前分支：${current ?? 'unknown'}]`,
+    `带分支标签的记忆：${tagged} 条（库内共 ${list.length} 条）。`,
+  ]
+  if (tagged === 0) {
+    lines.push('没有任何分支专属记忆：全部记忆都跨分支成立。')
+  } else {
+    lines.push('按分支分组：')
+    const groups = [...counts.entries()].sort((a, b) => (b[1] - a[1]) || compareText(a[0], b[0]))
+    for (const [branch, count] of groups) {
+      lines.push(`  - ${branch}：${count} 条${branch === current ? '（当前分支）' : ''}`)
+    }
+  }
+  // 未知分支时说清后果：带标签的记录此刻一律不注入（fail-closed），只有无标签的照常。
+  if (current === null) {
+    lines.push('当前分支未知（不在 git 仓库或读不到 HEAD）：带标签的记忆此时一律不注入（fail-closed）。')
+  }
+  return lines.join('\n')
 }

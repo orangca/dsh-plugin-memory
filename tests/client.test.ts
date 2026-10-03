@@ -261,14 +261,23 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
     assert.deepEqual(byName(name).parse(''), { kind: 'clear' }, `${name}: 空草稿 = 清除覆盖`)
   }
 
-  // 28 个字段都要有规格，且与 Host 侧 volatile 字段一一对应
-  assert.equal(specs.length, 28)
+  // M12：分支感知开关（布尔，界面 0/1、写回真布尔）
+  assert.deepEqual(byName('branchAware').parse('1'), { kind: 'set', value: true })
+  assert.deepEqual(byName('branchAware').parse('0'), { kind: 'set', value: false })
+  assert.equal(byName('branchAware').parse('2'), undefined)
+  assert.deepEqual(byName('branchAware').parse(''), { kind: 'clear' })
+  assert.equal(byName('branchAware').format(true), '1')
+  assert.equal(byName('branchAware').format(undefined), '')
+
+  // 29 个字段都要有规格，且与 Host 侧 volatile 字段一一对应
+  assert.equal(specs.length, 29)
   for (const name of [
     'selfIntroEnabled', 'selfIntroMinTurn', 'selfIntroMaxAsks',
     'sleepEnabled', 'sleepSessions', 'sleepMaxBackfill',
     'refsEnabled', 'refsMax',
     'writePolicy', 'pendingMax',
     'language',
+    'branchAware',
   ] as const) {
     assert.ok(specs.some((spec) => spec.field === name), `设置页缺少 ${name}`)
   }
