@@ -3,6 +3,50 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.17 — 2026-10-03
+
+Three tracks in one release, all from the "what is still missing" list rather than the competitor survey.
+
+### Added
+
+- **`/memory trace <sessionId prefix> [#<seq>]`** — the reverse of provenance. 0.5.9 gave each memory a source,
+  0.5.14 let the user verify one row; this answers "what did that conversation leave behind": every record whose
+  reference points into that session, optionally narrowed to the ones whose range covers a given event seq.
+  Read-only (proven: records, counters, audit ring and disk writes all unchanged), branch-filtered, and it never
+  shows pending rows. Command only — deliberately no eighth tool, so the tool contract stays where the M11 tests
+  pinned it.
+- **Zero-dependency retrieval quality.** The README's known-limitations section used to say search was purely
+  lexical; now lexical search is as good as it gets without embeddings: Chinese bigrams with single-character
+  fallback, light English suffix folding, IDF weighting instead of equal-weight hit counting, and length
+  normalisation so a short precise row beats a long padded one. `memory_explain` reports which tokens matched and
+  how much each contributed. Measured on this machine's real store: Top1 **85.7% → 100%**, Top3 flat at 100%,
+  trigger rate unchanged; recall p50 at 2000 rows 1.42 ms against a 10 ms budget (~1.4x the old cost, the price of
+  exact df statistics per call). Three switches (`searchStemming`, `searchBigram`, `searchLengthPenalty`) ride the
+  patch row.
+- **`ctx.memory` frozen as protocol v1** (`docs/protocol-v1.md`, `docs/protocol-v1.zh.md`, both now shipped in the
+  package) plus `tests/protocol.test.ts`, an 11-case conformance suite pinning every documented promise to the
+  built `lib/index.js` — including the three load-bearing rules: pending never injects, `refs` stays out of the
+  fingerprint, `branch` goes in.
+
+### Fixed
+
+- **The service face could write garbage.** The `memory_write` tool has a JSON Schema; `ctx.memory.write` had
+  nothing, so a third-party caller could create a record with `kind: undefined`. The service now validates `kind`
+  and `text` and returns `rejected_invalid` without writing.
+- The service now exposes `protocolVersion: '1.0'`, and the protocol documents ship with the package.
+- Retrieval switches were read from `RecallOptions` while living on `MemoryConfig`: every in-plugin recall path and
+  the service method now pass `cfg`, so the knobs actually apply.
+
+### Decisions recorded rather than silently changed
+
+- The recall *gate* still uses the pre-existing `match`/`minLexical` values, not the new normalised score: feeding
+  the new score into `recallMinMatch` (0.4) would zero out recall entirely (measured ~0.16 for real R2 queries).
+  `explainMatch().passes` implements the contract's literal rule for anyone asking per-row.
+- Ranking keeps the existing 0.6/0.3/0.1 shape and only swaps the lexical term; sorting purely by the new score
+  made two near-identical rows (0.1617 vs 0.1636) invert an importance-0.9 row, breaking host#13 for no gain.
+- `list()` / `recall()` remain the unfiltered raw view of the store, and `write` reporting `ok: true` means
+  "applied in memory" rather than "durable" — both are now stated in the protocol instead of being left implicit.
+
 ## 0.5.16 — 2026-10-03
 
 The last item from the competitor-survey queue: 0.5.9 gave every memory a verifiable source, 0.5.14 let the *user*

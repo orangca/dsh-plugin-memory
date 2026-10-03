@@ -350,6 +350,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 /memory self history [subject]                   自画像修订链（旧 → 新，含归档时间）
 /memory self reset [persona|work]                归档当前自画像（保留历史，不删除）
 /memory verify <id prefix>                    回到引用指向的事件核对这条记忆的来源（只读）
+/memory trace <sessionId 前缀> [#<seq>]        来源反查：列出引用指向该会话的记忆（#<seq> 只看覆盖该序号的区间；--at <seq> 等价）（只读）
 /memory audit [--limit N] [--verify]            写入审计：最近尝试 + 库内汇总；--verify 核对本会话注入是否逐字出现在会话日志里（只读）
 /memory export [path]                            导出 JSON
 /memory import <path>                            导入 JSON（按指纹去重；逐字段校验、数值夹取、`pinned` 强制关闭、来源一律降级为 `observed`）
@@ -413,7 +414,8 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 只能通过 patch 行设置的进阶旋钮（含默认值）：自画像条数 `selfPortraitMaxItems` 12 /
 `selfPortraitMaxSelfObserved` 4；捕获调优 `capturePerHour` 20、`captureMinConfidence` 0.6、
-`echoThreshold` 0.9、`gistMinMarkers` 2；自评准入 `selfPortraitPromoteSessions` 2、
+`echoThreshold` 0.9、`gistMinMarkers` 2；**检索质量** `searchStemming` true、`searchBigram` true、
+`searchLengthPenalty` 0.3（英文词形归并 / 中文 bigram / 长度归一化强度）；自评准入 `selfPortraitPromoteSessions` 2、
 `selfPortraitModelMinConfidence` 0.85；整合 `mergeSimilarity` 0.7、`archiveAfterDays` 180、
 `archiveBelowImportance` 0.15、`summarizeAbove` 5；召回细节 `recallMinQueryChars` 12、`recallMinHits` 2、
 `recallMinMatch` 0.4、`recallCooldownTurns` 3、`recallBudgetMs` 10；隐私 `piiPolicy` `mask`；

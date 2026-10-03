@@ -171,6 +171,12 @@ export const DEFAULTS: MemoryConfig = {
   // M13：内存审计环容量（契约 docs/audit.md §2.1）—— `0` = 不记录（显式关闭）；
   // 默认 50 与 `pendingMax` 同量级：够放下一轮会话里被拒/入队的尝试，又有硬上限。
   auditMax: 50,
+  // M15-B：检索质量升级（契约 docs/semantic.md §4）—— 英文轻量词形归并 + 中文 bigram 默认开，
+  // 长度归一化强度 0.3。默认值下 `tokenize` 与 0.5.16 **逐 token 相同**；变的是排序分
+  // （idf 加权 + 长度归一化，契约 §3），门槛（`match` 与 `minLexical`/`minMatch`）语义不变。
+  searchStemming: true,
+  searchBigram: true,
+  searchLengthPenalty: 0.3,
   gistBudgetRatio: 0.3,
   charsPerToken: 2.5,
   sectionOrder: 9000,
@@ -613,24 +619,45 @@ export function deriveOriginFromMessages(messages: unknown): MemoryOrigin {
   return 'model_proposed'
 }
 
-/** 轻量拉丁词干：只处理最常见的复数/时态尾巴（不引依赖）。 */
-function stemLatin(word: string): string {
+/**
+ * 词形归并：轻量后缀剥离（契约 docs/semantic.md §2），不引入词干库。
+ *
+ * 只对**英文字母序列**动手：`build` / `building` / `builds` 归并到同一个 token，
+ * 于是「用 building 写的记忆」也能被「build」查到。中文与数字原样返回 ——
+ * 它们没有英语形态变化，硬剥后缀只会把 `0.5.9`、`release.mjs` 这类标识符切坏。
+ * 长度 ≤ 4 的词不动（`docs` / `node` / `dist` 本身已是完整词，剥尾只会制造噪声）。
+ */
+export function stemToken(token: string): string {
+  const word = String(token ?? '').toLowerCase()
+  // 中文（CJK）原样
+  if (/[\u3400-\u4dbf\u4e00-\u9fff]/u.test(word)) return word
+  // 纯数字原样
+  if (/^[0-9]+$/u.test(word)) return word
   if (word.length <= 4) return word
   return word.replace(/(ing|ed|s)$/u, '')
 }
 
 /**
- * 分词（设计稿 §6.1）：拉丁词 + 轻量词干；CJK 连续串切 bigram（长度 1 时保留单字）。
+ * 检索 token 化的**唯一实现**（契约 docs/semantic.md §2）：拉丁词按空白/标点切分后做 `stemToken`，
+ * CJK 连续串切 bigram（长度 1 时保留单字），数字保留。
  * 例：`记忆数据落在` → 记忆/忆数/数据/据落/落在；`scripts/release.mjs` → scripts/release/mjs。
+ *
+ * `stemming` / `bigram` 就是契约 §4 的两个开关（`searchStemming` / `searchBigram`）：
+ * 出厂默认都为 true，因此 `tokenizeForSearch` 与旧名 `tokenize` 逐 token 相同。
  */
-export function tokenize(text: unknown): string[] {
+function tokenizeSearchWith(text: unknown, stemming: boolean, bigram: boolean): string[] {
   const normalized = normalizeText(text)
   const tokens: string[] = []
   for (const match of normalized.matchAll(/[a-z0-9][a-z0-9._-]*/gu)) {
-    for (const piece of match[0].split(/[._-]/u).filter(Boolean)) tokens.push(stemLatin(piece))
+    for (const piece of match[0].split(/[._-]/u).filter(Boolean)) tokens.push(stemming ? stemToken(piece) : piece)
   }
   for (const match of normalized.matchAll(/[\u3400-\u4dbf\u4e00-\u9fff]+/gu)) {
     const run = match[0]
+    if (!bigram) {
+      // 关掉 bigram ＝ 按单字切：中文没有空格，这是零依赖下唯一的兜底口径。
+      for (const char of run) tokens.push(char)
+      continue
+    }
     if (run.length === 1) {
       tokens.push(run)
       continue
@@ -638,6 +665,49 @@ export function tokenize(text: unknown): string[] {
     for (let index = 0; index < run.length - 1; index += 1) tokens.push(run.slice(index, index + 2))
   }
   return tokens
+}
+
+/**
+ * 检索 token 化（契约 docs/semantic.md §2）：中文 bigram + 单字兜底；英文按空白/标点切分后
+ * 做 `stemToken`；数字保留。出厂默认开关（归并 + bigram）下与旧名 `tokenize` 完全等价。
+ */
+export function tokenizeForSearch(text: string): string[] {
+  return tokenizeSearchWith(text, true, true)
+}
+
+/**
+ * 分词（设计稿 §6.1；M15-B 起保留为旧名，与 `tokenizeForSearch` 等价实现）。
+ * ⚠ 这是一条**行为契约**：`similarity` / `containment` / `deriveSubject` / 去重都吃它，
+ * 改动会连带改变合并、冲突与指纹，因此默认路径必须与 0.5.16 逐 token 相同。
+ */
+export function tokenize(text: unknown): string[] {
+  return tokenizeSearchWith(text, true, true)
+}
+
+// ---------------------------------------------------------------- M15-B：检索开关（契约 docs/semantic.md §4）
+
+/** 检索 token 化的两个布尔开关（出厂默认都是 true）。 */
+interface SearchFlags {
+  /** `searchStemming`：英文轻量词形归并。 */
+  stemming: boolean
+  /** `searchBigram`：中文 bigram（关掉 ＝ 按单字）。 */
+  bigram: boolean
+}
+
+const DEFAULT_SEARCH_FLAGS: SearchFlags = { stemming: true, bigram: true }
+
+/** 从配置读检索开关：缺省/非法一律按出厂默认（归并 + bigram）。 */
+function searchFlagsOf(cfg: Partial<MemoryConfig> | undefined | null): SearchFlags {
+  return {
+    stemming: cfg?.searchStemming !== false,
+    bigram: cfg?.searchBigram !== false,
+  }
+}
+
+/** 从配置读长度归一化强度：非法值回落 `DEFAULTS`；`0` 是合法值（＝关闭归一化）。 */
+function searchLengthPenaltyOf(cfg: Partial<MemoryConfig> | undefined | null): number {
+  const value = cfg?.searchLengthPenalty
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : DEFAULTS.searchLengthPenalty
 }
 
 /**
@@ -649,26 +719,28 @@ export function tokenize(text: unknown): string[] {
  * 再被扫描之后的预算检查整体丢弃，表现为**静默失效**。缓存把这一步从「每回合每条一次」
  * 降到「每条一次」。
  *
- * 键用 `kind|hash`：`hash` 覆盖 kind/scope/subject/text，内容变了键就变了，
+ * 键用 `kind|hash|开关位`：`hash` 覆盖 kind/scope/subject/text，内容变了键就变了，
  * 不会读到过期分词；旧条目由容量上限兜底清理（超过上限直接清空，代价可控）。
  */
 const TOKEN_CACHE = new Map<string, Set<string>>()
 const TOKEN_CACHE_MAX = 8192
 
-/** 缓存键：优先用记录指纹；手工构造、没有指纹的记录退化为按内容拼键。 */
-function tokenCacheKey(record: MemoryRecord): string {
+/** 缓存键：优先用记录指纹；手工构造、没有指纹的记录退化为按内容拼键。
+ *  ⚠ `search*` 开关必须进键：`searchStemming=false` 与 `true` 的分词结果不同，
+ *  共用一个键会让后一次调用读到前一次的分词（缓存不得改变语义）。 */
+function tokenCacheKey(record: MemoryRecord, flags: SearchFlags): string {
   const hash = typeof record.hash === 'string' && record.hash.length > 0
     ? record.hash
     : `${record.text}|${record.subject ?? ''}|${(record.tags ?? []).join(',')}`
-  return `${record.kind}|${hash}`
+  return `${record.kind}|${hash}|${flags.stemming ? 's1' : 's0'}${flags.bigram ? 'b1' : 'b0'}`
 }
 
 /** 一条记录的 token 集合（text + subject + tags），带缓存。 */
-function tokensOf(record: MemoryRecord): Set<string> {
-  const key = tokenCacheKey(record)
+function tokensOf(record: MemoryRecord, flags: SearchFlags = DEFAULT_SEARCH_FLAGS): Set<string> {
+  const key = tokenCacheKey(record, flags)
   const cached = TOKEN_CACHE.get(key)
   if (cached !== undefined) return cached
-  const tokens = new Set(tokenize(`${record.text} ${record.subject ?? ''} ${(record.tags ?? []).join(' ')}`))
+  const tokens = new Set(tokenizeSearchWith(`${record.text} ${record.subject ?? ''} ${(record.tags ?? []).join(' ')}`, flags.stemming, flags.bigram))
   // 逐个淘汰最旧的一条（Map 保持插入顺序）。**不能**整表清空：扫描量超过上限时
   // 清空会让每次调用都重新分词全库，实测 5000 条反而比不做缓存更慢。
   if (TOKEN_CACHE.size >= TOKEN_CACHE_MAX) {
@@ -702,25 +774,24 @@ interface QueryView {
   tokenSet: Set<string>
 }
 
-function queryView(query: unknown): QueryView {
+function queryView(query: unknown, flags: SearchFlags = DEFAULT_SEARCH_FLAGS): QueryView {
   const text = normalizeText(query)
-  const tokens = tokenize(query)
+  const tokens = tokenizeSearchWith(query, flags.stemming, flags.bigram)
   return { text, tokens, tokenSet: new Set(tokens) }
 }
 
 /** 查询覆盖率（无重复计数语义，与旧实现一致）。 */
-function lexicalMatchTokens(record: MemoryRecord, view: QueryView): number {
+function lexicalMatchTokens(recordTokens: Set<string>, view: QueryView): number {
   if (view.tokens.length === 0) return 1
-  const haystack = tokensOf(record)
   let hits = 0
-  for (const token of view.tokens) if (haystack.has(token)) hits += 1
+  for (const token of view.tokens) if (recordTokens.has(token)) hits += 1
   return hits / view.tokens.length
 }
 
 /** 词面命中率：查询 token 在记录里的覆盖率（0–1）。空查询视为完全匹配。
- *  适合**短查询**（模型显式 recall、销毁性操作）。 */
+ *  适合**短查询**（模型显式 recall、销毁性操作）；也是 `recallRecords` 的**门槛**口径。 */
 export function lexicalMatch(record: MemoryRecord, query: unknown): number {
-  return lexicalMatchTokens(record, queryView(query))
+  return lexicalMatchTokens(tokensOf(record), queryView(query))
 }
 
 /**
@@ -730,9 +801,15 @@ export function lexicalMatch(record: MemoryRecord, query: unknown): number {
  *   · 要求至少 `minHits` 个有信息量的 token（长度 ≥2 且非纯数字），挡掉巧合命中。
  * 用查询覆盖率做这件事会在长消息下趋近 0，这是 M4 评测暴露出来的缺陷。
  */
-/** 记忆侧命中度（查询侧已预先分词）。 */
-function memoryMatchTokens(record: MemoryRecord, view: QueryView, options: MemoryMatchOptions): number {
-  const recordTokens = tokensOf(record)
+/** 记忆侧命中度（查询侧已预先分词）。
+ *  `dfSink` 只在 `recallRecords` 里传：命中即顺手累加 df —— 这样「算门槛」与「统计 df」
+ *  共用同一次 token 集合遍历（热路径上少一遍扫描）。 */
+function memoryMatchTokens(
+  recordTokens: Set<string>,
+  view: QueryView,
+  options: MemoryMatchOptions,
+  dfSink?: Map<string, number>,
+): number {
   if (recordTokens.size === 0) return 0
   const queryTokens = view.tokenSet
   if (queryTokens.size === 0) return 0
@@ -742,6 +819,7 @@ function memoryMatchTokens(record: MemoryRecord, view: QueryView, options: Memor
   for (const token of recordTokens) {
     if (!queryTokens.has(token)) continue
     hits += 1
+    if (dfSink !== undefined) dfSink.set(token, (dfSink.get(token) ?? 0) + 1)
     if (token.length >= 2 && !/^\d+$/u.test(token)) informative += 1
   }
   if (informative < minHits) return 0
@@ -750,13 +828,15 @@ function memoryMatchTokens(record: MemoryRecord, view: QueryView, options: Memor
 }
 
 export function memoryMatch(record: MemoryRecord, query: unknown, options: MemoryMatchOptions = {}): number {
-  return memoryMatchTokens(record, queryView(query), options)
+  return memoryMatchTokens(tokensOf(record), queryView(query), options)
 }
 
-/** M1 的轻量检索打分（查询侧已预先分词）。 */
+/** M1 的轻量检索打分（查询侧已预先分词）。
+ *  ⚠ 保留 0.5.16 的口径（0.6 词面 + 0.3 重要度 + 0.1 时效）：它是**对外签名的一部分**，
+ *  改口径会静默改变调用方的阈值判断。`recallRecords` 自 M15-B 起改用契约 §3 的新打分。 */
 function scoreRecordTokens(record: MemoryRecord, view: QueryView, now: number, matchOverride?: number): number {
   if (view.text.length === 0) return record.importance
-  const lexical = matchOverride ?? lexicalMatchTokens(record, view)
+  const lexical = matchOverride ?? lexicalMatchTokens(tokensOf(record), view)
   // 有查询但词面完全没命中 → 不参与召回（避免「不相关条目靠重要度混进来」）。
   if (lexical === 0) return 0
   const ageDays = Math.max(0, (now - (record.lastUsedAt ?? record.observedAt)) / 86_400_000)
@@ -769,18 +849,207 @@ export function scoreRecord(record: MemoryRecord, query: unknown, now: number = 
   return scoreRecordTokens(record, queryView(query), now, matchOverride)
 }
 
+// ---------------------------------------------------------------- M15-B：IDF 加权与长度归一化
+// 契约 docs/semantic.md §2/§3。整节是纯函数：不联网、不引依赖、不调模型。
+
+/** 本次检索的 IDF 统计。`df` 只为**查询 token** 建表（其余 token 的 df 用不到），
+ *  `n` ＝ 参与检索的记录数。契约 §3 要求 N 与 df 是对本次记录集合的精确统计，
+ *  因此它由 `recallRecords` / `explainMatch` 在**一次调用内**构建，不允许全局近似。 */
+interface IdfStats {
+  n: number
+  df: Map<string, number>
+}
+
+/** `idf(t) = log(1 + N / (1 + df(t)))`（契约 §3）。 */
+function idfIn(stats: IdfStats, token: string): number {
+  return Math.log(1 + stats.n / (1 + (stats.df.get(token) ?? 0)))
+}
+
+/**
+ * 一个检索 token 的权重（idf：越稀有越高），确定性、无随机。
+ *
+ * `idf(t) = log(1 + N / (1 + df(t)))`：N ＝ 参与检索的记录数，df(t) ＝ 含该 token 的记录数。
+ * 本函数没有 cfg 入参（契约冻结签名），因此按**出厂默认**分词统计：
+ * 入参 token 先过 `stemToken`（已归并的 token 幂等），记录侧按 `text + subject + tags` 分词。
+ */
+export function searchIdf(token: string, records: Iterable<MemoryRecord>): number {
+  const needle = stemToken(String(token ?? ''))
+  let n = 0
+  let df = 0
+  for (const record of records) {
+    n += 1
+    if (tokensOf(record).has(needle)) df += 1
+  }
+  return Math.log(1 + n / (1 + df))
+}
+
+/** 命中详情：给 `memory_explain` 用（哪些 token 命中、各多少分、总分）。 */
+export interface MatchDetail {
+  /** 查询侧 token（去重、保持分词顺序）。 */
+  tokens: string[]
+  /** 记录侧真的含有的那些查询 token（`tokens` 的子集，顺序同 `tokens`）。 */
+  matched: string[]
+  /** token → 贡献分（已含 idf 与长度归一化）；只列命中 token，求和 ＝ `score`。 */
+  scores: Record<string, number>
+  /** 最终得分（0..1，便于展示与阈值比较）。 */
+  score: number
+  /** 是否过了 `cfg.recallMinMatch` 门槛。 */
+  passes: boolean
+}
+
+/**
+ * 单条记录对查询的匹配详情（`query` 为原始查询文本）。
+ *
+ * 口径（契约 docs/semantic.md §3，必须与实现一致）：
+ *   Q ＝ `tokenizeForSearch(query)` 去重，T ＝ 记录 token 集合，H ＝ Q ∩ T；
+ *   `score_raw = Σ_{t∈H} idf(t)`，`score_max = Σ_{t∈Q} idf(t)`；
+ *   `normalized = score_raw / (score_max × (1 + lengthPenalty × log2(1 + |T| / |Q|)))`；
+ *   `score = clamp(normalized, 0, 1)`，`passes = score >= cfg.recallMinMatch`。
+ * 空查询与 `lexicalMatch(record, '')` 同口径：视为完全匹配（score ＝ 1）。
+ */
+export function explainMatch(
+  record: MemoryRecord,
+  query: string,
+  records: Iterable<MemoryRecord>,
+  cfg: MemoryConfig,
+): MatchDetail {
+  const flags = searchFlagsOf(cfg)
+  const lengthPenalty = searchLengthPenaltyOf(cfg)
+  const tokens = [...new Set(tokenizeSearchWith(query, flags.stemming, flags.bigram))]
+  const recordTokens = tokensOf(record, flags)
+  const threshold = typeof cfg?.recallMinMatch === 'number' && Number.isFinite(cfg.recallMinMatch)
+    ? cfg.recallMinMatch
+    : DEFAULTS.recallMinMatch
+  if (tokens.length === 0) {
+    return { tokens, matched: [], scores: {}, score: 1, passes: 1 >= threshold }
+  }
+  const stats = buildIdfStats(new Set(tokens), records, flags)
+  const matched: string[] = []
+  const scores: Record<string, number> = {}
+  let raw = 0
+  let max = 0
+  for (const token of tokens) {
+    const idf = idfIn(stats, token)
+    max += idf
+    if (!recordTokens.has(token)) continue
+    matched.push(token)
+    raw += idf
+  }
+  // |T|/|Q| 用记录 token 集合大小（含 text + subject + tags，与现状一致）。
+  const score = max > 0
+    ? clamp01(raw / (max * (1 + lengthPenalty * Math.log2(1 + recordTokens.size / tokens.length))))
+    : 0
+  if (raw > 0 && score > 0) {
+    // 贡献分 ＝ idf(t) × 同一次的长度归一化系数 ⇒ 求和恰好等于 `score`。
+    const share = score / raw
+    for (const token of matched) scores[token] = idfIn(stats, token) * share
+  }
+  return { tokens, matched, scores, score, passes: score >= threshold }
+}
+
+/** 0..1 夹取（`NaN` → 0）。 */
+function clamp01(value: number): number {
+  return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0
+}
+
+/** 只为**查询 token**统计 df：遍历每条记录的 token 集合，复杂度 O(N·|T|)（token 集合有缓存）。 */
+function buildIdfStats(queryTokens: Set<string>, records: Iterable<MemoryRecord>, flags: SearchFlags): IdfStats {
+  const df = new Map<string, number>()
+  let n = 0
+  for (const record of records) {
+    n += 1
+    for (const token of tokensOf(record, flags)) {
+      if (!queryTokens.has(token)) continue
+      df.set(token, (df.get(token) ?? 0) + 1)
+    }
+  }
+  return { n, df }
+}
+
+/** 只为**查询 token**统计 df（记录侧按 text + subject + tags 分词，token 集合有缓存）。
+ *  遍历较小的一侧：短查询时只有几个 token，不必为每条记录扫整个 token 集合。 */
+function countQueryDf(queryTokens: Set<string>, recordTokens: Set<string>, df: Map<string, number>): void {
+  if (queryTokens.size <= recordTokens.size) {
+    for (const token of queryTokens) {
+      if (!recordTokens.has(token)) continue
+      df.set(token, (df.get(token) ?? 0) + 1)
+    }
+    return
+  }
+  for (const token of recordTokens) {
+    if (!queryTokens.has(token)) continue
+    df.set(token, (df.get(token) ?? 0) + 1)
+  }
+}
+
+/** 本次调用的 idf 表：只为**查询 token** 建一次（热路径上避免逐条记录重算 `Math.log`）。
+ *  返回值里的 `total` 就是 `score_max = Σ_{t∈Q} idf(t)`。 */
+function idfTableFor(queryTokens: Set<string>, stats: IdfStats): { idf: Map<string, number>; total: number } {
+  const idf = new Map<string, number>()
+  let total = 0
+  for (const token of queryTokens) {
+    const value = idfIn(stats, token)
+    idf.set(token, value)
+    total += value
+  }
+  return { idf, total }
+}
+
+/**
+ * 契约 §3 的排序分里的**相关性项**（纯相关性）：H ＝ Q ∩ T，`score_raw = Σ_{t∈H} idf(t)`，
+ * `score_max = Σ_{t∈Q} idf(t)`（由调用方算好一次传入），
+ * 再除以 `1 + lengthPenalty × log2(1 + |T| / |Q|)` 做长度归一化。
+ * 长度归一化让「短而精准」的记忆不被长文堆砌压过（长短文本命中同样多 token 时，短文本分更高）。
+ * 遍历的是**较小的一侧**：短查询（`/memory search`）遍历查询 token，长查询（R2 整轮消息）
+ * 遍历记录 token —— 两条热路径都不做无谓的扫描。
+ */
+function relevanceScore(
+  queryTokens: Set<string>,
+  recordTokens: Set<string>,
+  idf: Map<string, number>,
+  lengthPenalty: number,
+  maxIdf: number,
+): number {
+  if (queryTokens.size === 0 || recordTokens.size === 0 || !(maxIdf > 0)) return 0
+  let raw = 0
+  if (queryTokens.size <= recordTokens.size) {
+    for (const token of queryTokens) {
+      if (!recordTokens.has(token)) continue
+      raw += idf.get(token) ?? 0
+    }
+  } else {
+    for (const token of recordTokens) {
+      if (!queryTokens.has(token)) continue
+      raw += idf.get(token) ?? 0
+    }
+  }
+  if (raw === 0) return 0
+  return clamp01(raw / (maxIdf * (1 + lengthPenalty * Math.log2(1 + recordTokens.size / queryTokens.size))))
+}
+
 /** 检索：过滤 → 打分 → 确定性排序。
  *  `mode: 'query'`（默认）= 短查询，按查询覆盖率判定，minLexical 默认 0.34；
  *  `mode: 'memory'` = 长查询（整轮用户消息），按记忆侧覆盖率判定，minMatch 默认 0.4 + minHits 2。
  *  `includeArchived: true` 也纳入归档条目（设计稿 §4.4：归档只是不常驻注入，仍可被检索到）；
  *  `invalid` 永不参与检索。
- *  破坏性操作（删除）应传更高的 minLexical（如 0.6）。 */
+ *  破坏性操作（删除）应传更高的 minLexical（如 0.6）。
+ *
+ *  M15-B（契约 docs/semantic.md §2/§3）：`match` 仍是**门槛**（相关性判定值，口径不变，
+ *  因此既有阈值全部照旧），排序分里的**词面项**换成 IDF 加权 + 长度归一化的新相关性分
+ *  （`relevanceScore`），权重形状沿用 M1（0.6 相关性 + 0.3 重要度 + 0.1 时效）——
+ *  只换相关性这一项的算法，既有排序语义才不会被顺手改掉。
+ *  N 与 df 在本次调用内一次统计、复用（复杂度 O(N·|T|)，token 集合有缓存）。 */
 export function recallRecords(records: Iterable<MemoryRecord>, options: RecallOptions, now: number = Date.now()): RecallHit[] {
   const { query = '', kind, scopeLevel, tag, limit = 8 } = options ?? {}
   const mode = options?.mode ?? 'query'
+  // `search*` 三个开关在 `MemoryConfig` 上。宿主按 `options.cfg` 透传（M15 集成时加的字段）；
+  // 也兼容「把三键直接并进 options」的老写法 —— 有哪个读哪个，都没有就用出厂默认，签名不变。
+  const searchOptions = options?.cfg ?? (options as (RecallOptions & Partial<MemoryConfig>) | undefined)
+  const flags = searchFlagsOf(searchOptions)
+  const lengthPenalty = searchLengthPenaltyOf(searchOptions)
   // 查询侧只分词一次：一次扫描要过上千条记录，逐条重新分词在长查询下是主要开销
   // （实测 2000 条时 recall(memory) 从 ~23ms 降到 ~2ms，见 tools/bench.ts）。
-  const view = queryView(query)
+  const view = queryView(query, flags)
   const hasQuery = view.text.length > 0
   const threshold = mode === 'memory'
     ? (options?.minMatch ?? 0.4)
@@ -788,17 +1057,50 @@ export function recallRecords(records: Iterable<MemoryRecord>, options: RecallOp
   const pool = options?.includeArchived
     ? [...records].filter((record) => record.status === 'active' || record.status === 'archived')
     : listActive(records)
-  return pool
+  const filtered = pool
     .filter((record) => (kind ? record.kind === kind : true))
     .filter((record) => (scopeLevel ? record.scope.level === scopeLevel : true))
     .filter((record) => (tag ? (record.tags ?? []).includes(tag) : true))
-    .map((record) => {
-      const match = mode === 'memory'
-        ? memoryMatchTokens(record, view, { minHits: options?.minHits ?? 2 })
-        : lexicalMatchTokens(record, view)
-      return { record, match, score: scoreRecordTokens(record, view, now, match) }
+  // 第一遍：门槛值 + df。两条都要逐条看记录的 token 集合，能合并就合并 ——
+  // `mode: 'memory'` 时把 df 计数挂进 `memoryMatchTokens`，一次遍历办完两件事。
+  const df = new Map<string, number>()
+  const entries: Array<{ record: MemoryRecord; recordTokens: Set<string>; match: number }> = []
+  for (const record of filtered) {
+    const recordTokens = tokensOf(record, flags)
+    const match = mode === 'memory'
+      ? memoryMatchTokens(recordTokens, view, { minHits: options?.minHits ?? 2 }, hasQuery ? df : undefined)
+      : lexicalMatchTokens(recordTokens, view)
+    if (hasQuery && mode !== 'memory') countQueryDf(view.tokenSet, recordTokens, df)
+    entries.push({ record, recordTokens, match })
+  }
+  const stats: IdfStats = { n: filtered.length, df }
+  const { idf, total: maxIdf } = hasQuery ? idfTableFor(view.tokenSet, stats) : { idf: new Map<string, number>(), total: 0 }
+
+  // 第二遍：只给**过了门槛**的条目算分（没过的条目本来就会被过滤掉，不必为它们算相关性）。
+  const results: RecallHit[] = []
+  for (const entry of entries) {
+    if (hasQuery && entry.match < threshold) continue
+    // 空查询沿用 M1 口径（按重要度返回，没有相关性可言）。
+    if (!hasQuery) {
+      results.push({ record: entry.record, match: entry.match, score: entry.record.importance })
+      continue
+    }
+    // 有查询但词面完全没命中 → 0（与 `scoreRecordTokens` 同一取向：不让无关条目靠重要度混进来）。
+    if (entry.match === 0) {
+      results.push({ record: entry.record, match: entry.match, score: 0 })
+      continue
+    }
+    const relevance = relevanceScore(view.tokenSet, entry.recordTokens, idf, lengthPenalty, maxIdf)
+    const ageDays = Math.max(0, (now - (entry.record.lastUsedAt ?? entry.record.observedAt)) / 86_400_000)
+    const recency = 1 / (1 + ageDays / 30)
+    results.push({
+      record: entry.record,
+      match: entry.match,
+      // M1 的权重形状不变：0.6 相关性（M15-B 换成 idf 加权 + 长度归一化）+ 0.3 重要度 + 0.1 时效。
+      score: 0.6 * relevance + 0.3 * entry.record.importance + 0.1 * recency,
     })
-    .filter((entry) => (hasQuery ? entry.match >= threshold : true))
+  }
+  return results
     .sort((a, b) => (b.score - a.score) || compareRecords(a.record, b.record))
     .slice(0, Math.max(1, Math.min(50, limit)))
 }

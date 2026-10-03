@@ -18,6 +18,7 @@ import type {
   MemoryScope,
   ModelWriteDecision,
   PortraitCandidate,
+  RecallOptions,
   RecordHashInput,
   ReflectInput,
   SelfFacet,
@@ -51,6 +52,7 @@ import {
   detectWorkspaceMarkers,
   effectiveImportance,
   estimateTokens,
+  explainMatch,
   extractCandidates,
   extractSummaryText,
   facetOf,
@@ -92,14 +94,17 @@ import {
   renderContextBlock,
   renderSelfBlock,
   scanSensitive,
+  searchIdf,
   shouldArchive,
   shouldIntroduce,
   shouldReflect,
   similarity,
   sleepPlanIsEmpty,
+  stemToken,
   textsFor,
   tokenCacheSize,
   tokenize,
+  tokenizeForSearch,
   transcriptOf,
   withRef,
   workspaceKeyOf,
@@ -446,6 +451,162 @@ test('memoryMatch：长查询用记忆侧覆盖率，短查询才是查询覆盖
   assert.equal(memoryMatch(unrelated, longTurn), 0, '长轮次里没出现记忆相关词 → 不命中')
   assert.ok(memoryMatch(unrelated, '记忆开发') > 0, '两个信息 token 命中即视为相关')
   assert.equal(memoryMatch(unrelated, '记忆开发', { minHits: 3 }), 0, '提高 minHits 可挡掉少量巧合命中')
+})
+
+// ---------------------------------------------------------------- M15-B：检索质量升级（零依赖）
+// 契约：docs/semantic.md §2（签名冻结）/§3（评分口径）/§4（三个开关）。
+
+test('stemToken：build/building/builds 同族归并；中文与数字原样返回（契约 §2）', () => {
+  assert.equal(stemToken('build'), 'build')
+  assert.equal(stemToken('building'), 'build')
+  assert.equal(stemToken('builds'), 'build')
+  assert.equal(stemToken('BUILDING'), 'build', '英文大小写不敏感')
+  // 中文与数字没有英语形态变化，必须原样返回
+  assert.equal(stemToken('记忆'), '记忆')
+  assert.equal(stemToken('构建流程'), '构建流程')
+  assert.equal(stemToken('2026'), '2026')
+  assert.equal(stemToken('0.5.9'), '0.5.9')
+  // ≤4 的短词不剥后缀：`docs` 不该被剥成 `doc`
+  assert.equal(stemToken('docs'), 'docs')
+  assert.equal(stemToken(''), '')
+})
+
+test('tokenizeForSearch：英文出词形、中文出 bigram、空串/纯标点安全（契约 §2）', () => {
+  assert.deepEqual(tokenizeForSearch('记忆数据'), ['记忆', '忆数', '数据'])
+  assert.deepEqual(tokenizeForSearch('中'), ['中'], '单字 CJK 保留单字兜底')
+  assert.deepEqual(tokenizeForSearch('building builds'), ['build', 'build'])
+  assert.ok(tokenizeForSearch('scripts/release.mjs').includes('release'))
+  assert.deepEqual(tokenizeForSearch('2026'), ['2026'], '数字保留')
+  assert.deepEqual(tokenizeForSearch(''), [])
+  assert.deepEqual(tokenizeForSearch('，。！？'), [], '纯标点切不出 token')
+  // 旧名 `tokenize` 与它逐 token 相同（出厂默认下行为不变）
+  const sample = '记忆数据 build scripts/release.mjs'
+  assert.deepEqual(tokenizeForSearch(sample), tokenize(sample))
+})
+
+test('searchIdf：稀有 token 权重高于常见 token，且确定性（契约 §2/§3）', () => {
+  const records = [
+    makeRecord({ kind: 'semantic', text: '构建流程用 pnpm。' }),
+    makeRecord({ kind: 'semantic', text: '构建流程再用 pnpm。' }),
+    makeRecord({ kind: 'semantic', text: '量子力学与记忆检索。' }),
+  ]
+  const rare = searchIdf('量子', records)
+  const common = searchIdf('构建', records)
+  assert.ok(rare > common, `稀有 token 的 idf 应更高：${rare} vs ${common}`)
+  assert.equal(rare, searchIdf('量子', records), '同输入两次结果必须一致（确定性）')
+  assert.equal(searchIdf('不存在的词', records), Math.log(1 + 3 / 1), 'df=0 的 token 按 N/(1+0) 计')
+  assert.equal(searchIdf('构建', []), 0, 'N=0 时 idf 为 0')
+})
+
+test('explainMatch：命中 token 与贡献分求和等于总分，passes 与阈值一致（契约 §2/§3）', () => {
+  const target = makeRecord({ kind: 'semantic', text: '构建流程统一用 pnpm build。' })
+  const other = makeRecord({ kind: 'semantic', text: '发布流程用 pnpm publish。' })
+  const records = [target, other]
+
+  const detail = explainMatch(target, '构建流程 pnpm', records, { ...cfg, recallMinMatch: 0.1 })
+  assert.deepEqual(detail.tokens, ['pnpm', '构建', '建流', '流程'])
+  assert.deepEqual(detail.matched, detail.tokens, '四个查询 token 都在记录里')
+  const sum = Object.values(detail.scores).reduce((total, value) => total + value, 0)
+  assert.ok(Math.abs(sum - detail.score) < 1e-9, '贡献分之和必须等于总分')
+  assert.ok(detail.score > 0 && detail.score <= 1)
+  assert.equal(detail.passes, detail.score >= 0.1)
+
+  // 同一个分数换个阈值：分数不变，passes 跟着阈值走
+  const strict = explainMatch(target, '构建流程 pnpm', records, { ...cfg, recallMinMatch: 0.99 })
+  assert.equal(strict.score, detail.score, '阈值不得影响分数')
+  assert.equal(strict.passes, false, '阈值调高后 passes 必须为 false')
+
+  // 部分命中：只列命中的 token，未命中的不进 scores/matched
+  const partial = explainMatch(other, '构建流程 pnpm', records, cfg)
+  assert.ok(partial.matched.includes('pnpm'))
+  assert.ok(!partial.matched.includes('构建'), '没命中的 token 不进 matched')
+  assert.deepEqual(Object.keys(partial.scores).sort(), partial.matched.slice().sort())
+
+  // 空查询与 `lexicalMatch(record, '')` 同口径：视为完全匹配
+  const empty = explainMatch(target, '', records, cfg)
+  assert.deepEqual(empty.tokens, [])
+  assert.deepEqual(empty.matched, [])
+  assert.equal(empty.score, 1)
+  assert.equal(empty.passes, true)
+})
+
+test('explainMatch：长度归一化让「短而精准」胜过长文堆砌（契约 §3）', () => {
+  const precise = makeRecord({ kind: 'semantic', text: '构建流程用 pnpm。' })
+  const padded = makeRecord({ kind: 'semantic', text: `构建流程用 pnpm。${'无关的补充说明文字。'.repeat(12)}` })
+  const records = [precise, padded]
+
+  const short = explainMatch(precise, '构建流程 pnpm', records, cfg)
+  const long = explainMatch(padded, '构建流程 pnpm', records, cfg)
+  assert.deepEqual(long.matched, short.matched, '长文命中的 token 不会更少')
+  assert.ok(short.score > long.score, `短而精准应胜过长文堆砌：${short.score} vs ${long.score}`)
+
+  // 关掉归一化（0）：长度惩罚消失，命中全部查询 token 时回到 1
+  const off = explainMatch(padded, '构建流程 pnpm', records, { ...cfg, searchLengthPenalty: 0 })
+  assert.ok(off.score > long.score, 'searchLengthPenalty=0 必须真的关掉长度惩罚')
+  assert.equal(off.score, 1)
+})
+
+test('explainMatch：关掉 searchStemming / searchBigram 的回落行为（契约 §4）', () => {
+  const record = makeRecord({ kind: 'semantic', text: '构建流程用 build 跑。' })
+  const records = [record, makeRecord({ kind: 'semantic', text: '发布流程用 build 发。' })]
+
+  // 归并开启：building → build，命中记录里的 build；关掉则原样比对
+  const stemmed = explainMatch(record, 'building', records, cfg)
+  assert.deepEqual(stemmed.matched, ['build'], '归并后 building 应命中 build')
+  const raw = explainMatch(record, 'building', records, { ...cfg, searchStemming: false })
+  assert.deepEqual(raw.matched, [], '关掉归并后不得再把 building 归并到 build')
+
+  // bigram 开启：中文出 bigram；关闭：按单字
+  const bigram = explainMatch(record, '构建', records, cfg)
+  assert.deepEqual(bigram.tokens, ['构建'])
+  assert.deepEqual(bigram.matched, ['构建'])
+  const unigram = explainMatch(record, '构建', records, { ...cfg, searchBigram: false })
+  assert.deepEqual(unigram.tokens, ['构', '建'])
+  assert.deepEqual(unigram.matched, ['构', '建'])
+})
+
+test('recallRecords：idf 加权让稀有 token 命中胜过常见 token 命中（契约 §3）', () => {
+  const at = Date.now() - 86_400_000
+  const commonA = makeRecord({ kind: 'semantic', text: '构建流程用 pnpm build。', importance: 0.5, observedAt: at })
+  const commonB = makeRecord({ kind: 'semantic', text: '构建流程再看 pnpm build。', importance: 0.5, observedAt: at })
+  const rare = makeRecord({ kind: 'semantic', text: '量子检索流程。', importance: 0.5, observedAt: at })
+  const records = [commonA, commonB, rare]
+
+  // 词面口径下三条各命中一半查询：覆盖率完全相同（这正是要换掉等权命中的原因）
+  assert.equal(lexicalMatch(commonA, '构建 量子'), lexicalMatch(rare, '构建 量子'))
+  const hits = recallRecords(records, { query: '构建 量子', limit: 3 }, at)
+  assert.equal(hits.length, 3)
+  assert.equal(hits[0]!.record.text, rare.text, '命中稀有 token 的记录应排在命中常见 token 的前面')
+})
+
+test('recallRecords：同样命中时「短而精准」排在长文堆砌之前（契约 §3 长度归一化）', () => {
+  const at = Date.now() - 86_400_000
+  const precise = makeRecord({ kind: 'semantic', text: '构建流程。', importance: 0.5, observedAt: at })
+  const padded = makeRecord({
+    kind: 'semantic',
+    text: `构建流程。${'无关的补充说明文字。'.repeat(12)}`,
+    importance: 0.5,
+    observedAt: at,
+  })
+  const hits = recallRecords([padded, precise], { query: '构建流程', limit: 2 }, at)
+  assert.equal(hits.length, 2)
+  assert.equal(hits[0]!.record.text, precise.text, '短的精准命中应排在长文堆砌之前')
+})
+
+test('recallRecords：门槛仍是旧的覆盖率口径，search* 开关可随 options 透传（契约 §3/§4）', () => {
+  const records = [
+    makeRecord({ kind: 'semantic', text: '构建流程用 pnpm。' }),
+    makeRecord({ kind: 'semantic', text: '完全不同的一条记忆。' }),
+  ]
+  // 覆盖率 1/2 = 0.5：默认阈值 0.34 过，提高到 0.6 不过 —— 与 M15-B 之前完全一致
+  assert.equal(recallRecords(records, { query: '构建 量子' }).length, 1)
+  assert.equal(recallRecords(records, { query: '构建 量子', minLexical: 0.6 }).length, 0)
+
+  // 开关透传：归并开启（出厂默认）时 building 命中 build；关掉后不命中
+  const buildable = [makeRecord({ kind: 'semantic', text: '构建流程用 build 跑。', importance: 0.5 })]
+  assert.equal(recallRecords(buildable, { query: 'building' }).length, 1)
+  const searchOptions: RecallOptions & { searchStemming: boolean } = { query: 'building', searchStemming: false }
+  assert.equal(recallRecords(buildable, searchOptions).length, 0)
 })
 
 test('recallRecords：相关性排序、过滤、limit 与空查询回退', () => {

@@ -4001,4 +4001,285 @@ test('host#87 审计：整合的失效与归档各推一条（invalidated / arch
   assert.match(out.text, /库内状态：共 3 条 · active 1 · pending 0 · archived 1 · invalid 1/u)
 })
 
+// ================================================================ M15-A 来源反查（`/memory trace`）
+// 契约：docs/trace.md。**只加命令、不加第 8 个工具**：从会话 id（前缀即可）出发，列出引用指向它的记录；
+// `#<seq>`（或 `--at <seq>`）只保留区间覆盖该序号的记录（`from <= seq && (to ?? from) >= seq`）。
+// 三条纪律：纯读取（deepEqual 快照 + 不推审计）、默认过滤（分支 / pending 都不出现）、
+// 只用既有 helper 渲染（这里用 `memory().write()` 造记录后改写 `refs`，让区间完全可控）。
+
+/** 会话 id 形态与真实一致（`session-<8 位>-…`）；契约示例里的前缀 `84a547da` 指的就是第一段。 */
+const TRACE_SESSION = 'session-84a547da-5727-4ffc-adf0-26d02e749e13'
+/** 第二个会话：只与上者共享前缀 `84a547d`，用于验证歧义报错。 */
+const TRACE_SESSION_B = 'session-84a547db-1234-4ffc-adf0-26d02e749e14'
+/** 第三个会话：只被 pending 记录引用（验证 pending 不进结果、且命中 0 的文案）。 */
+const TRACE_SESSION_C = 'session-9f31c2ee-0000-4000-8000-000000000001'
+/** 没有任何记录引用的会话前缀。 */
+const TRACE_ABSENT = 'ffffffff'
+
+/**
+ * 造一条带指定引用的记录。
+ * 写路径只会附着「当前回合」的引用，因此这里写入后直接改写库内对象的 `refs`；`memory().list()`
+ * 返回的就是 `state.records` 里的同一批对象，改写对后续命令可见（与 M13 播种用例同一套路）。
+ */
+const writeWithRefs = async (harness: Harness, text: string, refs: Json[], extra: Json = {}): Promise<Json> => {
+  const result = await harness.memory().write({ kind: 'semantic', text, origin: 'observed', ...extra })
+  assert.equal(result.ok, true, `前置条件：写入必须成功（${String(result.error ?? '')}）`)
+  const row = rowsOf(harness).find((entry) => entry.id === result.id)!
+  assert.ok(row, '前置条件：写入的记录必须已在库内')
+  row.refs = refs
+  return row
+}
+
+/** 命中行（`- ` 开头）里出现的 id 前缀，按输出顺序。 */
+const hitIds = (text: string): string[] => text.split('\n')
+  .filter((line) => line.startsWith('- '))
+  .map((line) => (line.slice(2).split(' · ')[0] ?? ''))
+
+test('host#88 /memory trace：按会话前缀反查命中一条（首行 / 行格式 / 末尾提示）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const row = await writeWithRefs(harness, '构建流程统一用 pnpm，产物输出到 dist 目录', [
+    { sessionId: TRACE_SESSION, from: 10300, to: 10350, via: 'live' },
+  ])
+
+  // 前缀 `84a547da` 不是完整 id 的字面前缀（完整 id 以 `session-` 开头），契约示例用的就是这种写法。
+  const out = await harness.runCommand('trace 84a547da')
+  assert.equal(out.kind, 'success', out.text)
+  const lines = out.text.split('\n')
+  assert.equal(lines[0], `[来源反查 · 会话 ${TRACE_SESSION}#-]`, '首行给匹配到的完整 id 与序号占位 -')
+  assert.equal(lines[1], '命中 1 条（库内共 1 条记录）')
+  assert.ok(
+    lines[2]!.startsWith(`- ${String(row.id).slice(0, 8)} · semantic · active · observed · ${TRACE_SESSION}#10300-10350 · `),
+    `命中行格式必须是 id 前缀 · kind · status · origin · refs · 正文：${lines[2]}`,
+  )
+  assert.match(lines[2]!, /构建流程统一用 pnpm/u, '正文预览要带出来')
+  assert.equal(lines[3], '用 /memory show <id> 看全文，/memory verify <id> 回到原文核对。')
+
+  // 完整 id、以及 `--at <seq>` 等价写法都要认
+  assert.equal((await harness.runCommand(`trace ${TRACE_SESSION}`)).kind, 'success')
+  assert.equal((await harness.runCommand(`trace ${TRACE_SESSION} #99999`)).kind, 'success')
+  assert.equal((await harness.runCommand(`trace ${TRACE_SESSION} --at 99999`)).kind, 'success')
+})
+
+test('host#89 /memory trace：#seq 只列区间覆盖该序号的记录，并标出命中的那条引用', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const early = await writeWithRefs(harness, '早先那次会话里定下的构建约定', [
+    { sessionId: TRACE_SESSION, from: 10300, to: 10350, via: 'live' },
+  ])
+  const late = await writeWithRefs(harness, '更晚一次会话里补的发布约定', [
+    { sessionId: TRACE_SESSION, from: 10360, to: 10390, via: 'live' },
+  ])
+
+  // 覆盖 10329 的只有 early
+  const covered = await harness.runCommand('trace 84a547da #10329')
+  assert.equal(covered.kind, 'success', covered.text)
+  assert.match(covered.text, /命中 1 条/u)
+  assert.deepEqual(hitIds(covered.text), [String(early.id).slice(0, 8)])
+  assert.match(covered.text, new RegExp(`← 覆盖 #10329`, 'u'), '必须标出具体是哪条区间命中')
+  assert.match(covered.text, new RegExp(`${TRACE_SESSION}#10300-10350 ← 覆盖 #10329`, 'u'))
+
+  // 覆盖 10380 的只有 late；`--at <seq>` 与 `#<seq>` 等价
+  const lateOut = await harness.runCommand('trace 84a547da --at 10380')
+  assert.equal(lateOut.kind, 'success', lateOut.text)
+  assert.deepEqual(hitIds(lateOut.text), [String(late.id).slice(0, 8)])
+  assert.equal(lateOut.text, (await harness.runCommand('trace 84a547da #10380')).text, '--at 与 # 必须完全等价')
+
+  // 单点引用的边界：from 省略时 to 兜底，from=to 时只有该点命中
+  const single = await writeWithRefs(harness, '单点引用：只在 10400 那一刻说过', [
+    { sessionId: TRACE_SESSION, from: 10400, via: 'tool' },
+  ])
+  assert.match((await harness.runCommand('trace 84a547da #10400')).text, new RegExp(String(single.id).slice(0, 8), 'u'))
+  assert.match((await harness.runCommand('trace 84a547da #10401')).text, /这个会话有 3 条记忆，但都不覆盖 #10401/u)
+
+  // 全都不覆盖：0 命中的第二种文案（有记忆、但都不覆盖该序号）
+  const none = await harness.runCommand('trace 84a547da #99999')
+  assert.equal(none.kind, 'success', none.text)
+  assert.match(none.text, /命中 0 条（库内共 3 条记录）/u)
+  assert.match(none.text, /这个会话有 3 条记忆，但都不覆盖 #99999。/u)
+})
+
+test('host#90 /memory trace：命中多条时按 observedAt 从新到旧、同刻用 compareRecords 兜底', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const oldest = await writeWithRefs(harness, '最早的会话约定', [{ sessionId: TRACE_SESSION, from: 1, via: 'live' }])
+  const middle = await writeWithRefs(harness, '中间的会话约定', [{ sessionId: TRACE_SESSION, from: 2, via: 'live' }])
+  const newest = await writeWithRefs(harness, '最新的会话约定', [{ sessionId: TRACE_SESSION, from: 3, via: 'live' }])
+  oldest.observedAt = 1_000
+  middle.observedAt = 2_000
+  newest.observedAt = 3_000
+
+  const out = await harness.runCommand('trace 84a547da')
+  assert.equal(out.kind, 'success', out.text)
+  assert.match(out.text, /命中 3 条（库内共 3 条记录）/u)
+  assert.deepEqual(hitIds(out.text), [
+    String(newest.id).slice(0, 8),
+    String(middle.id).slice(0, 8),
+    String(oldest.id).slice(0, 8),
+  ], '多条必须按时间从新到旧，顺序确定')
+
+  // 连跑两次输出逐字相同（顺序完全确定，不受 Map 迭代顺序影响）
+  assert.equal((await harness.runCommand('trace 84a547da')).text, out.text)
+
+  // kind 标签：agent_self 必须带 facet（与 /memory pending 同一口径）
+  const portrait = await writeWithRefs(harness, '我倾向于先给结论', [{ sessionId: TRACE_SESSION, from: 4, via: 'tool' }])
+  portrait.kind = 'agent_self'
+  portrait.facet = 'persona'
+  const withFacet = await harness.runCommand('trace 84a547da')
+  assert.match(withFacet.text, /agent_self\/persona/u, 'agent_self 要显示具体小节')
+})
+
+test('host#91 /memory trace：pending 记录不出现；0 命中（没有任何记忆引用）文案与「找不到」分开', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 一条待确认写入（工具路径入队），手动补上引用 —— 它指向 TRACE_SESSION_C
+  const queued = await writeTool(harness, { kind: 'semantic', text: '模型猜想：这个会话里定下的约定' })
+  assert.equal(queued.pending, true, '前置条件：writePolicy=ask 时模型写入必须入队')
+  const pendingRow = rowsOf(harness).find((row) => row.id === queued.id)!
+  pendingRow.refs = [{ sessionId: TRACE_SESSION_C, from: 500, to: 520, via: 'tool' }]
+
+  const out = await harness.runCommand(`trace ${TRACE_SESSION_C.slice(0, 12)}`)
+  assert.equal(out.kind, 'success', out.text)
+  assert.match(out.text, /命中 0 条（库内共 1 条记录）/u)
+  assert.match(out.text, /没有任何记忆引用这个会话。/u, '0 命中的第一种文案')
+  assert.doesNotMatch(out.text, /模型猜想/u, 'pending 记录不得出现在反查结果里')
+
+  // 找不到的会话前缀：明确报错，不是 0 命中
+  const missing = await harness.runCommand(`trace ${TRACE_ABSENT}`)
+  assert.equal(missing.kind, 'error')
+  assert.match(missing.text, /未找到匹配/u)
+  assert.doesNotMatch(missing.text, /命中 0 条/u)
+})
+
+test('host#92 /memory trace：分支挡下的记录不出现（切回原分支才可见）', async (t) => {
+  const repoA = makeGitRepo('feature/x')
+  const repoB = makeGitRepo('main')
+  useTempDirs(t, repoA, repoB)
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  setSessionCwd(harness, repoA)
+  const tagged = await writeToolInWorkspace(harness, { kind: 'semantic', text: BRANCH_TAGGED_TEXT, branch: true }, repoA)
+  assert.equal(tagged.branch, 'feature/x', '前置条件：记录必须带分支标签')
+  const row = rowsOf(harness).find((entry) => entry.id === tagged.id)!
+  row.refs = [{ sessionId: TRACE_SESSION, from: 700, to: 760, via: 'tool' }]
+
+  setSessionCwd(harness, repoB)
+  const blocked = await harness.runCommand('trace 84a547da')
+  assert.equal(blocked.kind, 'success', blocked.text)
+  assert.match(blocked.text, /命中 0 条（库内共 1 条记录）/u)
+  assert.doesNotMatch(blocked.text, /分支专属约定/u, '分支不匹配的记录不得出现在反查结果里')
+
+  setSessionCwd(harness, repoA)
+  const visible = await harness.runCommand('trace 84a547da')
+  assert.match(visible.text, /命中 1 条/u)
+  assert.match(visible.text, /分支专属约定/u)
+})
+
+test('host#93 /memory trace：前缀歧义明确报错并列出全部候选', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  await writeWithRefs(harness, '会话 A 里的约定', [{ sessionId: TRACE_SESSION, from: 1, via: 'live' }])
+  await writeWithRefs(harness, '会话 B 里的约定', [{ sessionId: TRACE_SESSION_B, from: 2, via: 'live' }])
+
+  const ambiguous = await harness.runCommand('trace 84a547d')
+  assert.equal(ambiguous.kind, 'error')
+  assert.match(ambiguous.text, /匹配到 2 个会话/u)
+  assert.match(ambiguous.text, new RegExp(TRACE_SESSION, 'u'), '必须列出候选（完整 id）')
+  assert.match(ambiguous.text, new RegExp(TRACE_SESSION_B, 'u'))
+
+  // 更长的前缀即可唯一定位
+  const exact = await harness.runCommand('trace 84a547da')
+  assert.equal(exact.kind, 'success', exact.text)
+  assert.match(exact.text, new RegExp(TRACE_SESSION, 'u'))
+  assert.doesNotMatch(exact.text, new RegExp(TRACE_SESSION_B, 'u'))
+})
+
+test('host#94 /memory trace：参数非法都明确报错、不抛异常', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+  await writeWithRefs(harness, '参数用例的既有记录', [{ sessionId: TRACE_SESSION, from: 1, via: 'live' }])
+
+  const usage = await harness.runCommand('trace')
+  assert.equal(usage.kind, 'error')
+  assert.match(usage.text, /用法：\/memory trace <sessionId 前缀> \[#<seq>\]/u)
+
+  const badSeq = await harness.runCommand('trace 84a547da #abc')
+  assert.equal(badSeq.kind, 'error')
+  assert.match(badSeq.text, /非负整数/u)
+
+  const badAt = await harness.runCommand('trace 84a547da --at')
+  assert.equal(badAt.kind, 'error')
+  assert.match(badAt.text, /--at 后面要跟一个事件序号/u)
+
+  const twice = await harness.runCommand('trace 84a547da #1 --at 2')
+  assert.equal(twice.kind, 'error')
+  assert.match(twice.text, /序号只能给一处/u)
+
+  const extra = await harness.runCommand('trace 84a547da #1 junk')
+  assert.equal(extra.kind, 'error')
+  assert.match(extra.text, /多余的参数/u)
+
+  const unknownFlag = await harness.runCommand('trace --all 84a547da')
+  assert.equal(unknownFlag.kind, 'error')
+  assert.match(unknownFlag.text, /未知参数/u)
+})
+
+test('host#95 /memory trace：纯读取 —— 记录 / 状态 / 审计 / 落盘一字不动，也不 markUsed', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const row = await writeWithRefs(harness, '只读快照用例的记忆', [{ sessionId: TRACE_SESSION, from: 10, to: 20, via: 'live' }])
+  // 写路径给 lastUsedAt/useCount 的初值：反查不得推进它们
+  const usedBefore = [row.lastUsedAt ?? null, row.useCount ?? null]
+  const rowsBefore = JSON.parse(JSON.stringify(harness.memory().list())) as Json
+  const reportBefore = JSON.parse(JSON.stringify(harness.reportState())) as Json
+  const putsBefore = harness.domain.puts.length
+
+  assert.equal((await harness.runCommand('trace 84a547da #15')).kind, 'success')
+  assert.equal((await harness.runCommand('trace 84a547da')).kind, 'success')
+  assert.equal((await harness.runCommand(`trace ${TRACE_SESSION} --at 15`)).kind, 'success')
+
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.memory().list())), rowsBefore, 'trace 只读：记录必须逐字节相同')
+  assert.deepEqual([row.lastUsedAt ?? null, row.useCount ?? null], usedBefore, 'trace 不得 markUsed')
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.reportState())), reportBefore, 'trace 只读：状态与计数器必须逐字节相同')
+  assert.equal(harness.domain.puts.length, putsBefore, 'trace 不得落盘')
+  assert.equal(
+    Number((harness.reportState().audit as Json).entries),
+    Number((reportBefore.audit as Json).entries),
+    'trace 不推审计事件',
+  )
+})
+
+test('host#96 /memory trace：命令用法进 help 与 input.hint；库内共 M 条含 pending', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  await writeWithRefs(harness, '命中用例', [{ sessionId: TRACE_SESSION, from: 1, via: 'live' }])
+  const queued = await writeTool(harness, { kind: 'semantic', text: '另一条待确认写入' })
+  assert.equal(queued.pending, true)
+
+  assert.match((await harness.runCommand('help')).text, /trace <sessionId 前缀> \[#<seq>\]/u, 'help 要提到 trace')
+  const hint = String((harness.command() as unknown as { input?: { hint?: string } }).input?.hint ?? '')
+  assert.match(hint, /trace/u, '命令的 input.hint 也要提到 trace')
+  // 「库内共 M 条」按整个库算（pending 也算库内记录），但结果行里不出现 pending
+  const out = await harness.runCommand('trace 84a547da')
+  assert.match(out.text, /命中 1 条（库内共 2 条记录）/u)
+  assert.doesNotMatch(out.text, /另一条待确认写入/u)
+})
+
 

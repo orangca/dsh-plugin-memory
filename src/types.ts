@@ -146,6 +146,11 @@ export interface RecallOptions {
   minMatch?: number
   minHits?: number
   includeArchived?: boolean
+  /**
+   * M15-B：检索质量开关的透传口。`lib` 侧从 `cfg` 读 `searchStemming` / `searchBigram` /
+   * `searchLengthPenalty`；缺省（第三方经 `ctx.memory.recall` 直接调用时）按出厂默认。
+   */
+  cfg?: Partial<MemoryConfig> | null
 }
 
 /** 自动捕获抽出的候选（`extractCandidates` 的返回值）。 */
@@ -220,6 +225,12 @@ export interface MemoryConfig {
    * 成功的写事件由记录本身派生，因此不为审计新增存储。`0` = 不记录。
    */
   auditMax: number
+  /** M15-B：英文轻量词形归并（build / building / builds 互相命中）。 */
+  searchStemming: boolean
+  /** M15-B：中文按 bigram 切分（关掉＝按单字）。 */
+  searchBigram: boolean
+  /** M15-B：检索长度归一化强度（0 = 关闭；越大越惩罚长文本堆砌）。 */
+  searchLengthPenalty: number
   gistBudgetRatio: number
   charsPerToken: number
   sectionOrder: number

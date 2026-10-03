@@ -43,6 +43,25 @@ Node ≥ 22.18 runs the `.ts` sources directly (native type stripping); earlier 
   injected block is header + `- …` lines + footer. `clampText` flattens and strips control/zero-width characters so
   text cannot forge structure.
 
+## Consuming the `ctx.memory` seam
+
+Other plugins may depend on the host half's `memory` service. That surface is frozen as **protocol v1**:
+[`docs/protocol-v1.md`](docs/protocol-v1.md) (English) and [`docs/protocol-v1.zh.md`](docs/protocol-v1.zh.md)
+(Chinese, section by section). Read §2 before using it: the service is optional (`ctx.get('memory')` can be
+`undefined`) and §8 lists the known gaps that are still awaiting a ruling. v1 is additive-only — a breaking
+change bumps the protocol version and needs a CHANGELOG entry.
+
+The conformance suite pins the documented promises against the shipped output:
+
+```sh
+pnpm build                              # tests import lib/index.js, so build first
+node --test tests/protocol.test.ts      # or just list it in the test script and run pnpm test
+```
+
+`tests/protocol.test.ts` is a suite, not a duplicate of `tests/host.test.ts`: change the documented surface and
+it goes red by design. When you touch the service object in `src/index.ts`, update both protocol documents and
+this suite in the same change.
+
 ## Reporting bugs
 
 Include the plugin version, the DSH build (`memory_stats` prints both the domain and the runtime counters), and a

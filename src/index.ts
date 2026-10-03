@@ -42,6 +42,7 @@ import {
   branchOf,
   buildSleepPlan,
   clampText,
+  explainMatch,
   composeGistText,
   composeSubjectSummary,
   compareRecords,
@@ -630,6 +631,8 @@ interface MemoryCommandHandlers extends Record<string, CommandHandler> {
   show(args: string[]): DshCommandResult
   /** M9：核对引用的只读命令（`/memory verify <id>`）。 */
   verify(args: string[]): Promise<DshCommandResult>
+  /** M15-A：来源反查的只读命令（`/memory trace <sessionId 前缀> [#<seq>]`，契约 docs/trace.md）。 */
+  trace(args: string[]): DshCommandResult
   /** M10：待确认队列的查看（`/memory pending`，只读）。 */
   pending(): DshCommandResult
   forget(args: string[]): Promise<DshCommandResult>
@@ -809,6 +812,11 @@ function buildConfig(useVolatile: boolean): ReturnType<SchemaFactory['object']> 
     // M13：审计尝试环容量（契约 docs/audit.md §2.1）——类型与默认值必须与 lib.ts 的 DEFAULTS 逐字一致。
     // 标 volatile：用户在设置页要能改（表单 29 → 30 字段；客户端字段由 client 半边的 M13 补齐）。
     auditMax: field(Schema!.number().default(50)),
+    // M15-B：检索质量三键（契约 docs/semantic.md §4）。**非 volatile**：它们是进阶调参，走 patch 行，
+    // 不进设置页（表单保持 30 字段，中英 README 也把它们列在"只能通过 patch 行设置"那一行）。
+    searchStemming: Schema!.boolean().default(true),
+    searchBigram: Schema!.boolean().default(true),
+    searchLengthPenalty: Schema!.number().default(0.3),
   })
 }
 
@@ -1563,6 +1571,132 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     }
   }
 
+  /**
+   * M15-A：`/memory trace <sessionId 前缀> [#<seq>]`（契约 docs/trace.md）——**来源反查**：
+   * 从一次会话（或某个事件序号）出发，列出引用指向它的记录。
+   *
+   * 四条纪律：
+   *   · **纯读取**：不写记录、不改状态、不推审计事件、不 markUsed（反查不是「使用」）；
+   *   · 前缀歧义不被过滤掩盖：候选会话取自**全库引用**（含被分支挡下的与 pending 的记录），
+   *     命中集合则只看 `branchVisible` 且非 pending 的记录 —— 与其它列表命令同口径；
+   *   · 分支不匹配的记录、pending 记录都不出现在结果里（契约 §3）；
+   *   · 只读渲染只用既有 helper（`refsOf` / `formatRefs` / `clampText`），不碰纯函数层。
+   */
+  const traceRecords = (args: string[]): DshCommandResult => {
+    const usage = '用法：/memory trace <sessionId 前缀> [#<seq>]（#<seq> 也可写成 --at <seq>）'
+    let prefix = ''
+    let seq: number | null = null
+    let seqSpecs = 0
+    for (let index = 0; index < args.length; index += 1) {
+      const token = args[index] ?? ''
+      // `--at <seq>` / `--at=<seq>`：与 `--limit` 一致，两种写法等价。
+      if (token === '--at' || token.startsWith('--at=')) {
+        const value = token === '--at' ? args[index + 1] : token.slice('--at='.length)
+        if (value === undefined) return { kind: 'error', text: `--at 后面要跟一个事件序号。${usage}` }
+        if (!/^\d+$/u.test(value)) return { kind: 'error', text: `事件序号必须是非负整数（收到「${value}」）。${usage}` }
+        if (token === '--at') index += 1
+        seq = Number(value)
+        seqSpecs += 1
+        continue
+      }
+      if (token.startsWith('#')) {
+        const value = token.slice(1)
+        if (!/^\d+$/u.test(value)) return { kind: 'error', text: `事件序号必须是非负整数（收到「${token}」）。${usage}` }
+        seq = Number(value)
+        seqSpecs += 1
+        continue
+      }
+      if (token.startsWith('-')) return { kind: 'error', text: `未知参数「${token}」。${usage}` }
+      if (prefix === '') {
+        // 容忍 `session-…#<seq>` 粘成一个 token 的写法（会话 id 本身不含 `#`）。
+        const hash = token.indexOf('#')
+        if (hash >= 0) {
+          if (hash === 0) return { kind: 'error', text: `会话前缀不能为空。${usage}` }
+          const value = token.slice(hash + 1)
+          if (!/^\d+$/u.test(value)) return { kind: 'error', text: `事件序号必须是非负整数（收到「${token}」）。${usage}` }
+          prefix = token.slice(0, hash)
+          seq = Number(value)
+          seqSpecs += 1
+          continue
+        }
+        prefix = token
+        continue
+      }
+      return { kind: 'error', text: `多余的参数「${token}」。${usage}` }
+    }
+    if (prefix === '') return { kind: 'error', text: usage }
+    if (seqSpecs > 1) return { kind: 'error', text: `序号只能给一处（#<seq> 或 --at <seq>）。${usage}` }
+
+    // 候选会话：全库引用的 sessionId（去重 + 排序 → 候选顺序确定）。
+    const candidates = new Set<string>()
+    for (const record of state.records.values()) {
+      for (const ref of refsOf(record)) candidates.add(ref.sessionId)
+    }
+    // 前缀匹配：完整 id 的前缀，或首个 `-` 之后那段的前缀
+    // （契约示例 `84a547da` 对应 `session-84a547da-…`，因此 `session-` 段不参与比对）。
+    const matchesPrefix = (sessionId: string, value: string): boolean => {
+      if (sessionId.startsWith(value)) return true
+      const dash = sessionId.indexOf('-')
+      return dash >= 0 && sessionId.slice(dash + 1).startsWith(value)
+    }
+    const matchedSession = [...candidates].filter((sessionId) => matchesPrefix(sessionId, prefix)).sort()
+    if (matchedSession.length === 0) {
+      return {
+        kind: 'error',
+        text: `未找到匹配「${prefix}」的会话：库内没有任何记忆引用它（或前缀不完整）。${usage}`,
+      }
+    }
+    if (matchedSession.length > 1) {
+      return {
+        kind: 'error',
+        text: [
+          `会话前缀「${prefix}」匹配到 ${matchedSession.length} 个会话，请用更长的前缀区分：`,
+          ...matchedSession.map((sessionId) => `  - ${sessionId}`),
+        ].join('\n'),
+      }
+    }
+    const sessionId = matchedSession[0]!
+
+    // 命中集合：分支可见 + 非 pending（契约 §3：默认过滤，与其它列表命令一致）。
+    const visible = branchVisible(state.records.values()).filter((record) => record.status !== 'pending')
+    const referenced = visible.filter((record) => refsOf(record).some((ref) => ref.sessionId === sessionId))
+    // 区间覆盖：`from <= seq && (to ?? from) >= seq`；缺失端点补成开区间（会话级引用覆盖一切）。
+    const covers = (ref: MemoryRef, value: number): boolean =>
+      (ref.from ?? -Infinity) <= value && (ref.to ?? ref.from ?? Infinity) >= value
+    const at = seq
+    const hits = (at === null
+      ? referenced
+      : referenced.filter((record) => refsOf(record).some((ref) => ref.sessionId === sessionId && covers(ref, at))))
+      .sort((left, right) => (right.observedAt - left.observedAt) || compareRecords(left, right))
+
+    /** 引用字段：带序号时把**命中的那条引用**标出来，而不是只给一个合并后的区间列表。 */
+    const refFieldOf = (record: MemoryRecord): string => {
+      const refs = refsOf(record)
+      if (at === null) return formatRefs(refs)
+      const value = at
+      return refs
+        .map((ref) => `${formatRefs([ref])}${ref.sessionId === sessionId && covers(ref, value) ? ` ← 覆盖 #${value}` : ''}`)
+        .join('; ')
+    }
+
+    const lines: string[] = [`[来源反查 · 会话 ${sessionId}#${at === null ? '-' : String(at)}]`]
+    lines.push(`命中 ${hits.length} 条（库内共 ${state.records.size} 条记录）`)
+    if (hits.length === 0) {
+      // 两种 0 命中必须分开说：这个会话根本没有（可见的）记忆，还是有记忆但都不覆盖该序号。
+      lines.push(referenced.length === 0
+        ? '没有任何记忆引用这个会话。'
+        : `这个会话有 ${referenced.length} 条记忆，但都不覆盖 #${String(at)}。`)
+    } else {
+      for (const record of hits) {
+        const kind = record.kind === 'agent_self' ? `agent_self/${facetOf(record)}` : String(record.kind)
+        const preview = clampText(record.text, cfg.maxItemTokens ?? DEFAULTS.maxItemTokens, cfg.charsPerToken ?? DEFAULTS.charsPerToken)
+        lines.push(`- ${record.id.slice(0, 8)} · ${kind} · ${record.status} · ${record.origin} · ${refFieldOf(record)} · ${preview}`)
+      }
+    }
+    lines.push('用 /memory show <id> 看全文，/memory verify <id> 回到原文核对。')
+    return { kind: 'success', text: lines.join('\n') }
+  }
+
   // ---------------- M6：自画像写入收敛（契约 §4.1） ----------------
   //
   // 收敛只发生在**显式带 facet 的 `agent_self` 写入**上：`memory_write` 工具与 `/memory self set`
@@ -2189,7 +2323,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       let value: string | null = null
       if (candidate.origin === 'user_correction') {
         const best = recallRecords(state.records.values(), {
-          query: candidate.text, mode: 'memory', minHits: 1, minMatch: 0.3, limit: 1,
+          cfg, query: candidate.text, mode: 'memory', minHits: 1, minMatch: 0.3, limit: 1,
         })[0]
         if (best) {
           subject = best.record.subject ?? subject
@@ -2326,6 +2460,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       // 把它们后面的相关条目全挤走 —— 表现就是后续回合「0 命中」。
       const topK = cfg.recallTopK ?? 8
       const hits = recallRecords(branchVisible(state.records.values(), payload?.agent?.session?.header?.cwd), {
+        // M15-B：检索质量开关（stemming / bigram / 长度归一化）跟着配置走
+        cfg,
         query,
         mode: 'memory',
         minHits: cfg.recallMinHits ?? 2,
@@ -2901,7 +3037,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         // 归档条目（设计稿 §4.4）只是不常驻注入，模型主动检索时应当可见
         const hits = recallRecords(
           branchVisible(state.records.values(), exec?.agent?.session?.header?.cwd),
-          { ...args, includeArchived: true },
+          { ...args, includeArchived: true, cfg },
         )
         markUsed(hits.map((hit) => hit.record))
         return jsonList('items', hits.map(({ record, score }) => ({
@@ -2984,7 +3120,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         }
         if (args?.query) {
           // 破坏性操作：词面覆盖率必须 ≥ 0.6，宁可少删不可错删。
-          const hits = recallRecords(state.records.values(), { query: args.query, limit: 20, minLexical: 0.6 }, Date.now())
+          const hits = recallRecords(state.records.values(), { cfg, query: args.query, limit: 20, minLexical: 0.6 }, Date.now())
           if (!args.confirm) {
             return jsonList('matches', hits.map(({ record }) => ({ id: record.id, text: record.text })), { ok: false, needsConfirm: true })
           }
@@ -3076,7 +3212,26 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           return view
         })
         if (args?.apply !== true) {
-          return jsonList('candidates', candidateViews, { skipped, portrait: portraitDiagnostics(), branch: branchDiagnostics() })
+          // M15-B：把「命中哪些 token、各多少分」接出来（契约 docs/semantic.md §1 的可解释性要求）。
+          // 只对前 3 个候选做，且每个候选只对 top-3 命中算详情 —— 诊断路径不追求吞吐。
+          const matching = candidateViews.slice(0, 3).map((_view, index) => {
+            const probe = String(candidates[index]?.text ?? '')
+            const top = recallRecords(state.records.values(), { cfg, query: probe, limit: 3 })
+            return {
+              text: clampText(probe, 60),
+              hits: top.map(({ record, score }) => {
+                const detail = explainMatch(record, probe, state.records.values(), cfg)
+                return {
+                  id: record.id,
+                  score: Number(score.toFixed(3)),
+                  matchedTokens: detail.matched,
+                  matchScore: Number(detail.score.toFixed(3)),
+                  passesMatchThreshold: detail.passes,
+                }
+              }),
+            }
+          })
+          return jsonList('candidates', candidateViews, { skipped, matching, portrait: portraitDiagnostics(), branch: branchDiagnostics() })
         }
         const origin = cfg.trustToolWrites ? 'user_explicit' : deriveOriginFromMessages(toolMessages(exec))
         const written: Array<{ ok: boolean; status?: string; id?: string; error?: string; portrait?: PortraitOutcome }> = []
@@ -3329,6 +3484,12 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       return await verifyRecord(String(args[0] ?? ''))
     },
     /**
+     * M15-A：`/memory trace <sessionId 前缀> [#<seq>]`（只读，契约 docs/trace.md）——来源反查。
+     */
+    trace(args: string[]): DshCommandResult {
+      return traceRecords(args)
+    },
+    /**
      * M10：`/memory pending`（只读）——把待确认队列摆出来。
      * 这是**用户唯一能看到 pending 的命令通道**（另一个是 `memory_explain` 的诊断输出）。
      */
@@ -3565,7 +3726,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     search(args: string[]): DshCommandResult {
       const query = args.join(' ')
       if (query.length === 0) return { kind: 'error', text: '用法：/memory search <关键词>' }
-      const hits = recallRecords(branchVisible(state.records.values()), { query, limit: 10, includeArchived: true })
+      const hits = recallRecords(branchVisible(state.records.values()), { cfg, query, limit: 10, includeArchived: true })
       if (hits.length === 0) return { kind: 'success', text: `没有匹配「${query}」的记忆。` }
       return { kind: 'success', text: hits.map(({ record, score }) => `${record.id.slice(0, 8)}  ${score.toFixed(2)}  ${record.text}`).join('\n') }
     },
@@ -3955,7 +4116,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       return { kind: 'error', text: `未知的 self 子命令「${sub}」。${SELF_USAGE}` }
     },
     help(): DshCommandResult {
-      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | verify <id> | audit [--limit N] [--verify] | branch [--all] | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | pending | approve <id> | reject-pending <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
+      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | verify <id> | trace <sessionId 前缀> [#<seq>] | audit [--limit N] [--verify] | branch [--all] | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | pending | approve <id> | reject-pending <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
     },
   }
 
@@ -4371,7 +4532,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     ctx.commands.register({
       name: 'memory',
       description: '查看与管理长期记忆',
-      input: { hint: 'list | show <id> | verify <id> | audit [--limit N] [--verify] | branch [--all] | pending | self | forget <id> | export | stats' },
+      input: { hint: 'list | show <id> | verify <id> | trace <sessionId 前缀> [#<seq>] | audit [--limit N] [--verify] | branch [--all] | pending | self | forget <id> | export | stats' },
       handler: async (invocation) => {
         const parts = String(invocation?.rawInput ?? '').trim().split(/\s+/u).filter(Boolean)
         const sub = parts.shift() ?? 'list'
@@ -4406,13 +4567,29 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     state.openError = `sleep command register failed: ${errorText(error)}`
   }
 
-  // 供其他插件/调试使用的最小服务面（不导出类型，M4 再考虑正式 seam）
+  // 供其他插件/调试使用的最小服务面。M15-C 把它冻结成协议 v1（`docs/protocol-v1.md`），
+  // 那份文档里逐条写明方法/返回结构/缺口；这里的改动都是**加法**，v1 内只加不破。
   try {
     ;(ctx as DshPluginContextWithProvide).provide('memory', {
+      /** 协议版本：第三方据此判断可用面（只做加法时主版本不变）。 */
+      protocolVersion: '1.0',
       list: (): MemoryRecord[] => [...state.records.values()],
       stats: (): { records: number; version: number; opened: boolean } => ({ records: state.records.size, version: state.collectionVersion, opened: state.opened }),
-      recall: (options: RecallOptions) => recallRecords(state.records.values(), options),
-      write: (input: WriteMemoryInput) => writeMemory(input),
+      recall: (options: RecallOptions) => recallRecords(state.records.values(), { cfg, ...options }),
+      // 服务面在工具之前补一层**最小校验**：工具那边有 JSON Schema 兜着，而第三方调用没有。
+      // 不校验就等于允许别人写出 `kind: undefined` 的记录（M15-C 实测到的真缺口）。
+      write: (input: WriteMemoryInput) => {
+        const kind = (input as { kind?: unknown } | null | undefined)?.kind
+        const text = (input as { text?: unknown } | null | undefined)?.text
+        const kinds = ['user_profile', 'agent_self', 'project_gist', 'semantic', 'procedural', 'episodic'] as const
+        if (typeof kind !== 'string' || !(kinds as readonly string[]).includes(kind)) {
+          return Promise.resolve({ ok: false as const, error: `rejected_invalid: kind 必须是 ${kinds.join(' | ')} 之一（服务面不接受缺省）。` })
+        }
+        if (typeof text !== 'string' || text.trim().length === 0) {
+          return Promise.resolve({ ok: false as const, error: 'rejected_invalid: text 必须是非空字符串。' })
+        }
+        return writeMemory(input)
+      },
       consolidate: (reason?: string) => consolidate(reason ?? 'manual'),
     })
   } catch { /* 可选 */ }

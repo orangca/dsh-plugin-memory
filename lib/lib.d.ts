@@ -153,8 +153,23 @@ export declare function maskPii(text: unknown): string;
  */
 export declare function deriveOriginFromMessages(messages: unknown): MemoryOrigin;
 /**
- * 分词（设计稿 §6.1）：拉丁词 + 轻量词干；CJK 连续串切 bigram（长度 1 时保留单字）。
- * 例：`记忆数据落在` → 记忆/忆数/数据/据落/落在；`scripts/release.mjs` → scripts/release/mjs。
+ * 词形归并：轻量后缀剥离（契约 docs/semantic.md §2），不引入词干库。
+ *
+ * 只对**英文字母序列**动手：`build` / `building` / `builds` 归并到同一个 token，
+ * 于是「用 building 写的记忆」也能被「build」查到。中文与数字原样返回 ——
+ * 它们没有英语形态变化，硬剥后缀只会把 `0.5.9`、`release.mjs` 这类标识符切坏。
+ * 长度 ≤ 4 的词不动（`docs` / `node` / `dist` 本身已是完整词，剥尾只会制造噪声）。
+ */
+export declare function stemToken(token: string): string;
+/**
+ * 检索 token 化（契约 docs/semantic.md §2）：中文 bigram + 单字兜底；英文按空白/标点切分后
+ * 做 `stemToken`；数字保留。出厂默认开关（归并 + bigram）下与旧名 `tokenize` 完全等价。
+ */
+export declare function tokenizeForSearch(text: string): string[];
+/**
+ * 分词（设计稿 §6.1；M15-B 起保留为旧名，与 `tokenizeForSearch` 等价实现）。
+ * ⚠ 这是一条**行为契约**：`similarity` / `containment` / `deriveSubject` / 去重都吃它，
+ * 改动会连带改变合并、冲突与指纹，因此默认路径必须与 0.5.16 逐 token 相同。
  */
 export declare function tokenize(text: unknown): string[];
 /** 清空分词缓存（供测试与基准使用；正常运行靠指纹键自然失效）。 */
@@ -162,17 +177,55 @@ export declare function clearTokenCache(): void;
 /** 当前缓存条目数（可观测性）。 */
 export declare function tokenCacheSize(): number;
 /** 词面命中率：查询 token 在记录里的覆盖率（0–1）。空查询视为完全匹配。
- *  适合**短查询**（模型显式 recall、销毁性操作）。 */
+ *  适合**短查询**（模型显式 recall、销毁性操作）；也是 `recallRecords` 的**门槛**口径。 */
 export declare function lexicalMatch(record: MemoryRecord, query: unknown): number;
 export declare function memoryMatch(record: MemoryRecord, query: unknown, options?: MemoryMatchOptions): number;
 /** M1 的轻量检索打分：词面命中 + 重要度 + 时效（向量留到 M4）。 */
 export declare function scoreRecord(record: MemoryRecord, query: unknown, now?: number, matchOverride?: number): number;
+/**
+ * 一个检索 token 的权重（idf：越稀有越高），确定性、无随机。
+ *
+ * `idf(t) = log(1 + N / (1 + df(t)))`：N ＝ 参与检索的记录数，df(t) ＝ 含该 token 的记录数。
+ * 本函数没有 cfg 入参（契约冻结签名），因此按**出厂默认**分词统计：
+ * 入参 token 先过 `stemToken`（已归并的 token 幂等），记录侧按 `text + subject + tags` 分词。
+ */
+export declare function searchIdf(token: string, records: Iterable<MemoryRecord>): number;
+/** 命中详情：给 `memory_explain` 用（哪些 token 命中、各多少分、总分）。 */
+export interface MatchDetail {
+    /** 查询侧 token（去重、保持分词顺序）。 */
+    tokens: string[];
+    /** 记录侧真的含有的那些查询 token（`tokens` 的子集，顺序同 `tokens`）。 */
+    matched: string[];
+    /** token → 贡献分（已含 idf 与长度归一化）；只列命中 token，求和 ＝ `score`。 */
+    scores: Record<string, number>;
+    /** 最终得分（0..1，便于展示与阈值比较）。 */
+    score: number;
+    /** 是否过了 `cfg.recallMinMatch` 门槛。 */
+    passes: boolean;
+}
+/**
+ * 单条记录对查询的匹配详情（`query` 为原始查询文本）。
+ *
+ * 口径（契约 docs/semantic.md §3，必须与实现一致）：
+ *   Q ＝ `tokenizeForSearch(query)` 去重，T ＝ 记录 token 集合，H ＝ Q ∩ T；
+ *   `score_raw = Σ_{t∈H} idf(t)`，`score_max = Σ_{t∈Q} idf(t)`；
+ *   `normalized = score_raw / (score_max × (1 + lengthPenalty × log2(1 + |T| / |Q|)))`；
+ *   `score = clamp(normalized, 0, 1)`，`passes = score >= cfg.recallMinMatch`。
+ * 空查询与 `lexicalMatch(record, '')` 同口径：视为完全匹配（score ＝ 1）。
+ */
+export declare function explainMatch(record: MemoryRecord, query: string, records: Iterable<MemoryRecord>, cfg: MemoryConfig): MatchDetail;
 /** 检索：过滤 → 打分 → 确定性排序。
  *  `mode: 'query'`（默认）= 短查询，按查询覆盖率判定，minLexical 默认 0.34；
  *  `mode: 'memory'` = 长查询（整轮用户消息），按记忆侧覆盖率判定，minMatch 默认 0.4 + minHits 2。
  *  `includeArchived: true` 也纳入归档条目（设计稿 §4.4：归档只是不常驻注入，仍可被检索到）；
  *  `invalid` 永不参与检索。
- *  破坏性操作（删除）应传更高的 minLexical（如 0.6）。 */
+ *  破坏性操作（删除）应传更高的 minLexical（如 0.6）。
+ *
+ *  M15-B（契约 docs/semantic.md §2/§3）：`match` 仍是**门槛**（相关性判定值，口径不变，
+ *  因此既有阈值全部照旧），排序分里的**词面项**换成 IDF 加权 + 长度归一化的新相关性分
+ *  （`relevanceScore`），权重形状沿用 M1（0.6 相关性 + 0.3 重要度 + 0.1 时效）——
+ *  只换相关性这一项的算法，既有排序语义才不会被顺手改掉。
+ *  N 与 df 在本次调用内一次统计、复用（复杂度 O(N·|T|)，token 集合有缓存）。 */
 export declare function recallRecords(records: Iterable<MemoryRecord>, options: RecallOptions, now?: number): RecallHit[];
 /** 排除规则（设计稿 §5.2）：命中即丢弃，并记录原因以便观测。 */
 export declare function isExcluded(text: unknown): string | null;

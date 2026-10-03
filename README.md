@@ -398,6 +398,7 @@ whole Config through the settings service and persists it into the profile patch
 /memory self reset [persona|work]                archive the current self-portrait (history kept, nothing deleted)
 /memory audit [--limit N] [--verify]             write audit: recent attempts + store summary; --verify checks this session's injection against the session log (read-only)
 /memory verify <id prefix>                       walk back to the cited events and check where this memory came from (read-only)
+/memory trace <sessionId prefix> [#<seq>]        reverse lookup: list memories whose refs point at this session (#<seq> keeps only intervals covering that event; --at <seq> is equivalent) (read-only)
 /memory export [path]                            export JSON
 /memory import <path>                            import JSON (deduplicated by fingerprint; every field is validated, numbers are clamped, `pinned` is forced off and the origin is downgraded to `observed`)
 /memory clear --all --yes                        permanently clear everything (`--all` is mutually exclusive with the filters below)
@@ -461,7 +462,9 @@ the settings form:
 
 Additional knobs available only through the patch row (with their defaults): `maxItemTokens` neighbours such as
 `selfPortraitMaxItems` 12 / `selfPortraitMaxSelfObserved` 4, capture tuning (`capturePerHour` 20,
-`captureMinConfidence` 0.6, `echoThreshold` 0.9, `gistMinMarkers` 2), self-portrait admission
+`captureMinConfidence` 0.6, `echoThreshold` 0.9, `gistMinMarkers` 2), **retrieval quality** (`searchStemming` true,
+`searchBigram` true, `searchLengthPenalty` 0.3 — English stemming / Chinese bigrams / length normalisation),
+self-portrait admission
 (`selfPortraitPromoteSessions` 2, `selfPortraitModelMinConfidence` 0.85), consolidation
 (`mergeSimilarity` 0.7, `archiveAfterDays` 180, `archiveBelowImportance` 0.15, `summarizeAbove` 5),
 recall detail (`recallMinQueryChars` 12, `recallMinHits` 2, `recallMinMatch` 0.4, `recallCooldownTurns` 3,
