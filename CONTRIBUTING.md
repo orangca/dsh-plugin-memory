@@ -45,11 +45,21 @@ Node ≥ 22.18 runs the `.ts` sources directly (native type stripping); earlier 
 
 ## Consuming the `ctx.memory` seam
 
-Other plugins may depend on the host half's `memory` service. That surface is frozen as **protocol v1**:
-[`docs/protocol-v1.md`](docs/protocol-v1.md) (English) and [`docs/protocol-v1.zh.md`](docs/protocol-v1.zh.md)
-(Chinese, section by section). Read §2 before using it: the service is optional (`ctx.get('memory')` can be
-`undefined`) and §8 lists the known gaps that are still awaiting a ruling. v1 is additive-only — a breaking
-change bumps the protocol version and needs a CHANGELOG entry.
+Other plugins may depend on the host half's `memory` service. That surface is frozen as **protocol v1**, and is
+now at **v1.1** — still additive-only: [`docs/protocol-v1.md`](docs/protocol-v1.md) (English) and
+[`docs/protocol-v1.zh.md`](docs/protocol-v1.zh.md) (Chinese, section by section). Read §2 before using it: the
+service is optional (`ctx.get('memory')` can be `undefined`) and §8 lists the known gaps that are still awaiting a
+ruling. **§9 is the whole v1.1 delta**; `docs/protocol-v1.1-changes.md` is the frozen change contract it folds in.
+A breaking change bumps the protocol version and needs a CHANGELOG entry.
+
+- **Version detection:** the service carries `protocolVersion` (`'1.1'`). Test it with a `'1.x'` predicate
+  (`/^1\./u`), never string equality — a later `1.2` must not lock callers out, and a `'1.0'` service simply lacks
+  the v1.1 keys.
+- **New capabilities in v1.1 (all optional, all backward compatible):** `list({ status, branch, limit })`,
+  `recall({ status, branch })`, and `persisted` on every successful `write()` result — `ok: true` still means
+  "applied in memory", `persisted` is the one that means "reached the storage domain".
+- **Unchanged:** a no-argument `list()` still returns the raw, unfiltered, insertion-ordered live objects, and a
+  no-argument `recall()` still never sees `pending`/`invalid`.
 
 The conformance suite pins the documented promises against the shipped output:
 

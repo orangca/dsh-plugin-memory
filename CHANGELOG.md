@@ -3,6 +3,41 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.18 — 2026-10-03
+
+**Protocol v1.1.** The three gaps 0.5.17 left open were all additive, and the protocol's own §1 promises that v1
+only ever grows — so this is a minor protocol bump (`protocolVersion` `'1.0'` → `'1.1'`), not a v2. Callers should
+test for `'1.x'`, never for equality.
+
+### Added
+
+- **`list(options?)`** takes `{ status, branch, limit }`. No-arg behaviour is byte-for-byte what 0.5.17 returned
+  (insertion order, every status, the live objects) — the raw view is still the default. `status: 'active'` never
+  includes pending rows; `branch: 'current'` applies exactly the `branchVisible` filter the injection paths use, so
+  a consumer can finally ask for "what the model actually sees" without reimplementing it.
+- **`recall(options)`** gains the same `status` and `branch`. `status: 'pending'` is deliberately allowed for
+  admin/audit queries — and deliberately *not* passed by any injection path, which is what keeps the M10 rule
+  ("pending never reaches the context") intact. There is a test that hammers fifteen parameter combinations and
+  asserts the resident and per-turn blocks are unchanged.
+- **`write()` results carry `persisted`.** `ok: true` has always meant "applied in memory"; now the result also
+  says whether the write actually reached the storage domain, taken straight from `persist()` rather than inferred
+  from `ok`. Multi-step paths (portrait supersede) report `true` only when every step persisted. Rejection paths
+  do not carry the field.
+- **The whole `docs/` directory now ships** in the package instead of just the two protocol files, so installing
+  from npm gets the contracts for refs, sleep, write-policy, audit, branch, i18n, trace and retrieval too.
+
+### Notes
+
+- `tests/protocol.test.ts` grew from 11 to 20 cases, all pinned to the built `lib/index.js`: version, no-arg
+  equivalence, each `status` bucket, `limit` edge cases (0 / negative / NaN ignored), `branch: 'current'` agreeing
+  with both injection channels, explicit-branch and unknown-branch behaviour, `persisted` on each success path and
+  its absence on rejections, and the packaged file list.
+- One consequence worth stating plainly: the explicit `status` path narrows the candidate set in the host before
+  handing a query view to the pure layer, because the pure layer's pool intentionally admits only active/archived
+  rows. Default and injection paths are untouched, but an explicit `{ status: 'all' }` query does not re-apply the
+  pure layer's lexical floor. That is a deliberate trade — the pool rule is load-bearing, the floor is a
+  recall-quality heuristic.
+
 ## 0.5.17 — 2026-10-03
 
 Three tracks in one release, all from the "what is still missing" list rather than the competitor survey.

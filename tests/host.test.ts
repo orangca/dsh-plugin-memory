@@ -72,10 +72,14 @@ interface EffectRecord {
 }
 
 interface MemoryService {
-  list(): Json[]
+  /** M16（协议 v1.1）：'1.1'；调用方按 '1.x' 判断可用面。 */
+  protocolVersion: string
+  /** M16（协议 v1.1 §1）：可选 { status, branch, limit }；无参与 0.5.17 逐字节相同。 */
+  list(options?: Json): Json[]
   stats(): { records: number; version: number; opened: boolean }
   recall(options: Json): Array<{ record: Json; match: number; score: number }>
-  write(input: Json): Promise<{ ok: boolean; status?: string; id?: string; error?: string }>
+  /** M16（协议 v1.1 §3）：成功路径带 `persisted`（拒绝路径没有这个字段）。 */
+  write(input: Json): Promise<{ ok: boolean; status?: string; id?: string; error?: string; pending?: boolean; persisted?: boolean }>
   consolidate(reason?: string): Promise<void>
 }
 
@@ -109,6 +113,8 @@ interface HarnessOptions {
    * 启动新实例时走的就是 `openDomain` 的加载分支，因此可以断言 pending 会随普通记录一起被加载。
    */
   seedDomainRows?: Map<string, Json>
+  /** M16（协议 v1.1 §3）：true 时 `put` 抛错（验证 `persisted` 如实回报 false，而不是用 ok 兜底猜）。 */
+  failPuts?: boolean
 }
 
 interface Harness {
@@ -165,6 +171,8 @@ function makeFakeDomain(options: HarnessOptions): { domain: Json; control: Domai
     get: (key: string): Json | undefined => rows.get(key),
     put: (key: string, value: Json): Promise<void> => {
       puts.push({ key, value })
+      // M16：故障注入 —— 落盘失败，但内存里已经生效（`persisted` 必须如实回报 false）。
+      if (options.failPuts === true) return Promise.reject(new Error('put failed: disk full'))
       if (!control.gatePuts) {
         rows.set(key, value)
         return Promise.resolve()
@@ -4280,6 +4288,363 @@ test('host#96 /memory trace：命令用法进 help 与 input.hint；库内共 M 
   const out = await harness.runCommand('trace 84a547da')
   assert.match(out.text, /命中 1 条（库内共 2 条记录）/u)
   assert.doesNotMatch(out.text, /另一条待确认写入/u)
+})
+
+// ================================================================ M16 协议 v1.1（服务面）
+// 契约：docs/protocol-v1.1-changes.md §1/§2/§3。三件事**都是加法**：
+//   · `protocolVersion` 从 '1.0' 变 '1.1'；
+//   · `list(options?)` / `recall(options)` 新增可选 status / branch（+ list 的 limit）；
+//   · `write(input)` 成功路径新增 `persisted`。
+//
+// 两条纪律贯穿本节：
+//   ① **无参调用必须与 0.5.17 逐字节相同**（顺序、内容、活对象）——所以每个用例都先钉死缺省面；
+//   ② 新参数**只影响显式调用**，注入路径根本不传它们，行为一字不变。
+
+/** 记录 id 列表（按给定顺序）。 */
+const idsOf = (rows: readonly Json[]): string[] => rows.map((row) => String(row.id))
+
+/** 召回命中的记录 id 列表（RecallHit 的形状是 `{ record, match, score }`）。 */
+const recallIds = (hits: unknown): string[] =>
+  (hits as Array<{ record: Json }>).map((hit) => String(hit.record.id))
+
+/**
+ * 一库四态：active / pending / archived / invalid 各一条。
+ * pending 走 `writePolicy=ask` 的模型来源（服务面默认 origin = model_proposed）；
+ * archived / invalid 直接改库内活对象的状态（与既有分支用例改 `refs` 同一手法）。
+ */
+const seedFourStatuses = async (harness: Harness): Promise<{ active: string; pending: string; archived: string; invalid: string }> => {
+  const service = harness.memory()
+  const active = await service.write({ kind: 'semantic', text: '状态探针：active 条目的构建流程统一用 pnpm', origin: 'user_explicit' })
+  const pending = await service.write({ kind: 'semantic', text: '状态探针：pending 条目的构建流程也许用 bun' })
+  const archived = await service.write({ kind: 'semantic', text: '状态探针：archived 条目的构建流程统一用 pnpm', origin: 'user_explicit' })
+  const invalid = await service.write({ kind: 'semantic', text: '状态探针：invalid 条目的构建流程统一用 pnpm', origin: 'user_explicit' })
+  assert.equal(pending.pending, true, '前置条件：writePolicy=ask 时模型来源写入必须入队')
+  const rows = rowsOf(harness)
+  rows.find((row) => row.id === archived.id)!.status = 'archived'
+  rows.find((row) => row.id === invalid.id)!.status = 'invalid'
+  return {
+    active: String(active.id),
+    pending: String(pending.id),
+    archived: String(archived.id),
+    invalid: String(invalid.id),
+  }
+}
+
+test('host#97 ctx.memory 的 protocolVersion=1.1；list() 无参与 0.5.17 逐字节等价（顺序/内容/活对象）', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const service = harness.memory()
+  assert.equal(service.protocolVersion, '1.1', 'v1 内只做加法 ⇒ 1.0 → 1.1（调用方按 1.x 判断）')
+
+  const first = await service.write({ kind: 'user_profile', text: '用户偏好中文回答与英文标识符', origin: 'user_explicit' })
+  const second = await service.write({ kind: 'semantic', text: '构建流程统一用 pnpm，产物输出到 dist 目录', origin: 'user_explicit' })
+  const queued = await service.write({ kind: 'semantic', text: '模型猜想：测试也许该换用 bun 运行' })
+  assert.equal(queued.pending, true, '前置条件：模型来源写入入队')
+
+  // 无参：插入顺序、全部状态（pending 也在库内）、**库内活对象本身**（不是快照副本）
+  const rows = service.list()
+  assert.deepEqual(idsOf(rows), [first.id, second.id, queued.id], '无参必须保持插入顺序')
+  assert.deepEqual(rows.map((row) => row.status), ['active', 'active', 'pending'], '无参不得过滤任何状态')
+  assert.equal(rows[0], service.list()[0], '无参返回的必须是库内活对象（改一条应能被下一次 list 看到）')
+
+  // 三个参数「都不生效」时必须与无参逐字节相同
+  const plain = JSON.stringify(service.list())
+  const noop: Array<[string, Json]> = [
+    ['空对象', {}],
+    ['status: all', { status: 'all' }],
+    ['branch: null', { branch: null }],
+    ['非法 limit: 0', { limit: 0 }],
+    ['非法 limit: -3', { limit: -3 }],
+    ['非法 limit: NaN', { limit: Number.NaN }],
+  ]
+  for (const [label, options] of noop) {
+    assert.equal(JSON.stringify(service.list(options)), plain, `${label} 必须与无参逐字节相同`)
+  }
+})
+
+test('host#98 list({status})：各档只返回该状态；active 不含 pending；all 与无参同集合同顺序', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const service = harness.memory()
+  const seeded = await seedFourStatuses(harness)
+  const fullOrder = idsOf(service.list())
+  assert.deepEqual(fullOrder, [seeded.active, seeded.pending, seeded.archived, seeded.invalid], '前置条件：四种状态都在库内')
+
+  assert.deepEqual(idsOf(service.list({ status: 'active' })), [seeded.active], 'active 必须且只能有 active')
+  assert.equal(service.list({ status: 'active' }).some((row) => row.status === 'pending'), false, 'active 不得含 pending（§4.3）')
+  assert.deepEqual(idsOf(service.list({ status: 'pending' })), [seeded.pending], 'pending 只在显式查询里出现')
+  assert.deepEqual(idsOf(service.list({ status: 'archived' })), [seeded.archived])
+  assert.deepEqual(idsOf(service.list({ status: 'invalid' })), [seeded.invalid])
+  assert.deepEqual(idsOf(service.list({ status: 'all' })), fullOrder, 'all 与无参同集合、同顺序')
+
+  // 过滤只影响返回集合：不过滤时相对顺序与无参一致，且不改任何状态
+  assert.deepEqual(
+    idsOf(service.list({ status: 'active' })),
+    fullOrder.filter((id) => id === seeded.active),
+    '过滤必须保持插入顺序',
+  )
+  assert.deepEqual(
+    service.list().map((row) => row.status),
+    ['active', 'pending', 'archived', 'invalid'],
+    '过滤不得改状态（不做任何写入）',
+  )
+  assert.equal(harness.domain.puts.length, 4, '四个写入探针之外不得有额外落盘')
+})
+
+test('host#99 list({limit})：>=1 才生效、按当前顺序截断，0/负数/NaN 忽略；过滤后截断', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const service = harness.memory()
+  const first = await service.write({ kind: 'semantic', text: '限量探针一：构建流程统一用 pnpm', origin: 'user_explicit' })
+  const second = await service.write({ kind: 'semantic', text: '限量探针二：构建流程统一用 pnpm', origin: 'user_explicit' })
+  const third = await service.write({ kind: 'semantic', text: '限量探针三：构建流程统一用 pnpm', origin: 'user_explicit' })
+  const order = [String(first.id), String(second.id), String(third.id)]
+
+  assert.deepEqual(idsOf(service.list({ limit: 1 })), order.slice(0, 1), 'limit=1 取第一条')
+  assert.deepEqual(idsOf(service.list({ limit: 2 })), order.slice(0, 2), 'limit 必须截当前顺序的前 N 条')
+  assert.deepEqual(idsOf(service.list({ limit: 3 })), order, 'limit 超过条数＝全部')
+  assert.deepEqual(idsOf(service.list({ limit: 99 })), order)
+  assert.deepEqual(idsOf(service.list({ limit: 0 })), order, 'limit=0 非法 ⇒ 忽略（不是返回空）')
+  assert.deepEqual(idsOf(service.list({ limit: -3 })), order, '负数非法 ⇒ 忽略')
+  assert.deepEqual(idsOf(service.list({ limit: Number.NaN })), order, 'NaN 非法 ⇒ 忽略')
+  assert.deepEqual(idsOf(service.list({ limit: Number.POSITIVE_INFINITY })), order, 'Infinity 非法 ⇒ 忽略')
+
+  // 截断发生在过滤之后（status 先过，再取前 N 条）
+  const target = rowsOf(harness).find((row) => row.id === String(second.id))!
+  target.status = 'archived'
+  assert.deepEqual(idsOf(service.list({ status: 'archived', limit: 1 })), [String(second.id)])
+})
+
+test('host#100 list({branch})：current 与注入同口径（branchVisible）；显式分支名只留该标签；null 不过滤', async (t) => {
+  const repoA = makeGitRepo('feature/x')
+  const repoB = makeGitRepo('main')
+  useTempDirs(t, repoA, repoB)
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const service = harness.memory()
+  setSessionCwd(harness, repoA)
+  const onA = await service.write({ kind: 'semantic', text: BRANCH_TAGGED_TEXT, branch: 'feature/x', origin: 'user_explicit' })
+  const plain = await service.write({ kind: 'semantic', text: BRANCH_PLAIN_TEXT, origin: 'user_explicit' })
+  setSessionCwd(harness, repoB)
+  const onB = await service.write({ kind: 'semantic', text: '主干专属约定：主干上的构建流程统一用 pnpm 输出到 dist 目录', branch: 'main', origin: 'user_explicit' })
+  assert.equal(rowsOf(harness).length, 3, '前置条件：两条带标签 + 一条无标签')
+
+  // A 分支：current ＝ 无标签 + feature/x 标签，main 标签被挡
+  setSessionCwd(harness, repoA)
+  assert.deepEqual(
+    idsOf(service.list({ branch: 'current' })),
+    [String(onA.id), String(plain.id)],
+    "branch:'current' 必须用与注入相同的 branchVisible 口径（顺序不变）",
+  )
+  // 与工具同口径的交叉验证：memory_list 的候选池就是 branchVisible（再剔掉 pending，这里没有 pending）
+  const toolRows = JSON.parse(String(await harness.tool('memory_list').execute({ status: 'all' }))).items as Json[]
+  assert.deepEqual(
+    idsOf(service.list({ branch: 'current' })).sort(),
+    idsOf(toolRows).sort(),
+    "branch:'current' 必须与注入/工具走同一个过滤点",
+  )
+
+  // B 分支：换成 B 的标签
+  setSessionCwd(harness, repoB)
+  assert.deepEqual(
+    idsOf(service.list({ branch: 'current' })).sort(),
+    [String(plain.id), String(onB.id)].sort(),
+    '切分支后 current 必须重新解析（缓存按 cwd 失效）',
+  )
+
+  // 显式分支名：只保留 branchOf(record) 等于该值的记录（无标签记录**不**算）
+  assert.deepEqual(idsOf(service.list({ branch: 'main' })), [String(onB.id)])
+  assert.deepEqual(idsOf(service.list({ branch: 'feature/x' })), [String(onA.id)])
+  assert.deepEqual(idsOf(service.list({ branch: 'release/1.0' })), [], '没有该分支的记录 ⇒ 空，不是全量')
+  assert.deepEqual(idsOf(service.list({ branch: null })).length, 3, 'null = 不过滤')
+  assert.deepEqual(
+    idsOf(service.list({ branch: 'current', status: 'active' })).sort(),
+    [String(plain.id), String(onB.id)].sort(),
+    '两个新参数可以叠加（先分支后状态）',
+  )
+
+  // branchAware=false：'current' 忽略标签（与注入一致），显式分支名仍按标签相等过滤
+  const off = makeHarness({ config: { branchAware: false } })
+  t.after(() => off.dispose())
+  await off.settle()
+  setSessionCwd(off, repoB)
+  const offA = await off.memory().write({ kind: 'semantic', text: BRANCH_TAGGED_TEXT, branch: 'feature/x', origin: 'user_explicit' })
+  const offB = await off.memory().write({ kind: 'semantic', text: BRANCH_PLAIN_TEXT, origin: 'user_explicit' })
+  assert.deepEqual(
+    idsOf(off.memory().list({ branch: 'current' })).sort(),
+    [String(offA.id), String(offB.id)].sort(),
+    'branchAware=false ⇒ current 忽略标签（与注入完全同口径）',
+  )
+  assert.deepEqual(idsOf(off.memory().list({ branch: 'feature/x' })), [String(offA.id)], '显式分支名仍按标签相等过滤')
+})
+
+test('host#101 recall({status})：pending 可显式取到、all 含全部状态；缺省行为一字不变', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const service = harness.memory()
+  const seeded = await seedFourStatuses(harness)
+  const query = '构建流程 输出 pnpm'
+  const fullPool = [seeded.active, seeded.pending, seeded.archived, seeded.invalid].sort()
+
+  // 缺省：不传 status ⇒ 与 0.5.17 相同（只有 active 参与召回，pending 绝不出现）
+  const plain = service.recall({ query }) as unknown as Json[]
+  assert.deepEqual(recallIds(plain), [seeded.active], '缺省召回只返回 active')
+  assert.deepEqual(
+    recallIds(service.recall({ query, status: 'active' })),
+    recallIds(plain),
+    "显式 status:'active' 必须与缺省完全一致",
+  )
+  assert.deepEqual(
+    recallIds(service.recall({ query, branch: null })),
+    recallIds(plain),
+    'branch:null = 不过滤，与缺省一致',
+  )
+
+  // status:'pending'：允许的显式管理/审计查询（v1.1 的加法），返回的是库里的活对象
+  const pendingHits = service.recall({ query, status: 'pending' }) as unknown as Json[]
+  assert.deepEqual(recallIds(pendingHits), [seeded.pending], "recall({status:'pending'}) 必须能取到待确认记录")
+  assert.equal((pendingHits[0]!.record as Json).status, 'pending', 'pending 记录的状态不得被改写')
+  assert.equal(
+    (pendingHits[0]!.record as Json).id,
+    rowsOf(harness).find((row) => row.id === seeded.pending)!.id,
+    '返回的必须是库里那条活对象（不是检索视图副本）',
+  )
+
+  // archived / invalid / all：显式 status 不必再传 includeArchived
+  assert.deepEqual(recallIds(service.recall({ query, status: 'archived' })), [seeded.archived])
+  assert.deepEqual(recallIds(service.recall({ query, status: 'invalid' })), [seeded.invalid])
+  assert.deepEqual(
+    recallIds(service.recall({ query, status: 'all' })).sort(),
+    fullPool,
+    "status:'all' 必须命中 active + pending + invalid + archived（排序口径不变）",
+  )
+  // 空查询 + all：四种状态都在；缺省空查询仍只返回 active
+  assert.deepEqual(recallIds(service.recall({ status: 'all' })).sort(), fullPool)
+  assert.deepEqual(recallIds(service.recall({})), [seeded.active], '缺省空查询只返回 active（与 0.5.17 相同）')
+  // 没有命中的状态：空结果，不抛
+  assert.deepEqual(service.recall({ query, status: 'invalid', tag: '不存在的标签' }), [])
+})
+
+test('host#102 recall({branch}) 过滤；注入路径不受新参数影响（pending 与它分支的记录都不进注入）', async (t) => {
+  const repoA = makeGitRepo('feature/x')
+  const repoB = makeGitRepo('main')
+  useTempDirs(t, repoA, repoB)
+  const harness = makeHarness({
+    config: { writePolicy: 'ask', recallMode: 'inject', selfIntroEnabled: false, selfReflectEnabled: false },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const service = harness.memory()
+  setSessionCwd(harness, repoA)
+  const taggedA = await service.write({
+    kind: 'semantic', scope: { level: 'profile', key: '*' }, text: BRANCH_TAGGED_TEXT, branch: 'feature/x', origin: 'user_explicit',
+  })
+  const plain = await service.write({ kind: 'semantic', scope: { level: 'profile', key: '*' }, text: BRANCH_PLAIN_TEXT, origin: 'user_explicit' })
+  setSessionCwd(harness, repoB)
+  const taggedB = await service.write({
+    kind: 'semantic', scope: { level: 'profile', key: '*' },
+    text: '主干专属约定：主干上的构建流程统一用 pnpm 输出到 dist 目录', branch: 'main', origin: 'user_explicit',
+  })
+  // 一条 pending（模型来源）：正文与查询高度重合，但绝不允许进注入
+  const pending = await service.write({ kind: 'semantic', scope: { level: 'profile', key: '*' }, text: '模型猜想：构建流程也许该用 bun 输出到 build 目录' })
+  assert.equal(pending.pending, true, '前置条件：pending 已入队')
+
+  // 缺省：与 0.5.17 一样**不做分支过滤**（协议文档据实记录；branch 要显式传）
+  assert.deepEqual(
+    recallIds(service.recall({ query: BRANCH_QUERY })).sort(),
+    [String(taggedA.id), String(taggedB.id), String(plain.id)].sort(),
+    '缺省召回（不传 branch）必须保持 0.5.17 的「不过滤分支」行为',
+  )
+  // branch:'current'：与注入同口径，在 B 上只留无标签 + main 标签
+  setSessionCwd(harness, repoB)
+  assert.deepEqual(
+    recallIds(service.recall({ query: BRANCH_QUERY, branch: 'current' })).sort(),
+    [String(taggedB.id), String(plain.id)].sort(),
+    "recall 的 branch:'current' 必须与注入同口径",
+  )
+  setSessionCwd(harness, repoA)
+  assert.deepEqual(
+    recallIds(service.recall({ query: BRANCH_QUERY, branch: 'current' })).sort(),
+    [String(taggedA.id), String(plain.id)].sort(),
+  )
+  assert.deepEqual(
+    recallIds(service.recall({ query: BRANCH_QUERY, branch: 'main' })),
+    [String(taggedB.id)],
+    '显式分支名只留该标签的记录（无标签记录不算）',
+  )
+
+  // 注入路径（R2）根本不接收新参数：分支按 branchVisible 挡，pending 一律不进
+  setSessionCwd(harness, repoB)
+  const injected = appendedText(await stepTurnAt(harness, 10, repoB, BRANCH_QUERY))
+  assert.doesNotMatch(injected, /分支专属约定/u, '它分支的标签记录不得进注入')
+  assert.match(injected, /跨分支约定/u, '无标签记录照常注入')
+  assert.doesNotMatch(injected, /模型猜想/u, 'pending 绝不进注入（M10 硬约束不受新参数影响）')
+  // 常驻块与工具同样不受影响
+  assert.doesNotMatch(residentText(harness), /模型猜想/u)
+  assert.doesNotMatch(String(await harness.tool('memory_recall').execute({ query: BRANCH_QUERY })), /模型猜想/u)
+})
+
+test('host#103 write 的 persisted：成功/合并/入队落盘为 true；领域未打开或 put 抛错为 false 且 ok 仍 true；拒绝路径没有该字段', async (t) => {
+  // a) 领域打开：created / merged / pending 三条成功路径都必须如实回报 true
+  const harness = makeHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const service = harness.memory()
+  const created = await service.write({ kind: 'semantic', text: 'persisted 探针：构建流程统一用 pnpm 输出到 dist', origin: 'user_explicit' })
+  assert.equal(created.ok, true)
+  assert.equal(created.persisted, true, '领域打开且 put 成功 ⇒ persisted=true')
+  assert.ok(harness.domain.puts.some((entry) => entry.key === created.id), 'persisted=true 必须对应一次真实落盘')
+
+  const merged = await service.write({ kind: 'semantic', text: 'persisted 探针：构建流程统一用 pnpm 输出到 dist', origin: 'user_explicit' })
+  assert.equal(merged.status, 'merged')
+  assert.equal(merged.persisted, true, '合并路径同样如实回报')
+
+  const queued = await service.write({ kind: 'semantic', text: 'persisted 探针：模型猜想也许该换用 bun' })
+  assert.equal(queued.pending, true)
+  assert.equal(queued.persisted, true, '入队路径也是落盘（待确认记录必须在盘上）')
+  assert.ok(harness.domain.rows.has(String(queued.id)), '入队的记录确实在存储域里')
+
+  // b) 拒绝路径：ok:false 且**没有** persisted 字段（不加该字段，而不是给个 false）
+  const sensitive = await service.write({ kind: 'user_profile', text: '这台机器的部署密钥是 sk-abcdefghijklmnop123456，请记住' })
+  assert.equal(sensitive.ok, false)
+  assert.match(String(sensitive.error), /rejected_sensitive/)
+  assert.equal('persisted' in sensitive, false, '拒绝路径不得带 persisted 字段')
+  const malformed = await service.write({ text: '缺 kind 的写入' })
+  assert.equal(malformed.ok, false, '服务面最小校验仍然生效')
+  assert.equal('persisted' in malformed, false)
+
+  // c) 领域未打开：内存语义不变（ok:true），但如实回报没落盘
+  const closed = makeHarness({ failOpen: true, config: { writePolicy: 'ask' } })
+  t.after(() => closed.dispose())
+  await closed.settle()
+  const notOpened = await closed.memory().write({ kind: 'semantic', text: '领域未打开时的写入探针', origin: 'user_explicit' })
+  assert.equal(notOpened.ok, true, '"已在内存生效"的语义不变')
+  assert.equal(notOpened.persisted, false, '领域未打开 ⇒ persisted=false')
+  const notOpenedPending = await closed.memory().write({ kind: 'semantic', text: '领域未打开时的待确认探针' })
+  assert.equal(notOpenedPending.ok, true)
+  assert.equal(notOpenedPending.persisted, false)
+  assert.equal(closed.domain.puts.length, 0, '没有可写领域时一次 put 都不该发生')
+
+  // d) put 抛错：ok 仍为 true，persisted 必须为 false（不能用 ok 兜底猜）
+  const failing = makeHarness({ failPuts: true })
+  t.after(() => failing.dispose())
+  await failing.settle()
+  const failedPut = await failing.memory().write({ kind: 'semantic', text: 'put 抛错时的写入探针', origin: 'user_explicit' })
+  assert.equal(failedPut.ok, true)
+  assert.equal(failedPut.persisted, false, 'put 抛错 ⇒ persisted=false')
+  assert.ok(failing.domain.puts.length > 0, '确实尝试过落盘（失败也留痕）')
 })
 
 

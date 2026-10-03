@@ -13,7 +13,7 @@
 
 - 方法名、入参含义、每个返回结构的键、§3.4 的错误码、§4.4 的三条载荷约定，全部冻结；
 - 允许**新增方法**，允许给 `MemoryRecord` / 召回命中**新增可选字段**（调用方必须忽略不认识的键，不要做穷举式校验）；
-- 允许给 `write` / `recall` **新增可选入参**。
+- 允许给 `write` / `recall` / `list` **新增可选入参**。
 
 任何破坏上面这些的改动 —— 改名/删除方法、改变字段含义、把可选字段变成必填、改变参与去重指纹的输入 ——
 都是**破坏性改动**：必须把协议版本升到 `v2`，单独发一版，并在 `CHANGELOG.md` 里说明。插件版本号仍按 patch 递增
@@ -21,14 +21,19 @@
 
 要下线的方法必须在整个 v1 里照常可用，并先在本文件里标为「已废弃」。
 
-今天服务对象上**有** `protocolVersion`（`'1.0'`），调用方应当先读它再决定怎么用（未知版本给可读降级，不要崩）。
+本文写的是 **v1.1**。它是 v1.0 之上的**纯加法**：`list()` 多了可选的 `status` / `branch` / `limit`，`recall()`
+多了两个可选过滤，`write()` 多了 `persisted` 字段，服务面的 `protocolVersion` 从 `'1.0'` 变成 `'1.1'`（§9）。
+`'1.0'` 调用方依赖过的东西一样没动 —— 所有无参调用的返回值与 0.5.17 逐字节相同（§3.1、§3.3）。
+
+今天服务对象上**有** `protocolVersion`（`'1.1'`），调用方应当先读它再决定怎么用（未知版本给可读降级，不要崩）。
+判断兼容性请用 `'1.x'` 谓词（`/^1\./u`），**不要**比字符串相等 —— 否则以后出 `1.2` 会把调用方锁在门外；最小示例见 §9。
 
 ## 2. 服务定位方式与可选性
 
 服务在 `apply()` 里**恰好注册一次**：
 
 ```ts
-ctx.provide('memory', { list, stats, recall, write, consolidate })
+ctx.provide('memory', { protocolVersion, list, stats, recall, write, consolidate })
 ```
 
 定位方式：
@@ -57,25 +62,50 @@ const memory = ctx.get('memory')
 
 ## 3. 方法：签名 / 入参 / 返回结构 / 错误形状
 
-注册对象，逐字来自 `src/index.ts`：
+服务对象的签名（实现体是内部的，语义以 §3.1–§3.5 为准）：
 
 ```ts
-ctx.provide('memory', {
-  list:        (): MemoryRecord[] => [...state.records.values()],
-  stats:       (): { records: number; version: number; opened: boolean } =>
-                 ({ records: state.records.size, version: state.collectionVersion, opened: state.opened }),
-  recall:      (options: RecallOptions) => recallRecords(state.records.values(), options),
-  write:       (input: WriteMemoryInput) => writeMemory(input),
-  consolidate: (reason?: string) => consolidate(reason ?? 'manual'),
-})
+interface MemoryService {
+  protocolVersion: string            // '1.1'
+  list(options?: ListOptions): MemoryRecord[]
+  stats(): { records: number; version: number; opened: boolean }
+  recall(options: RecallOptions): Array<{ record: MemoryRecord; match: number; score: number }>
+  write(input: WriteMemoryInput): Promise<WriteMemoryResult>
+  consolidate(reason?: string): Promise<void>
+}
 ```
 
 ### 3.1 `list()`
 
-- **入参**：无。
-- **返回**：内存库里**全部**记录的新数组，按**插入顺序**（先加载、后写入）。不排序、不按 `status` 过滤、不按分支过滤。
-  这是唯一能看到 `pending` / `invalid` / `archived` 的方法。
-- **错误形状**：无（只是造数组）。
+- **入参**：可选的 `options`；签名逐字冻结为：
+
+```ts
+list(options?: {
+  /** 只看某个状态；`'all'` ＝ 不过滤（与今天一致）。缺省 = 'all'（**保持向后兼容**）。 */
+  status?: 'active' | 'pending' | 'invalid' | 'archived' | 'all'
+  /**
+   * 分支过滤：
+   *   `'current'`（字符串字面量）= 用**与注入完全相同的** `branchVisible` 口径过滤当前 cwd 的分支；
+   *   其它字符串 = 只保留 `branchOf(record)` 等于该值的记录（外加无标签记录？**不**：只保留等于该值的）；
+   *   `null` = 不过滤。缺省 = 不过滤（向后兼容）。
+   */
+  branch?: 'current' | string | null
+  /** 最多返回几条（>=1；非法值忽略）。缺省 = 不限。 */
+  limit?: number
+}): MemoryRecord[]
+```
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `status` | `'all'` | `'all'` = 不过滤（与今天完全一致）。其它值只保留 §4.3 状态等于该值的记录；`'active'` 因此**不含** `pending`。 |
+| `branch` | 不给 | 不给 / `null` = 不过滤（今天的行为）。`'current'` 用**与注入完全相同**的 `branchVisible` 口径，按当前 cwd 过滤。其它字符串只保留 `branchOf(record)` 等于该值的记录 —— 无分支标签的记录**不会**被算进去。 |
+| `limit` | 不给 | 最多返回这么多条（`>= 1`；非法值忽略）。 |
+
+- **返回**：过滤后仍留存的记录的新数组，按**插入顺序**（先加载、后写入）。**无参调用**返回内存库里的**全部**记录，
+  与 0.5.17 逐字节相同：顺序、内容、活对象都不变 —— 不排序、不过滤。
+- **影响面**：过滤只影响**返回集合**，不影响任何记录的状态。无参 `list()` 仍是那个能看到 `pending` / `invalid` /
+  `archived` 的原始视图（显式 `recall({ status: … })` 是 v1.1 新增的第二道审计门 —— §3.3）。
+- **错误形状**：无（只是造数组 + 过滤）。
 
 ### 3.2 `stats()`
 
@@ -92,7 +122,17 @@ ctx.provide('memory', {
 
 ### 3.3 `recall(options)`
 
-- **入参**：`RecallOptions`（全部可选）：
+- **入参**：`RecallOptions`；v1.1 新增两个可选键，签名逐字冻结为：
+
+```ts
+interface RecallOptions {
+  // …既有字段不变
+  /** 状态过滤；缺省 = 今天的行为（active，`includeArchived: true` 时再含 archived）。 */
+  status?: 'active' | 'pending' | 'invalid' | 'archived' | 'all'
+  /** 分支过滤，语义与 `list` 的 `branch` 完全一致。缺省 = 不过滤（今天的行为）。 */
+  branch?: 'current' | string | null
+}
+```
 
 | 键 | 类型 | 默认 | 含义 |
 |---|---|---|---|
@@ -106,12 +146,15 @@ ctx.provide('memory', {
 | `minMatch` | `number` | `0.4` | `mode: 'memory'` 的阈值 |
 | `minHits` | `number` | `2` | `mode: 'memory'` 的最少有信息量 token 命中数 |
 | `includeArchived` | `boolean` | `false` | 同时纳入 `archived` 记录 |
+| `status` | `'active' \| 'pending' \| 'invalid' \| 'archived' \| 'all'` | 不给 = 今天的候选集合 | 允许返回哪些 §4.3 状态。不给 = 今天的行为（`active`，外加 `includeArchived === true` 时的 `archived`）；`'all'` = active + pending + invalid + archived，排序不变；`'pending'` **是允许的** —— 这是显式的管理/审计查询（§9） |
+| `branch` | `'current' \| string \| null` | 不给 = 不过滤 | 与 `list` 的 `branch` 语义完全一致（§3.1）：`'current'` = 注入自己那套 `branchVisible` 口径，按当前 cwd 过滤；其它字符串只保留 `branchOf(record)` 等于该值的记录；`null`/不给 = 不过滤 |
 
 - **返回**：`Array<{ record: MemoryRecord; match: number; score: number }>`，按 `score` 降序、再按记录确定性顺序（§4.1）
   排序，截断到 `limit`。
   - `match` 是所选模式下的相关性（0…1）；`score` 是排序分（词面 + 重要度 + 时效）。
-  - 候选集合：`status === 'active'` 恒在内；`includeArchived === true` 时再加上 `archived`。
-    **`pending` 与 `invalid` 在任何入参组合下都永不返回。**
+  - 候选集合：不给 `status` 时就是今天的集合 —— `status === 'active'` 恒在内，`includeArchived === true` 时再加上
+    `archived`；**只有不给 `status` 时，无论其它入参怎么组合，`pending` 与 `invalid` 都永不返回。** 显式的
+    `status: 'pending' | 'invalid' | 'all'` 是唯一能取到它们的门 —— 那是审计查询，绝不是注入路径（注入路径不传 `status`）。
 - **错误形状**：任何入参形状都不抛（运行期容忍 options 缺席）。
 
 ### 3.4 `write(input)`
@@ -137,17 +180,27 @@ ctx.provide('memory', {
 | `refs` | `MemoryRef[]` | — | 显式引用；优先于 `refVia` |
 | `branch` | `string` | — | 分支标签；不给 = 跨分支成立。改变它会**改变指纹**（§4.4） |
 
-- **返回**：`WriteMemoryResult` 对象；成功与拒绝都是结构化结果：
+- **返回**：`WriteMemoryResult` 对象；成功与拒绝都是结构化结果（v1.1 给每个成功形状加了 `persisted`，逐字冻结为）：
+
+```ts
+type WriteMemoryResult =
+  | { ok: true; status: 'created' | 'merged'; id: string; record: MemoryRecord; boosted?: number; /** 新增 */ persisted: boolean }
+  | { ok: true; pending: true; id: string; text: string; /** 新增 */ persisted: boolean }
+  | { ok: false; error: string }
+```
 
 | 形状 | 何时 |
 |---|---|
-| `{ ok: true, status: 'created', id, record }` | 新记录已生效 |
-| `{ ok: true, status: 'merged', id, record, boosted? }` | 已有同指纹的 `active` 记录，就地更新 |
-| `{ ok: true, pending: true, id, text }` | `writePolicy: 'ask'` 把 `model_proposed` 写入排进队列；**没有 `status` 键**，什么都没生效 |
-| `{ ok: false, error: '<code>: <message>' }` | 被拒；自画像收敛产出决策时会多一个 `portrait` |
+| `{ ok: true, status: 'created', id, record, persisted }` | 新记录已生效；`persisted` 说明是否真的到了存储域 |
+| `{ ok: true, status: 'merged', id, record, boosted?, persisted }` | 已有同指纹的 `active` 记录，就地更新 |
+| `{ ok: true, pending: true, id, text, persisted }` | `writePolicy: 'ask'` 把 `model_proposed` 写入排进队列；**没有 `status` 键**，什么都没生效 |
+| `{ ok: false, error: '<code>: <message>' }` | 被拒；**没有** `persisted` 键；自画像收敛产出决策时会多一个 `portrait` |
 
   `record` 是完整落库记录（§4.1 的全部必填字段）。`portrait` 是内部收敛决策，**形状在 v1 不冻结** —— 除非在排查
   自画像写入，否则忽略它。
+- **`persisted`（v1.1 新增）**：**这次写入是否真的落到了存储域**（`persist()` 成功）。领域未打开、或 `put` 抛错 ⇒
+  `false`，而 `ok` 仍是 `true`。`ok` 的含义 —— 「过了闸门并写进了内存库（或排进队列）」—— **不变**，只是不再含糊。
+  拒绝路径（`ok: false`）**不加**该字段；既有调用方忽略它即不受影响。
 - **错误码**（`error` 一律是「错误码 + `": "` + 说明」）：
 
 | 错误码 | 触发条件 |
@@ -164,8 +217,8 @@ ctx.provide('memory', {
   文字本身可能在 patch 版里改写。
 - **错误形状**：上面这些拒绝路径都不抛，返回结构化结果。Promise 被 reject 说明故障发生在这几条路径之外（例如宿主给的
   对象自己抛了）—— 按宿主故障处理，不要当成策略性拒绝。
-- **`ok` 不代表「已落盘」。** 它的含义是「过了闸门并写进了内存库（或排进队列）」。告诉别人「记住了」之前，先看
-  `stats().opened` 与这条记录有没有出现在 `list()` 里（见 §8 缺口 3）。
+- **`ok` 不代表「已落盘」。** 它的含义是「过了闸门并写进了内存库（或排进队列）」。v1.1 看上面的 `persisted`；
+  面对 `'1.0'` 服务面时，告诉别人「记住了」之前先看 `stats().opened` 与这条记录有没有出现在 `list()` 里（见 §8 缺口 3）。
 
 ### 3.5 `consolidate(reason?)`
 
@@ -232,17 +285,18 @@ interface MemoryRef {
 | 取值 | 含义 |
 |---|---|
 | `active` | 唯一会参与注入与召回的取值 |
-| `pending` | 被写入审批门（`writePolicy: 'ask'`）排队的条目，**在等用户确认**。不进注入、不进召回、工具也列不出来；只有用户命令（`/memory approve`、`/memory confirm`）能让它变 `active` |
-| `invalid` | 冲突落败方 / 被拒绝的待确认写入。永不参与召回，连 `includeArchived` 也拿不到；可用 `/memory restore` 恢复 |
+| `pending` | 被写入审批门（`writePolicy: 'ask'`）排队的条目，**在等用户确认**。不进注入、工具也列不出来；默认召回拿不到，**除非显式点名**（`list({ status: 'pending' })`、`recall({ status: 'pending' })`，属审计查询，§3.1/§3.3）；只有用户命令（`/memory approve`、`/memory confirm`）能让它变 `active` |
+| `invalid` | 冲突落败方 / 被拒绝的待确认写入。默认不参与召回，连 `includeArchived` 也拿不到；只有显式 `status: 'invalid'`（或 `'all'`）查询能取到；可用 `/memory restore` 恢复 |
 | `archived` | 不进注入，但 `includeArchived: true` 时仍可被检索（衰减归档与整合合并都落在这里） |
 
 ### 4.4 三条载荷级约定
 
 这三条是这份文档存在的理由；`tests/protocol.test.ts` 里每条都有专门断言。
 
-1. **`pending` 绝不进任何注入路径。** 常驻块（`section` + `context` 两条通道）不进、按轮召回不进、`recall()` 也不进。
-   `list()` 与 `memory_explain` 的待确认区是诊断路径，能看到它。实现方式是每条读取路径都按 `status === 'active'` 过滤 ——
-   不给「这是模型自己提的」留任何例外。
+1. **`pending` 绝不进任何注入路径。** 常驻块（`section` + `context` 两条通道）不进、按轮召回不进、`recall()` 也不进 ——
+   除非调用方显式传 `status: 'pending' | 'invalid' | 'all'`（§3.3），那是注入路径绝不会发出的审计查询（v1.1 起
+   `list()` 也归入这一类）。`list()`、`recall({ status: … })` 与 `memory_explain` 的待确认区是诊断路径，能看到它。
+   实现方式是每条读取路径都按 `status === 'active'` 过滤 —— 不给「这是模型自己提的」留任何例外。
 2. **`refs` 不进指纹。** 两次写入若 kind/scope/subject/text 相同而引用不同，结果是**同一条**记录（第二次返回
    `status: 'merged'`），两次的引用会并进这一条。否则同一条记忆会因为来源不同被判成两条，去重与幂等一起失效。
 3. **`branch` 进指纹**，但只在这条记录确实带非空分支标签时追加（`...(branch ? [branch] : [])`）。于是「哪儿都成立的约定」
@@ -310,7 +364,7 @@ export async function remember(ctx: { get(name: string): unknown }, text: string
   if (!memory) return false
   const result = await memory.write({ kind: 'semantic', text, subject: 'build.tool' })
   // ok:true 且 pending:true 表示「已提议、等用户确认」，不是「记住了」。
-  // 只有 ok:true 也不代表落盘：要看 memory.stats().opened。
+  // 只有 ok:true 也不代表落盘：v1.1 看 result.persisted（§3.4），否则看 memory.stats().opened。
   return result.ok === true && result.pending !== true
 }
 ```
@@ -329,30 +383,86 @@ export async function remember(ctx: { get(name: string): unknown }, text: string
 | 客户端半边（`dsh.client` / `lib/client.js`） | 可选 | 只负责设置页表单与预览；没有它，宿主半边的全部服务面照常工作 |
 | `@deepseek-ai/schemastery` | 可选 peer | 不可用时整个 `Config` schema 被丢弃（或退化成不带 volatile 的版本）；服务面不受影响 |
 | 运行期依赖 | **零** | `dependencies` 为空；发布包发的是 `lib/`，不是 `src/` |
-| 协议版本字段 | v1 没有 | 见 §8 缺口 1；今天靠方法集合 + 记录形状识别版本 |
+| 协议版本字段 | 有：`'1.1'` | §1、§9；用 `'1.x'` 谓词（`/^1\./u`）判断，不要比字符串相等。`'1.0'` 服务面只是没有 v1.1 的新键 |
 
 ## 8. 缺口与已声明行为（2026-10-03 集成时复核）
 
 2026-10-03 照实现读出来的清单；`tests/protocol.test.ts` **不**把其中任何一条断言成「正确」，这里也不在 `src/` 里绕开它们。
 
 **集成时已修（3 条）**：
-- ~~1. 服务面没有 `protocolVersion`~~ → **已加** `protocolVersion: '1.0'`（加法；§1 的稳定性承诺不变）。
+- ~~1. 服务面没有 `protocolVersion`~~ → **已加** `protocolVersion`（加法；§1 的稳定性承诺不变）；v1.1 的加法之后读出来是 `'1.1'`（§9）。
 - ~~4. `write` 不校验入参~~ → **已在服务面补最小校验**：`kind` 必须是六个枚举之一、`text` 必须是非空字符串，
   否则返回 `{ ok: false, error: 'rejected_invalid: …' }` 且**不落盘**。工具侧原本有 JSON Schema 兜着，服务面此前没有，
   于是第三方能写出 `kind: undefined` 的记录 —— 现在是结构化拒绝。
-- ~~7. 协议文档不在发布包里~~ → **`package.json` 的 `files` 已加** `docs/protocol-v1.md` 与 `docs/protocol-v1.zh.md`。
+- ~~7. 协议文档不在发布包里~~ → **`package.json` 的 `files` 现在发整个 `docs/`**（v1.0 时只列了两份协议文档；§9）。
 
 **保留为「已声明行为」（不是缺陷，但调用方必须知道）**：
 
-2. **`list()` 与 `recall()` 是未过滤的原始视图。** 两者直接读 `state.records.values()`，而所有注入路径都过
+2. **`list()` 与 `recall()` 默认是未过滤的原始视图。** 两者直接读 `state.records.values()`，而所有注入路径都过
    `branchVisible(...)`。于是 `branchAware: true` 时，第三方通过 `ctx.memory` 能看到别的分支的带标签记录，尽管这些记录
-   被正确地挡在提示之外。**裁决：保留为原始视图**（服务面是管理/审计视角，过滤会让第三方无法看全库）；
-   需要同口径过滤的调用方请自行用 `branchOf(record)` 过滤（`lib` 有导出）。
+   被正确地挡在提示之外。**裁决：默认保持原始视图**（服务面是管理/审计视角，默认过滤会让第三方无法看全库）。v1.1 加的是
+   可选开关、不是改默认：无参仍是原始视图；`list({ status })` / `recall({ status })` 按 §4.3 状态过滤，`list({ limit })`
+   截断条数，`list({ branch: 'current' })` / `recall({ branch: 'current' })` 用**注入自己那套** `branchVisible` 口径。
+   除 `'current'` 之外的视角请自行用 `branchOf(record)` 过滤（`lib` 有导出）。
 3. **`write` 在什么都没落盘时也报 `ok: true`。** 领域没打开时 `persist()` 在**写进内存库之前**就返回 `false`：结果依然是
-   `{ ok: true, status: 'created', id, record }`，而 `list()` 是空的、`stats().opened` 是 `false`。如果 `put` 自己抛了，
-   记录留在内存但没在盘上，同样是 `ok: true`。所以 `ok` 的含义是「已在内存生效」，不是「已持久化」——
-   **裁决：保留该语义并把这句话写进契约**（要判断落盘情况请读 `stats().opened` 与 `version`）。
+   `{ ok: true, status: 'created', id, record, persisted: false }`，而 `list()` 是空的、`stats().opened` 是 `false`。如果
+   `put` 自己抛了，记录留在内存但没在盘上，同样是 `ok: true`。所以 `ok` 的含义是「已在内存生效」，不是「已持久化」——
+   **裁决：保留 `ok` 语义 —— 现在已写进契约、不再含糊**：v1.1 的 `persisted`（§3.4）说明这次写入有没有到存储域，
+   `stats().opened` 与 `version` 仍是看存储域自身状态的方式。
 5. **`list()` / `recall()` 返回的是活对象。** 它们就是插件自己会改的那些引用（`useCount`、`lastUsedAt`、合并结果）。
    读是安全的；往里写是未定义行为，而且不会自行落盘。
-6. **`list()` 既不排序也不过滤。** 只有插入顺序，且含 `pending`/`invalid`/`archived`。想要「注入看到的样子」，请自己按
-   §4.3 + §4.4 复现。
+6. **`list()` 不排序，且无参时不过滤。** 只有插入顺序，无参调用含 `pending`/`invalid`/`archived`。v1.1 新增的是可选
+   `status` / `branch` / `limit` 过滤（§3.1），默认不变。想要「注入看到的样子」，请自己按 §4.3 + §4.4 复现，或者直接传
+   `branch: 'current'` —— 那正是注入自己那套分支口径。
+
+## 9. v1.1 的加法
+
+v1.1 是 v1 之内的**纯加法**：服务面的 `protocolVersion` 从 `'1.0'` 变成 `'1.1'`，0.5.17 能用的调用行为全部照旧
+（无参 `list()` 逐字节不变）。三处服务面新增 + 一处发布包变化：
+
+| # | 新增 | 位置 |
+|---|---|---|
+| 1 | `list(options?)` —— 可选 `status` / `branch` / `limit`；无参 = v1.0 的原始视图 | §3.1 |
+| 2 | `recall(options)` —— 可选 `status` / `branch`。`status: 'pending'` 是显式的审计门；注入路径不传 `status`，行为不变 | §3.3 |
+| 3 | `write(input)` —— 每个**成功**形状都带 `persisted: boolean`。`ok: true` 仍是「已在内存生效」，`persisted` 才是「已落盘」。拒绝路径**没有**这个键 | §3.4 |
+| 4 | 发布包 —— `package.json` 的 `files` 从「两份协议文档」改为发**整个 `docs/`**（refs / self-portrait / sleep / write-policy / audit / branch / i18n / trace / semantic / dsh-mechanisms 以及两份协议） | §8 第 7 条 |
+
+**版本请用 `'1.x'` 谓词判断，不要比字符串相等** —— 以后出 `1.2` 不能把调用方锁在门外；还写着 `'1.0'` 的服务面只是
+少了那三个可选键：
+
+```ts
+/** 本调用方用到的切片；服务类型没有导出（见 §6）。 */
+interface MemoryService {
+  protocolVersion?: string
+  list(options?: { status?: string; branch?: string | null; limit?: number }): Array<{ id: string }>
+  recall(options?: { query?: string; status?: string; branch?: string | null }): Array<{ record: { id: string } }>
+  write(input: { kind: string; text: string }): Promise<
+    { ok: true; pending?: boolean; persisted?: boolean } | { ok: false; error: string }
+  >
+}
+
+export function memoryService(ctx: { get(name: string): unknown }): MemoryService | null {
+  const memory = ctx.get('memory') as MemoryService | undefined
+  if (!memory) return null                                  // 可选服务：静默降级（§2）
+  const version = memory.protocolVersion
+  // '1.0'、'1.1' 以及之后所有 '1.x' 都放行；未知主版本拒绝，不要猜。
+  if (version !== undefined && !/^1\./u.test(version)) return null
+  return memory
+}
+
+export async function remember(ctx: { get(name: string): unknown }, text: string): Promise<boolean> {
+  const memory = memoryService(ctx)
+  if (!memory) return false
+  const v11 = memory.protocolVersion !== undefined && memory.protocolVersion !== '1.0'
+  if (v11) {
+    // 只有 v1.1 才有的可选入参：版本判断通过后再传（其它地方记得忽略不认识的键）。
+    const active = memory.list({ status: 'active', limit: 20 })
+    if (active.length === 0) return false
+  }
+  const result = await memory.write({ kind: 'semantic', text })
+  // ok = 「已在内存生效」；persisted（v1.1）= 「已落盘」。v1.1 之前的服务面直接不返回 persisted。
+  return result.ok === true && result.persisted !== false
+}
+```
+
+本文其余部分 —— §2 的可选性、§4 的数据模型与三条载荷约定、§5 的配置面 —— 都是 v1.0 的内容，v1.1 没有改动。

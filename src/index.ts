@@ -619,6 +619,31 @@ interface WriteMemoryResult {
   pending?: boolean
   /** 队列路径返回的正文（模型需要看到自己提了什么）。 */
   text?: string
+  /**
+   * M16（协议 v1.1 §3）：这次写入是否**真的落到了存储域**（`persist()` 成功）。
+   *
+   *  · 领域未打开、或 `put` 抛错 ⇒ `false`，而 `ok` 仍为 `true`（「已在内存生效」的语义不变）；
+   *  · 成功路径统一口径：**本次写入产生/更新的那条记录**（supersede 时还包括被取代条目的归档）
+   *    的 `persist()` 是否全部成功；
+   *  · **只在成功路径出现** —— 拒绝路径（`ok: false`）不得带这个字段（既有调用方忽略它即不受影响）。
+   */
+  persisted?: boolean
+}
+
+/**
+ * M16（协议 v1.1 §1）：`list()` 的显式过滤参数。
+ * 三个字段全是可选的，且**全部缺省/全不生效时必须与 0.5.17 逐字节相同**（顺序、内容、活对象）。
+ */
+interface MemoryListOptions {
+  /** 只看某个状态；`'all'` ＝ 不过滤（与今天一致）。缺省 = `'all'`。 */
+  status?: MemoryRecord['status'] | 'all'
+  /**
+   * 分支过滤：`'current'`（字面量）= 与注入**完全相同**的 `branchVisible` 口径；
+   * 其它字符串 = 只保留 `branchOf(record)` 等于该值的记录；`null`/缺省 = 不过滤。
+   */
+  branch?: 'current' | string | null
+  /** 最多返回几条（`>= 1` 才生效；非法值忽略）。缺省 = 不限。 */
+  limit?: number
 }
 
 /** `/memory` 子命令处理器。 */
@@ -1794,13 +1819,14 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     attachRefs(target, incomingRefs)
     // 指纹必须重算：recordHash 覆盖 subject 与正文（**不含 refs**，§5）
     target.hash = recordHash(target)
-    await persist(target)
+    // M16（协议 v1.1 §3）：如实带出「这条更新有没有真的落盘」，而不是用 ok 兜底猜。
+    const persisted = await persist(target)
     state.writes.merged += 1
     state.self.refined += 1
     // M13：reinforce / refine 是「合并到既有条目」（不是新建）——审计按 merged 记。
     auditPush('merged', { id: target.id, kind: target.kind, origin: target.origin, via: viaOfRecord(target) })
     flush()
-    return { ok: true, status: 'merged', id: target.id, record: target, boosted: false, portrait: plan.outcome }
+    return { ok: true, status: 'merged', id: target.id, record: target, boosted: false, portrait: plan.outcome, persisted }
   }
 
   /**
@@ -1829,19 +1855,22 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     asPortrait(record).facet = plan.outcome.facet
     // M9：新条目带自己的引用；被归档的旧条目引用不动（§4.2）。
     attachRefs(record, incomingRefs)
+    // M16（协议 v1.1 §3）：supersede 这次写入涉及两次落盘 —— 旧条目的归档与新条目。
+    // 只要有一次没落盘，就不能对外说「已经落到存储域」（`ok:true` 仍表示内存里已生效）。
+    let archived = true
     if (plan.decision.archiveTarget && target) {
       target.status = 'archived'
       asPortrait(target).supersededBy = record.id
-      await persist(target)
+      archived = await persist(target)
       // M13：被取代的旧条目归档也是「库内状态变化」，如实记一条。
       auditPush('archived', { id: target.id, kind: target.kind, origin: target.origin, via: viaOfRecord(target) })
     }
-    await persist(record)
+    const persisted = (await persist(record)) && archived
     state.writes.created += 1
     state.self.superseded += 1
     auditPush('created', { id: record.id, kind: record.kind, origin: record.origin, via: viaOfRecord(record) })
     flush()
-    return { ok: true, status: 'created', id: record.id, record, portrait: plan.outcome }
+    return { ok: true, status: 'created', id: record.id, record, portrait: plan.outcome, persisted }
   }
 
   /** 写入：敏感过滤 → PII 脱敏 → 回声剔除 → 自画像收敛 → hash 去重合并 → 落盘。（工具与命令共用） */
@@ -1930,11 +1959,12 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       queued.status = 'pending'
       attachRefs(queued, pendingRefs(input))
       queued.hash = recordHash(queued)
-      await persist(queued)
+      // M16（协议 v1.1 §3）：入队也要如实回报有没有真的落到盘上。
+      const persisted = await persist(queued)
       state.writes.pending += 1
       auditPush('pending', { id: queued.id, kind: queued.kind, origin: queued.origin, via: viaOfRecord(queued) })
       flush()
-      return { ok: true, pending: true, id: queued.id, text: queued.text }
+      return { ok: true, pending: true, id: queued.id, text: queued.text, persisted }
     }
 
     // ---- 自画像收敛（仅显式 facet 的 agent_self 写入）----
@@ -2005,14 +2035,16 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       }
       // M9：合并（同一件事又被说了一次）时新引用并入既有条目，旧引用保留（§4.2）。
       attachRefs(merged, incomingRefs)
-      await persist(merged)
+      // M16（协议 v1.1 §3）：合并后的记录有没有真的落盘。
+      const persisted = await persist(merged)
       state.writes.merged += 1
       auditPush('merged', { id: merged.id, kind: merged.kind, origin: merged.origin, via: viaOfRecord(merged) })
       flush()
-      return { ok: true, status: 'merged', id: merged.id, record: merged, boosted: isNewSession }
+      return { ok: true, status: 'merged', id: merged.id, record: merged, boosted: isNewSession, persisted }
     }
 
-    await persist(record)
+    // M16（协议 v1.1 §3）：新建记录有没有真的落盘。
+    const persisted = await persist(record)
     state.writes.created += 1
     if (portraitPlan) state.self.added += 1
     auditPush('created', { id: record.id, kind: record.kind, origin: record.origin, via: viaOfRecord(record) })
@@ -2022,6 +2054,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       status: 'created',
       id: record.id,
       record,
+      persisted,
       ...(portraitPlan ? { portrait: portraitPlan.outcome } : {}),
     }
   }
@@ -4569,13 +4602,75 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
 
   // 供其他插件/调试使用的最小服务面。M15-C 把它冻结成协议 v1（`docs/protocol-v1.md`），
   // 那份文档里逐条写明方法/返回结构/缺口；这里的改动都是**加法**，v1 内只加不破。
+  // M16 落在 v1.1（契约 `docs/protocol-v1.1-changes.md` §1/§2/§3）：`list`/`recall` 加可选过滤、
+  // `write` 成功路径加 `persisted`、`protocolVersion` 升到 `'1.1'`（调用方按 `'1.x'` 判断）。
   try {
     ;(ctx as DshPluginContextWithProvide).provide('memory', {
       /** 协议版本：第三方据此判断可用面（只做加法时主版本不变）。 */
-      protocolVersion: '1.0',
-      list: (): MemoryRecord[] => [...state.records.values()],
+      protocolVersion: '1.1',
+      /**
+       * M16（协议 v1.1 §1）：`list(options?)`。
+       *
+       * **无参（或三个参数都不生效）时必须与 0.5.17 逐字节相同**：直接返回
+       * `[...state.records.values()]` —— 插入顺序、全部状态、库内的活对象本身。
+       * 因此这里刻意保留那条原样的返回路径；过滤只在新参数**真正生效**时发生
+       * （`status:'all'` / `branch:null`、缺省 / 非法 `limit` 都算「不生效」）。
+       */
+      list: (options?: MemoryListOptions): MemoryRecord[] => {
+        const status = options?.status ?? 'all'
+        const branch = options?.branch ?? null
+        const rawLimit = options?.limit
+        // `>= 1` 才生效；`0` / 负数 / NaN / Infinity / 非数字一律忽略（＝不限）。
+        const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit >= 1 ? rawLimit : null
+        if (status === 'all' && branch === null && limit === null) return [...state.records.values()]
+        const rows = branch === null
+          ? [...state.records.values()]
+          : branch === 'current'
+            // `'current'` 用**与注入完全相同**的统一过滤点（`branchAware` 也在里面生效）。
+            ? branchVisible(state.records.values())
+            : [...state.records.values()].filter((record) => branchOf(record) === branch)
+        const filtered = status === 'all' ? rows : rows.filter((record) => record.status === status)
+        // 过滤只影响返回集合（顺序不变），不写任何状态。
+        return limit === null ? filtered : filtered.slice(0, limit)
+      },
       stats: (): { records: number; version: number; opened: boolean } => ({ records: state.records.size, version: state.collectionVersion, opened: state.opened }),
-      recall: (options: RecallOptions) => recallRecords(state.records.values(), { cfg, ...options }),
+      /**
+       * M16（协议 v1.1 §2）：`recall(options)` 支持新增的 `status` / `branch`。
+       *
+       *  · **缺省路径一字不改**：不传新参数时就是 0.5.17 的那个表达式（含 `cfg`/`includeArchived`/
+       *    `limit` 透传），注入路径不传 `status` ⇒ 行为不变；
+       *  · `branch` 与 `list` 同口径（`'current'` 走 `branchVisible`，其它字符串按 `branchOf` 相等）；
+       *  · 显式 `status` 时状态集合**完全由调用方决定**（含 `'pending'` 这种管理/审计查询）。
+       */
+      recall: (options: RecallOptions) => {
+        const branch = options?.branch ?? null
+        const status = options?.status
+        if (status === undefined && branch === null) {
+          return recallRecords(state.records.values(), { cfg, ...options })
+        }
+        // 新参数路径：先把 `branch` 落到候选池，再走同一个纯函数检索（打分/排序口径不变）。
+        const byBranch: Iterable<MemoryRecord> = branch === null
+          ? state.records.values()
+          : branch === 'current'
+            ? branchVisible(state.records.values())
+            : [...state.records.values()].filter((record) => branchOf(record) === branch)
+        // 新参数已由宿主落实，不再下传给纯函数层（避免两处过滤、也避免版本间互相打架）。
+        const rest: RecallOptions = { ...options }
+        delete rest.status
+        delete rest.branch
+        if (status === undefined) return recallRecords(byBranch, { cfg, ...rest })
+        // 显式 `status`：纯函数层的候选池按设计只收 active（`includeArchived` 时再含 archived）——
+        // 那是 M10「未批准的模型猜想绝不进召回」的硬约束，不能为了新参数把它破掉。
+        // 因此这里喂给它一份 `status:'active'` 的**检索视图**（打分只看正文/标签/重要度，与状态无关），
+        // 命中后立刻换回库里的活对象 —— 调用方拿到的仍是真的记录，不是副本。
+        const pool = [...byBranch]
+        const selected = status === 'all' ? pool : pool.filter((record) => record.status === status)
+        const view = selected.map((record) => ({ ...record, status: 'active' as MemoryRecord['status'] }))
+        const originals = new Map<MemoryRecord, MemoryRecord>()
+        selected.forEach((record, index) => { originals.set(view[index]!, record) })
+        const hits = recallRecords(view, { cfg, ...rest })
+        return hits.map((hit) => ({ ...hit, record: originals.get(hit.record) ?? hit.record }))
+      },
       // 服务面在工具之前补一层**最小校验**：工具那边有 JSON Schema 兜着，而第三方调用没有。
       // 不校验就等于允许别人写出 `kind: undefined` 的记录（M15-C 实测到的真缺口）。
       write: (input: WriteMemoryInput) => {

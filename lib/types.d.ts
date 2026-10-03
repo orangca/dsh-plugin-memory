@@ -134,6 +134,16 @@ export interface RecallOptions {
      * `searchLengthPenalty`；缺省（第三方经 `ctx.memory.recall` 直接调用时）按出厂默认。
      */
     cfg?: Partial<MemoryConfig> | null;
+    /**
+     * M16（协议 v1.1）：状态过滤。缺省 = 今天的行为（active；`includeArchived: true` 时再含 archived）。
+     * `'pending'` 只允许显式的管理/审计查询使用 —— **注入路径不传它**，行为不变。
+     */
+    status?: MemoryStatus | 'all';
+    /**
+     * M16（协议 v1.1）：分支过滤，语义与 `ctx.memory.list` 的 `branch` 一致。
+     * `'current'` = 与注入相同的 `branchVisible` 口径；其它字符串 = 只保留该分支标签的记录；`null`/缺省 = 不过滤。
+     */
+    branch?: 'current' | string | null;
 }
 /** 自动捕获抽出的候选（`extractCandidates` 的返回值）。 */
 export interface CaptureCandidate {

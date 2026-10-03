@@ -16,7 +16,7 @@ This is **v1**. Within v1 the service only grows:
   payload rules in §4.4 are frozen;
 - new **methods** may be added, and **optional** fields may be added to `MemoryRecord` / `MemoryRecallHit`
   (existing consumers must ignore unknown keys — do not exhaustively check shapes);
-- new **optional** input keys may be added to `write` / `recall`.
+- new **optional** input keys may be added to `write` / `recall` / `list`.
 
 Anything that breaks the above — renaming or removing a method, changing what a field means, making an
 optional field required, changing which inputs feed the dedup fingerprint — is a **breaking change**: it must
@@ -25,15 +25,21 @@ still advance by one patch (`0.5.16 → 0.5.17`); the protocol version and the p
 
 A method that is going away keeps working for the whole of v1 and is marked deprecated in this document first.
 
-Today the service object **does** carry `protocolVersion` (`'1.0'`); read it first and degrade readably on an
-unknown version rather than assuming.
+The revision you are reading is **v1.1**. It is a **pure addition** on top of v1.0: `list()` gained optional
+`status` / `branch` / `limit`, `recall()` two optional filters, `write()` the `persisted` field, and the service's
+`protocolVersion` moved from `'1.0'` to `'1.1'` (§9). Nothing a `'1.0'` consumer relied on changed — every
+no-argument call is byte for byte what 0.5.17 returned (§3.1, §3.3).
+
+Today the service object **does** carry `protocolVersion` (`'1.1'`); read it first and degrade readably on an
+unknown version rather than assuming. Decide compatibility with a `'1.x'` predicate (`/^1\./u`), **not** string
+equality, so that a later `1.2` does not lock you out; §9 has the minimal snippet.
 
 ## 2. Locating the service, and what to do when it is absent
 
 The service is registered exactly once, inside `apply()`:
 
 ```ts
-ctx.provide('memory', { list, stats, recall, write, consolidate })
+ctx.provide('memory', { protocolVersion, list, stats, recall, write, consolidate })
 ```
 
 Locate it with:
@@ -63,26 +69,52 @@ Rules for callers:
 
 ## 3. Methods
 
-The registered object, verbatim from `src/index.ts`:
+The service object, as signatures (the bodies are internal; §3.1–§3.5 fix the semantics):
 
 ```ts
-ctx.provide('memory', {
-  list:        (): MemoryRecord[] => [...state.records.values()],
-  stats:       (): { records: number; version: number; opened: boolean } =>
-                 ({ records: state.records.size, version: state.collectionVersion, opened: state.opened }),
-  recall:      (options: RecallOptions) => recallRecords(state.records.values(), options),
-  write:       (input: WriteMemoryInput) => writeMemory(input),
-  consolidate: (reason?: string) => consolidate(reason ?? 'manual'),
-})
+interface MemoryService {
+  protocolVersion: string            // '1.1'
+  list(options?: ListOptions): MemoryRecord[]
+  stats(): { records: number; version: number; opened: boolean }
+  recall(options: RecallOptions): Array<{ record: MemoryRecord; match: number; score: number }>
+  write(input: WriteMemoryInput): Promise<WriteMemoryResult>
+  consolidate(reason?: string): Promise<void>
+}
 ```
 
 ### 3.1 `list()`
 
-- **Arguments:** none.
-- **Returns:** a fresh array of **every** record in the in-memory store, in **insertion order** (load order,
-  then write order). No sorting, no `status` filter, no branch filter. This is the only method that can see
-  `pending` / `invalid` / `archived` rows.
-- **Errors:** none (array allocation only).
+- **Arguments:** optional `options`; the signature is frozen verbatim as:
+
+```ts
+list(options?: {
+  /** 只看某个状态；`'all'` ＝ 不过滤（与今天一致）。缺省 = 'all'（**保持向后兼容**）。 */
+  status?: 'active' | 'pending' | 'invalid' | 'archived' | 'all'
+  /**
+   * 分支过滤：
+   *   `'current'`（字符串字面量）= 用**与注入完全相同的** `branchVisible` 口径过滤当前 cwd 的分支；
+   *   其它字符串 = 只保留 `branchOf(record)` 等于该值的记录（外加无标签记录？**不**：只保留等于该值的）；
+   *   `null` = 不过滤。缺省 = 不过滤（向后兼容）。
+   */
+  branch?: 'current' | string | null
+  /** 最多返回几条（>=1；非法值忽略）。缺省 = 不限。 */
+  limit?: number
+}): MemoryRecord[]
+```
+
+| key | default | meaning |
+|---|---|---|
+| `status` | `'all'` | `'all'` = no filter (exactly today's behaviour). Any other value keeps only the rows whose §4.3 status is that value; `'active'` therefore never includes `pending`. |
+| `branch` | unset | unset / `null` = no filter (today's behaviour). `'current'` applies the **exact same** `branchVisible` rule injection uses, for the current cwd. Any other string keeps only the records whose `branchOf(record)` equals that value — records with no branch tag are **not** added. |
+| `limit` | unset | at most that many records (`>= 1`; an invalid value is ignored). |
+
+- **Returns:** a fresh array of the records that survive the filters, in **insertion order** (load order, then
+  write order). Called with **no argument** it is **every** record in the in-memory store, byte for byte what
+  0.5.17 returned: same order, same contents, same live objects — no sorting and no filtering.
+- **Effects:** filtering changes only the **returned set**; it never changes any record's state. A no-argument
+  `list()` is still the raw, unfiltered view that sees `pending` / `invalid` / `archived` (an explicit
+  `recall({ status: … })` is now the second audit door — §3.3).
+- **Errors:** none (array allocation + a filter only).
 
 ### 3.2 `stats()`
 
@@ -99,7 +131,17 @@ ctx.provide('memory', {
 
 ### 3.3 `recall(options)`
 
-- **Arguments:** `RecallOptions` (optional keys):
+- **Arguments:** `RecallOptions`; v1.1 adds two optional keys, frozen verbatim as:
+
+```ts
+interface RecallOptions {
+  // …既有字段不变
+  /** 状态过滤；缺省 = 今天的行为（active，`includeArchived: true` 时再含 archived）。 */
+  status?: 'active' | 'pending' | 'invalid' | 'archived' | 'all'
+  /** 分支过滤，语义与 `list` 的 `branch` 完全一致。缺省 = 不过滤（今天的行为）。 */
+  branch?: 'current' | string | null
+}
+```
 
 | key | type | default | meaning |
 |---|---|---|---|
@@ -113,13 +155,17 @@ ctx.provide('memory', {
 | `minMatch` | `number` | `0.4` | `mode: 'memory'` threshold |
 | `minHits` | `number` | `2` | `mode: 'memory'` minimum informative token hits |
 | `includeArchived` | `boolean` | `false` | also consider `archived` records |
+| `status` | `'active' \| 'pending' \| 'invalid' \| 'archived' \| 'all'` | absent = today's pool | which §4.3 statuses may be returned. Absent = today's behaviour (`active`, plus `archived` when `includeArchived === true`); `'all'` = active + pending + invalid + archived, order unchanged; `'pending'` is allowed — an explicit management/audit query (§9) |
+| `branch` | `'current' \| string \| null` | unset = no filter | exactly `list`'s `branch` (§3.1): `'current'` = the injection's own `branchVisible` rule for the current cwd; any other string keeps only records whose `branchOf(record)` equals it; `null` / unset = no filter |
 
 - **Returns:** `Array<{ record: MemoryRecord; match: number; score: number }>`, sorted by `score` descending and
   then by the deterministic record order (§4.1), truncated to `limit`.
   - `match` is the relevance value (0…1) for the chosen mode; `score` is the ordering score (lexical + importance
     + recency).
-  - Candidate pool: `status === 'active'` always, plus `archived` when `includeArchived === true`.
-    **`pending` and `invalid` are never returned, under any option combination.**
+  - Candidate pool: with `status` absent it is exactly today's pool — `status === 'active'` always, plus `archived`
+    when `includeArchived === true`. **Without an explicit `status`, `pending` and `invalid` are never returned,
+    whatever the other options say.** An explicit `status: 'pending' | 'invalid' | 'all'` is the only door that can
+    return them — an audit query, never an injection path (injection passes no `status`).
 - **Errors:** none for any option shape (absent options are tolerated at runtime).
 
 ### 3.4 `write(input)`
@@ -146,17 +192,29 @@ ctx.provide('memory', {
 | `refs` | `MemoryRef[]` | — | explicit references; takes precedence over `refVia` |
 | `branch` | `string` | — | branch tag; omitted = applies to every branch. Changing it **changes the fingerprint** (§4.4) |
 
-- **Returns:** a `WriteMemoryResult` object; success and rejection are both structured results:
+- **Returns:** a `WriteMemoryResult` object; success and rejection are both structured results (v1.1 adds
+  `persisted` to every success shape, frozen verbatim as):
+
+```ts
+type WriteMemoryResult =
+  | { ok: true; status: 'created' | 'merged'; id: string; record: MemoryRecord; boosted?: number; /** 新增 */ persisted: boolean }
+  | { ok: true; pending: true; id: string; text: string; /** 新增 */ persisted: boolean }
+  | { ok: false; error: string }
+```
 
 | shape | when |
 |---|---|
-| `{ ok: true, status: 'created', id, record }` | a new record was applied |
-| `{ ok: true, status: 'merged', id, record, boosted? }` | an `active` record with the same fingerprint already existed; it was updated in place |
-| `{ ok: true, pending: true, id, text }` | `writePolicy: 'ask'` queued a `model_proposed` write; **no `status` key**, nothing took effect |
-| `{ ok: false, error: '<code>: <message>' }` | rejected; `portrait` is added when self-portrait convergence produced a decision |
+| `{ ok: true, status: 'created', id, record, persisted }` | a new record was applied; `persisted` says whether it reached the domain |
+| `{ ok: true, status: 'merged', id, record, boosted?, persisted }` | an `active` record with the same fingerprint already existed; it was updated in place |
+| `{ ok: true, pending: true, id, text, persisted }` | `writePolicy: 'ask'` queued a `model_proposed` write; **no `status` key**, nothing took effect |
+| `{ ok: false, error: '<code>: <message>' }` | rejected; **no `persisted` key**; `portrait` is added when self-portrait convergence produced a decision |
 
   `record` is the full record as stored (all required fields of §4.1). `portrait` is an internal convergence
   decision whose shape is **not** frozen in v1 — ignore it unless you are diagnosing self-portrait writes.
+- **`persisted` (new in v1.1).** Whether **this write really reached the storage domain** (`persist()` succeeded).
+  Domain not open, or `put` threw ⇒ `false`, while `ok` stays `true`. The `ok` meaning — "passed the gates and was
+  applied to (or queued in) the in-memory store" — is **unchanged**; `persisted` just stops it being ambiguous.
+  The rejection shape (`ok: false`) does **not** carry the field. Callers that ignore it are unaffected.
 - **Error codes** (`error` always starts with the code, then `": "`):
 
 | code | trigger |
@@ -175,8 +233,8 @@ ctx.provide('memory', {
   a fault outside those paths (e.g. a host-supplied object throwing) — treat it as a host failure, not a policy
   rejection.
 - **`ok` does not mean "durable".** It means "passed the gates and was applied to (or queued in) the in-memory
-  store". Check `stats().opened` and whether the row appears in `list()` before telling anyone the memory is
-  safe (see §8 gap 3).
+  store". On v1.1 read `persisted` for durability (above); against a `'1.0'` service, check `stats().opened` and
+  whether the row appears in `list()` before telling anyone the memory is safe (see §8 gap 3).
 
 ### 3.5 `consolidate(reason?)`
 
@@ -246,8 +304,8 @@ command, `solidify` = compaction summary, `sleep` = `/sleep` backfill, `import` 
 | value | meaning |
 |---|---|
 | `active` | the only status that participates in injection and recall |
-| `pending` | queued by the write gate (`writePolicy: 'ask'`); **waiting for the user**. Not injected, not recalled, not listed by the tools; only a user command (`/memory approve`, `/memory confirm`) can make it `active` |
-| `invalid` | conflict loser / rejected pending write. Never recalled, not even with `includeArchived`; recoverable with `/memory restore` |
+| `pending` | queued by the write gate (`writePolicy: 'ask'`); **waiting for the user**. Not injected, not recalled, not listed by the tools **unless you explicitly ask** (`list({ status: 'pending' })`, `recall({ status: 'pending' })` — audit queries, §3.1/§3.3); only a user command (`/memory approve`, `/memory confirm`) can make it `active` |
+| `invalid` | conflict loser / rejected pending write. Not recalled by default, not even with `includeArchived`; only an explicit `status: 'invalid'` (or `'all'`) query returns it; recoverable with `/memory restore` |
 | `archived` | not injected, but still searchable with `includeArchived: true` (decay archiving and consolidation merges land here) |
 
 ### 4.4 Three payload-level rules
@@ -256,9 +314,11 @@ These three are the reason this document exists; each one has a dedicated assert
 `tests/protocol.test.ts`.
 
 1. **`pending` never enters an injection path.** Not the resident block (`section` + `context` channels), not
-   turn-level recall, not `recall()`. `list()` and the pending view in `memory_explain` are diagnostic and do
-   see it. Implemented by filtering on `status === 'active'` in every read path — no exception is allowed for
-   "the model's own proposal".
+   turn-level recall, and not `recall()` either — unless the caller explicitly passes
+   `status: 'pending' | 'invalid' | 'all'` (§3.3), which is an audit query no injection path ever issues (`list()`
+   joined that group in v1.1). `list()`, `recall({ status: … })` and the pending view in `memory_explain` are
+   diagnostic and do see it. Implemented by filtering on `status === 'active'` in every read path — no exception is
+   allowed for "the model's own proposal".
 2. **`refs` never feeds the fingerprint.** Two writes with the same kind/scope/subject/text and different
    references are **one** record (`status: 'merged'` on the second call); the references of the two writes are
    merged into it. Otherwise one memory would look like two and dedup/idempotency would break.
@@ -333,7 +393,7 @@ export async function remember(ctx: { get(name: string): unknown }, text: string
   if (!memory) return false
   const result = await memory.write({ kind: 'semantic', text, subject: 'build.tool' })
   // ok:true with pending:true means "proposed, waiting for the user" — not "remembered".
-  // ok:true alone is not durability either: check memory.stats().opened.
+  // ok:true alone is not durability either: read result.persisted (v1.1, §3.4) or memory.stats().opened.
   return result.ok === true && result.pending !== true
 }
 ```
@@ -352,7 +412,7 @@ Call `ctx.get('memory')` inside a step / effect (where services are live) and re
 | client half (`dsh.client` / `lib/client.js`) | optional | settings form + previews only; the host half and the whole service surface work without it |
 | `@deepseek-ai/schemastery` | optional peer | when unavailable the `Config` schema is dropped (or built without `volatile`); the service surface is unchanged |
 | runtime dependencies | **none** | `dependencies` is empty; the published package ships `lib/`, not `src/` |
-| protocol version field | absent in v1 | see §8 gap 1; version detection is by method set + shape today |
+| protocol version field | present: `'1.1'` | §1, §9; test it with a `'1.x'` predicate (`/^1\./u`), never string equality. A `'1.0'` service simply lacks the v1.1 keys |
 
 ## 8. Known gaps (awaiting a ruling)
 
@@ -360,29 +420,91 @@ Read off the implementation on 2026-10-03; none of these is asserted as "correct
 and none is worked around in `src/` here.
 
 **Fixed while integrating (3)**:
-- ~~1. No `protocolVersion` on the service~~ → **added** `protocolVersion: '1.0'` (additive; §1 unchanged).
+- ~~1. No `protocolVersion` on the service~~ → **added** `protocolVersion` (additive; §1 unchanged); it reads
+  `'1.1'` since the v1.1 additions (§9).
 - ~~4. `write` does not validate its arguments~~ → **the service now validates minimally**: `kind` must be one of
   the six enum values and `text` a non-empty string, otherwise it returns
   `{ ok: false, error: 'rejected_invalid: …' }` and writes nothing. The tool had a JSON Schema; the service did
   not, so a third party could write a record with `kind: undefined`.
-- ~~7. The protocol documents are not in the published package~~ → `package.json` `files` now includes
-  `docs/protocol-v1.md` and `docs/protocol-v1.zh.md`.
+- ~~7. The protocol documents are not in the published package~~ → `package.json` `files` now ships the **whole
+  `docs/`** directory (in v1.0 it listed only the two protocol documents; §9).
 
 **Kept as declared behaviour (not defects, but callers must know)**:
 
-2. **`list()` and `recall()` are an unfiltered raw view.** Both read `state.records.values()` directly, while
-   every injection path goes through `branchVisible(...)`. With `branchAware: true` a third party can therefore
-   see records tagged for another branch through `ctx.memory` even though those records are correctly withheld
-   from the prompt. **Decision: keep it raw** (the service is the admin/audit view; filtering would stop a third
-   party from auditing the whole store). Filter with `branchOf(record)` yourself if you need the same view.
+2. **`list()` and `recall()` are an unfiltered raw view by default.** Both read `state.records.values()` directly,
+   while every injection path goes through `branchVisible(...)`. With `branchAware: true` a third party can
+   therefore see records tagged for another branch through `ctx.memory` even though those records are correctly
+   withheld from the prompt. **Decision: keep the default raw** (the service is the admin/audit view; filtering by
+   default would stop a third party from auditing the whole store). v1.1 adds the opt-in instead of changing the
+   default: no argument is still the raw view, while `list({ status })` / `recall({ status })` filter by §4.3
+   status, `list({ limit })` caps the array, and `list({ branch: 'current' })` / `recall({ branch: 'current' })`
+   use **the injection's own** `branchVisible` rule. For any view other than `'current'`, filter with
+   `branchOf(record)` yourself.
 3. **`write` reports `ok: true` when nothing was persisted.** If the domain is not open, `persist()` returns
    `false` **before** inserting into the in-memory store: the result is still
-   `{ ok: true, status: 'created', id, record }` while `list()` is empty and `stats().opened` is `false`. If the
-   `put` itself throws, the record stays in memory but not on disk, again with `ok: true`. `ok` therefore means
-   "applied in memory", not "durable". **Decision: keep the wording and state it in the contract** — read
-   `stats().opened` and `version` when durability matters.
+   `{ ok: true, status: 'created', id, record, persisted: false }` while `list()` is empty and `stats().opened` is
+   `false`. If the `put` itself throws, the record stays in memory but not on disk, again with `ok: true`. `ok`
+   therefore means "applied in memory", not "durable". **Decision: keep the `ok` meaning — now stated in the
+   contract and no longer ambiguous**: v1.1's `persisted` (§3.4) says whether this write reached the domain, while
+   `stats().opened` and `version` remain the way to see the domain's own state.
 5. **Records returned by `list()` / `recall()` are the live objects.** They are the same references the plugin
    mutates (`useCount`, `lastUsedAt`, merge results). Reading is safe; writing into them is undefined behaviour
    and does not persist on its own.
-6. **`list()` is not sorted and not filtered.** Insertion order only; `pending`/`invalid`/`archived` rows are
-   included. Anyone who wants the injected view must reproduce §4.3 + §4.4 themselves.
+6. **`list()` is not sorted and — with no argument — not filtered.** Insertion order only; a no-argument call
+   includes `pending`/`invalid`/`archived` rows. v1.1 adds the opt-in `status` / `branch` / `limit` filters (§3.1)
+   without changing that default. Anyone who wants the injected view must reproduce §4.3 + §4.4 themselves, or ask
+   for `branch: 'current'`, which is the injection's own branch rule.
+
+## 9. What v1.1 adds
+
+v1.1 is a **pure addition** inside v1: the service's `protocolVersion` went `'1.0' → '1.1'`, and every call that
+worked in 0.5.17 keeps its exact behaviour (a no-argument `list()` is byte for byte identical). Three surface
+additions and one packaging change:
+
+| # | addition | where |
+|---|---|---|
+| 1 | `list(options?)` — optional `status` / `branch` / `limit`; no argument = the v1.0 raw view | §3.1 |
+| 2 | `recall(options)` — optional `status` / `branch`. `status: 'pending'` is the explicit audit door; injection passes no `status`, so its behaviour is unchanged | §3.3 |
+| 3 | `write(input)` — every **success** shape now carries `persisted: boolean`. `ok: true` still means "applied in memory"; `persisted` is the one that means "reached the storage domain". The rejection shape has no such key | §3.4 |
+| 4 | packaging — `package.json` `files` now ships the **whole `docs/`** directory (refs / self-portrait / sleep / write-policy / audit / branch / i18n / trace / semantic / dsh-mechanisms and the two protocol documents) instead of only the two protocol documents | §8 item 7 |
+
+**Check the version with a `'1.x'` predicate, never string equality** — a later `1.2` must not lock you out, and a
+service that still says `'1.0'` simply lacks the three optional keys:
+
+```ts
+/** The slice this caller uses; the service type is not exported (see §6). */
+interface MemoryService {
+  protocolVersion?: string
+  list(options?: { status?: string; branch?: string | null; limit?: number }): Array<{ id: string }>
+  recall(options?: { query?: string; status?: string; branch?: string | null }): Array<{ record: { id: string } }>
+  write(input: { kind: string; text: string }): Promise<
+    { ok: true; pending?: boolean; persisted?: boolean } | { ok: false; error: string }
+  >
+}
+
+export function memoryService(ctx: { get(name: string): unknown }): MemoryService | null {
+  const memory = ctx.get('memory') as MemoryService | undefined
+  if (!memory) return null                                  // optional service: degrade silently (§2)
+  const version = memory.protocolVersion
+  // '1.0', '1.1' and every later '1.x' pass; an unknown major is refused, not guessed.
+  if (version !== undefined && !/^1\./u.test(version)) return null
+  return memory
+}
+
+export async function remember(ctx: { get(name: string): unknown }, text: string): Promise<boolean> {
+  const memory = memoryService(ctx)
+  if (!memory) return false
+  const v11 = memory.protocolVersion !== undefined && memory.protocolVersion !== '1.0'
+  if (v11) {
+    // v1.1-only options: usable once the version check passed (ignore unknown keys elsewhere).
+    const active = memory.list({ status: 'active', limit: 20 })
+    if (active.length === 0) return false
+  }
+  const result = await memory.write({ kind: 'semantic', text })
+  // ok = "in memory"; persisted (v1.1) = "on disk". A pre-v1.1 service simply omits persisted.
+  return result.ok === true && result.persisted !== false
+}
+```
+
+Everything else in this document — §2's optionality, §4's data model and the three payload rules, §5's
+configuration surface — is v1.0 material and unchanged by v1.1.
