@@ -23,6 +23,8 @@ export type SelfFacet = 'persona' | 'work'
 export type MemoryStatus = 'active' | 'pending' | 'invalid' | 'archived'
 /** M10：模型来源写入的处置策略（默认 `'auto'` ＝ 0.5.9 行为）。 */
 export type WritePolicy = 'auto' | 'ask' | 'off'
+/** M11：**模型可见文本**的语言（不含命令输出；默认 `'zh'` 保持现状）。 */
+export type Language = 'zh' | 'en'
 export type MemoryPrecision = 'exact' | 'gist'
 export type ScopeLevel = 'profile' | 'workspace' | 'session'
 
@@ -204,6 +206,8 @@ export interface MemoryConfig {
   writePolicy: WritePolicy
   /** M10：待确认队列上限；满了拒绝新写入并报结构化错误。 */
   pendingMax: number
+  /** M11：模型可见文本的语言（`zh` 默认；命令输出仍为中文）。 */
+  language: Language
   gistBudgetRatio: number
   charsPerToken: number
   sectionOrder: number

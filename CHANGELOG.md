@@ -3,6 +3,34 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.11 — 2026-10-02
+
+**English for the model, Chinese for you.** The half of the plugin the model reads — the injected blocks and their
+headers/footers, the reflection and first-run prompts, the per-turn recall block and the seven tool descriptions —
+was Chinese-only, so an English-speaking user's model read Chinese instructions every turn. `language` now switches
+that half to English while command output stays Chinese, exactly as before.
+
+### Added
+
+- `language` (`'zh' | 'en'`, default `'zh'`): the language of **model-visible text only**. The English table is a
+  complete counterpart of the Chinese one — the same footers (a description rather than an instruction; judge by
+  facts and feasibility; do not agree just to please) and the same four hard requirements in the reflection and
+  first-run prompts — and contains no mixed Chinese.
+- Settings form: `language` is editable as an enum field, **27 → 28 fields**; both READMEs gained a "model-visible
+  text language" section with the coverage table (what is localized and what is not) and the new configuration row.
+- `/memory stats` prints the effective `language` (that line, like every other command output, stays Chinese), so
+  "why is the model still reading Chinese?" has a visible answer.
+
+### Changed
+
+- **Default `'zh'` is 0.5.10 behaviour, byte for byte**: with `language` unset, missing or invalid, every injected
+  byte is unchanged — the English table is an addition, not a rewrite of the Chinese one.
+- **The tool contract does not move with the language**: tool names, parameter names, required fields and schema
+  structure are identical in both languages; only the human-readable descriptions are translated, so a learned call
+  pattern never breaks when the switch is flipped.
+- **Command output stays Chinese** (`/memory …`, the `/sleep` preview, `stats`, …): localizing it is explicitly out
+  of scope for this release.
+
 ## 0.5.10 — 2026-10-02
 
 **An optional write approval gate: the model only proposes — you decide.** The two leading memory plugins in the

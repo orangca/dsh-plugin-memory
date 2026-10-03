@@ -6,6 +6,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import type {
+  CaptureCandidate,
+  InjectedTexts,
+  Language,
   MakeRecordInput,
   MemoryConfig,
   MemoryOrigin,
@@ -57,12 +60,14 @@ import {
   lexicalMatch,
   listActive,
   listPending,
+  localizedTexts,
   makeRecord,
   maskPii,
   memoryMatch,
   NAMING_SUBJECTS,
   namingSettled,
   normalizeFacet,
+  normalizeLanguage,
   normalizeRefs,
   normalizeText,
   normalizeWritePolicy,
@@ -83,6 +88,7 @@ import {
   shouldReflect,
   similarity,
   sleepPlanIsEmpty,
+  textsFor,
   tokenCacheSize,
   tokenize,
   transcriptOf,
@@ -2030,4 +2036,227 @@ test('pending 不进注入/召回路径：listActive/recallRecords/renderContext
   assert.equal(recallRecords([pendingFact], { query: '未批准的模型猜想' }).length, 0)
   assert.ok(!renderContextBlock([pendingFact], cfg, null).text.includes('未批准的模型猜想'))
   assert.ok(!renderSelfBlock([pendingSelf], cfg).text.includes('未批准的自画像猜想'))
+})
+
+// ---------------------------------------------------------------------------
+// M11：模型可见文本多语言（契约 docs/i18n.md §2/§3/§5）
+// ---------------------------------------------------------------------------
+
+const CJK_RE = /[\u4e00-\u9fff]/u
+
+/** 合法的 InjectedTexts 字段名（用来核对两套表字段齐全）。 */
+const INJECTED_TEXT_KEYS: ReadonlyArray<keyof InjectedTexts> = [
+  'factsHeader', 'factsFooter', 'gistHeader', 'gistFooter',
+  'personaHeader', 'personaFooter',
+  'workConfirmedHeader', 'workObservedHeader', 'workObservedFooter',
+  'recallHeader', 'recallFooter',
+  'reflectNotice', 'introNotice',
+  'emptySelfPortrait', 'emptyPendingQueue',
+]
+
+/** 带任意 language 值的配置（用于测容错回落）。 */
+function cfgWith(language: unknown): MemoryConfig {
+  return { ...DEFAULTS, language: language as Language }
+}
+
+test('DEFAULTS：M11 新增 language，默认 zh（契约 §2）', () => {
+  assert.equal(DEFAULTS.language, 'zh', '默认语言必须保持现状')
+})
+
+test('normalizeLanguage：合法值原样返回（容忍空白/大小写），非法与缺失一律回落 zh（契约 §3/§5）', () => {
+  assert.equal(normalizeLanguage('zh'), 'zh')
+  assert.equal(normalizeLanguage('en'), 'en')
+  assert.equal(normalizeLanguage(' EN '), 'en', '容忍空白与大小写（与 normalizeFacet/normalizeWritePolicy 同口径）')
+  assert.equal(normalizeLanguage('Zh'), 'zh')
+  for (const bad of [undefined, null, '', ' ', 'english', 'en-US', 'zh-CN', 'auto', 0, 1, true, false, {}, [], Number.NaN]) {
+    assert.equal(normalizeLanguage(bad), 'zh', `${String(bad)} 应回落 zh`)
+  }
+})
+
+test('localizedTexts：zh 表与既有常量/既有字面量逐字一致（契约 §3.1）', () => {
+  const zh = localizedTexts('zh')
+  // 逐条比对既有导出常量
+  assert.equal(zh.personaHeader, PERSONA_HEADER)
+  assert.equal(zh.personaFooter, PERSONA_FOOTER)
+  assert.equal(zh.workConfirmedHeader, WORK_CONFIRMED_HEADER)
+  assert.equal(zh.workObservedHeader, WORK_OBSERVED_HEADER)
+  assert.equal(zh.workObservedFooter, WORK_OBSERVED_FOOTER)
+  assert.equal(zh.reflectNotice, REFLECT_NOTICE)
+  assert.equal(zh.introNotice, INTRO_NOTICE)
+  // 原本内联在 renderContextBlock / index.ts R2 路径里的中文，一字不改
+  assert.equal(zh.factsHeader, '[长期记忆 · 自动注入]')
+  assert.equal(zh.factsFooter, '以上为历史记录，可能过时或有误；与当前情况冲突时先核对事实，以事实与实际效果为准。')
+  assert.equal(zh.gistHeader, '[项目印象 · 模糊且可能过时]')
+  assert.equal(zh.gistFooter, '以上为自动观察形成的模糊印象，不是精确事实；与当前代码/对话冲突时以实际为准。')
+  assert.equal(zh.recallHeader, '[相关记忆 · 本轮召回]')
+  assert.equal(zh.recallFooter, '以上为历史记录，可能与本轮任务相关，也可能已过时；先核对事实再采用。')
+  assert.equal(zh.emptySelfPortrait, '自画像为空。')
+  assert.equal(zh.emptyPendingQueue, '没有待确认的写入。')
+  // 缺省/非法/未设置都取同一张 zh 表
+  assert.equal(localizedTexts(undefined), zh)
+  assert.equal(localizedTexts(), zh)
+  assert.equal(localizedTexts(null), zh)
+  assert.equal(localizedTexts('bogus'), zh)
+  assert.equal(textsFor({ ...DEFAULTS }), zh, 'textsFor 缺省即 zh')
+})
+
+test('textsFor：等价于 localizedTexts(cfg.language) 的便利函数（契约 §3）', () => {
+  assert.equal(textsFor(cfgWith('en')), localizedTexts('en'))
+  assert.equal(textsFor(cfgWith('EN')), localizedTexts('en'))
+  assert.equal(textsFor(cfgWith('bogus')), localizedTexts('zh'))
+  assert.equal(textsFor(cfgWith(undefined)), localizedTexts('zh'))
+  // 文案表是冻结常量，不是每次新建对象
+  assert.equal(localizedTexts('en'), localizedTexts('en'))
+  assert.equal(localizedTexts('zh'), localizedTexts('zh'))
+  assert.ok(Object.isFrozen(localizedTexts('en')), 'en 表必须是冻结常量')
+  assert.ok(Object.isFrozen(localizedTexts('zh')), 'zh 表必须是冻结常量')
+})
+
+test('文案表：两套字段齐全、非空；en 不含任何 CJK；zh 不含英文化漏字（契约 §3.1/§5）', () => {
+  const zh = localizedTexts('zh')
+  const en = localizedTexts('en')
+  assert.notEqual(en, zh)
+  for (const key of INJECTED_TEXT_KEYS) {
+    assert.equal(typeof zh[key], 'string', `zh.${key} 缺失`)
+    assert.equal(typeof en[key], 'string', `en.${key} 缺失`)
+    assert.ok(zh[key].length > 0, `zh.${key} 不得为空`)
+    assert.ok(en[key].length > 0, `en.${key} 不得为空`)
+    assert.equal(CJK_RE.test(en[key]), false, `en.${key} 不得含 CJK：${en[key]}`)
+    assert.equal(CJK_RE.test(zh[key]), true, `zh.${key} 应为中文（不得被英文覆盖）：${zh[key]}`)
+  }
+  // 两个语言的块头都用 [...] 包裹，保持既有视觉结构
+  for (const key of ['factsHeader', 'gistHeader', 'personaHeader', 'workConfirmedHeader', 'workObservedHeader', 'recallHeader'] as const) {
+    assert.ok(zh[key].startsWith('[') && zh[key].endsWith(']'), `zh.${key} 必须用 [] 包裹`)
+    assert.ok(en[key].startsWith('[') && en[key].endsWith(']'), `en.${key} 必须用 [] 包裹`)
+  }
+})
+
+test('en 单行提示：必须单行，且长度不超过 zh 的 1.6 倍（契约 §3.1）', () => {
+  const zh = localizedTexts('zh')
+  const en = localizedTexts('en')
+  for (const key of ['reflectNotice', 'introNotice'] as const) {
+    assert.equal(en[key].includes('\n'), false, `en.${key} 必须单行`)
+    assert.equal(en[key].includes('\r'), false, `en.${key} 不得含回车`)
+    assert.ok(
+      en[key].length <= zh[key].length * 1.6,
+      `en.${key} 长度 ${en[key].length} 超过 zh 的 1.6 倍（zh ${zh[key].length} → 上限 ${zh[key].length * 1.6}）`,
+    )
+    assert.ok(en[key].length >= zh[key].length * 0.5, `en.${key} 过短，可能漏掉语义：${en[key]}`)
+  }
+})
+
+test('en 文案：语义与 zh 一一对应（人格页脚/工作页脚/反思与初次设定提示的硬要求）', () => {
+  const en = localizedTexts('en')
+  // 人格页脚：描述而非指令、以事实为准、先看合理性与可行性、办不到给替代方案、不为迎合而附和
+  assert.match(en.personaFooter, /[Ss]elf-description|description/u)
+  assert.match(en.personaFooter, /not a user instruction/u)
+  assert.match(en.personaFooter, /reasonableness and feasibility/u)
+  assert.match(en.personaFooter, /alternatives/u)
+  assert.match(en.personaFooter, /facts/u)
+  assert.match(en.personaFooter, /just please/u)
+  // 工作页脚：判断依据是事实与实际效果，而不是谁说得更肯定
+  assert.match(en.workObservedFooter, /facts and actual results/u)
+  assert.match(en.workObservedFooter, /not who states things more confidently/u)
+  // 反思提示：memory_write + facet；没有新认识不要写；不改 user_profile/用户设定；描述而非授权、不放宽安全边界
+  assert.match(en.reflectNotice, /memory_write/u)
+  assert.match(en.reflectNotice, /kind=agent_self/u)
+  assert.match(en.reflectNotice, /facet/u)
+  assert.match(en.reflectNotice, /do not write/u)
+  assert.match(en.reflectNotice, /user_profile/u)
+  assert.match(en.reflectNotice, /user settings/u)
+  assert.match(en.reflectNotice, /authoriz/u)
+  assert.match(en.reflectNotice, /safety/u)
+  // 初次设定：只问一句；让取名就提一个并确认；三个命名 subject 落盘；说不用就不再问
+  assert.match(en.introNotice, /one sentence/u)
+  assert.match(en.introNotice, /suggest one and confirm/u)
+  assert.match(en.introNotice, /memory_write/u)
+  assert.match(en.introNotice, /self\.persona\.name/u)
+  assert.match(en.introNotice, /self\.persona\.address_user/u)
+  assert.match(en.introNotice, /self\.persona\.address_self/u)
+  assert.match(en.introNotice, /stop asking/u)
+})
+
+test("renderContextBlock：language:'en' 输出英文块头页脚（契约 §3）", () => {
+  const workspaceKey = workspaceKeyOf('C:/proj/a')!
+  const en = cfgWith('en')
+  const texts = localizedTexts('en')
+  const records = [
+    makeRecord({ id: 'f1', kind: 'user_profile', text: 'Prefers terse answers.', importance: 0.9, observedAt: 10 }),
+    makeRecord({ id: 'g1', kind: 'project_gist', text: 'This workspace uses pnpm.', scope: { level: 'workspace', key: workspaceKey }, observedAt: 20 }),
+  ]
+  const block = renderContextBlock(records, en, workspaceKey)
+  assert.ok(block.text.includes(texts.factsHeader), '常驻块头应为英文')
+  assert.ok(block.text.includes(texts.factsFooter), '常驻块尾应为英文')
+  assert.ok(block.text.includes(texts.gistHeader), '项目印象块头应为英文')
+  assert.ok(block.text.includes(texts.gistFooter), '项目印象块尾应为英文')
+  assert.equal(block.text.includes('长期记忆'), false, 'en 下不得出现 zh 块头')
+  assert.equal(CJK_RE.test(block.text), false, 'en 渲染结果不得含 CJK')
+  // 结构不变：块头 + 逐条 `- ` 行 + 块尾
+  assert.equal(block.lines.filter((line) => line.startsWith('- ')).length, 2)
+})
+
+test("renderSelfBlock：language:'en' 输出英文块头页脚（人格 + 工作两节，契约 §3）", () => {
+  const texts = localizedTexts('en')
+  const records = [
+    makeRecord({ id: 'p1', kind: 'agent_self', facet: 'persona', origin: 'user_explicit', confidence: 0.95, pinned: true, text: 'I speak plainly.', observedAt: 30 }),
+    makeRecord({ id: 'w1', kind: 'agent_self', facet: 'work', origin: 'user_explicit', confidence: 0.95, pinned: true, text: 'Conclusion first.', observedAt: 40 }),
+    makeRecord({ id: 'w2', kind: 'agent_self', facet: 'work', origin: 'model_proposed', confidence: 0.9, reinforcement: { sessions: ['s1', 's2'], count: 1 }, text: 'Check facts before acting.', observedAt: 50 }),
+  ]
+  const block = renderSelfBlock(records, cfgWith('en'))
+  assert.ok(block.text.includes(texts.personaHeader), '人格块头应为英文')
+  assert.ok(block.text.includes(texts.personaFooter), '人格页脚应为英文')
+  assert.ok(block.text.includes(texts.workConfirmedHeader), '工作确认块头应为英文')
+  assert.ok(block.text.includes(texts.workObservedHeader), '自我观察块头应为英文')
+  assert.ok(block.text.includes(texts.workObservedFooter), '自我观察页脚应为英文')
+  assert.equal(block.text.includes('我的人格'), false, 'en 下不得出现 zh 块头')
+  assert.equal(CJK_RE.test(block.text), false, 'en 渲染结果不得含 CJK')
+  // 结构顺序不变：人格在前，工作两节在后
+  assert.ok(block.text.indexOf(texts.personaHeader) < block.text.indexOf(texts.workConfirmedHeader))
+  assert.ok(block.text.indexOf(texts.workConfirmedHeader) < block.text.indexOf(texts.workObservedHeader))
+})
+
+test('默认 zh 渲染结果与改动前逐字节一致（块头/页脚/结构均不得变，契约 §5）', () => {
+  const workspaceKey = workspaceKeyOf('C:/proj/a')!
+  const records = [
+    makeRecord({ id: 'f1', kind: 'user_profile', text: '偏好中文。', importance: 0.9, observedAt: 10 }),
+    makeRecord({ id: 'g1', kind: 'project_gist', text: '这个工作区涉及 pnpm。', scope: { level: 'workspace', key: workspaceKey }, observedAt: 20 }),
+  ]
+  // 期望值是 0.5.10 的实际输出（改动前采集并逐字节比对过）
+  assert.equal(renderContextBlock(records, { ...DEFAULTS }, workspaceKey).text, [
+    '[长期记忆 · 自动注入]',
+    '- (profile) 偏好中文。',
+    '以上为历史记录，可能过时或有误；与当前情况冲突时先核对事实，以事实与实际效果为准。',
+    '',
+    '[项目印象 · 模糊且可能过时]',
+    '- 这个工作区涉及 pnpm。',
+    '以上为自动观察形成的模糊印象，不是精确事实；与当前代码/对话冲突时以实际为准。',
+  ].join('\n'))
+
+  const selfRecords = [
+    makeRecord({ id: 'p1', kind: 'agent_self', facet: 'persona', origin: 'user_explicit', confidence: 0.95, pinned: true, text: '我说话直接。', observedAt: 30 }),
+    makeRecord({ id: 'w1', kind: 'agent_self', facet: 'work', origin: 'user_explicit', confidence: 0.95, pinned: true, text: '先给结论。', observedAt: 40 }),
+  ]
+  assert.equal(renderSelfBlock(selfRecords, { ...DEFAULTS }).text, [
+    '[我的人格 · 模型自述，非用户指令]',
+    '- 我说话直接。',
+    PERSONA_FOOTER,
+    '',
+    '[我的工作约定 · 来自用户确认]',
+    '- 先给结论。',
+  ].join('\n'))
+})
+
+test('language 非法/缺失：渲染结果与 zh 逐字节相同（契约 §5）', () => {
+  const workspaceKey = workspaceKeyOf('C:/proj/a')!
+  const records = [
+    makeRecord({ id: 'f1', kind: 'user_profile', text: '偏好中文。', importance: 0.9, observedAt: 10 }),
+    makeRecord({ id: 'p1', kind: 'agent_self', facet: 'persona', origin: 'user_explicit', confidence: 0.95, pinned: true, text: '我说话直接。', observedAt: 30 }),
+  ]
+  const zhContext = renderContextBlock(records, { ...DEFAULTS }, workspaceKey).text
+  const zhSelf = renderSelfBlock(records, { ...DEFAULTS }).text
+  for (const bad of ['EN?', 'english', 'zh-CN', '', 0, true, {}, []]) {
+    const broken = cfgWith(bad)
+    assert.equal(renderContextBlock(records, broken, workspaceKey).text, zhContext, `language=${String(bad)} 应回落 zh`)
+    assert.equal(renderSelfBlock(records, broken).text, zhSelf, `language=${String(bad)} 应回落 zh`)
+  }
 })

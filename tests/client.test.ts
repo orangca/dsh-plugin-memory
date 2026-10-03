@@ -236,6 +236,12 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
   assert.equal(byName('writePolicy').parse('bogus'), undefined, 'writePolicy 只认 auto/ask/off')
   assert.deepEqual(byName('writePolicy').parse(''), { kind: 'clear' })
 
+  // M11：模型可见文本语言 —— 枚举只认 zh/en
+  assert.deepEqual(byName('language').parse('en'), { kind: 'set', value: 'en' })
+  assert.deepEqual(byName('language').parse('zh'), { kind: 'set', value: 'zh' })
+  assert.equal(byName('language').parse('english'), undefined, 'language 只认 zh/en')
+  assert.deepEqual(byName('language').parse(''), { kind: 'clear' })
+
   // 其余 5 个键是普通数字字段（默认值见契约 3.1：80 / 0.6 / 12 / 4 / 3）
   for (const name of [
     'selfPersonaMaxTokens',
@@ -255,13 +261,14 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
     assert.deepEqual(byName(name).parse(''), { kind: 'clear' }, `${name}: 空草稿 = 清除覆盖`)
   }
 
-  // 27 个字段都要有规格，且与 Host 侧 volatile 字段一一对应
-  assert.equal(specs.length, 27)
+  // 28 个字段都要有规格，且与 Host 侧 volatile 字段一一对应
+  assert.equal(specs.length, 28)
   for (const name of [
     'selfIntroEnabled', 'selfIntroMinTurn', 'selfIntroMaxAsks',
     'sleepEnabled', 'sleepSessions', 'sleepMaxBackfill',
     'refsEnabled', 'refsMax',
     'writePolicy', 'pendingMax',
+    'language',
   ] as const) {
     assert.ok(specs.some((spec) => spec.field === name), `设置页缺少 ${name}`)
   }

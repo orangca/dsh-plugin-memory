@@ -1,5 +1,5 @@
-import type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryRef, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet, WritePolicy } from './types.js';
-export type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryRef, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet, WritePolicy, } from './types.js';
+import type { CaptureCandidate, Language, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryRef, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet, WritePolicy } from './types.js';
+export type { CaptureCandidate, Language, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryRef, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet, WritePolicy, } from './types.js';
 /** `makeRecord` 的入参：`MakeRecordInput` 再加 `sessionId`（types.ts 目前缺这个字段）。 */
 export interface MakeRecordInputWithSession extends MakeRecordInput {
     sessionId?: string;
@@ -565,4 +565,29 @@ export declare function pendingQueueFull(count: number, cfg: MemoryConfig): bool
  * origin · 时间 · 引用（`formatRefs`）· 正文预览（过 `clampText` 压成单行）。
  */
 export declare function formatPendingQueue(records: Iterable<MemoryRecord>, cfg: MemoryConfig): string;
+/** 容错解析语言：非法/缺失/大小写混杂 → `'zh'`（默认语言必须保持现状）。 */
+export declare function normalizeLanguage(value: unknown): Language;
+/** 一套完整文案（所有模型可见文本）。 */
+export interface InjectedTexts {
+    factsHeader: string;
+    factsFooter: string;
+    gistHeader: string;
+    gistFooter: string;
+    personaHeader: string;
+    personaFooter: string;
+    workConfirmedHeader: string;
+    workObservedHeader: string;
+    workObservedFooter: string;
+    recallHeader: string;
+    recallFooter: string;
+    reflectNotice: string;
+    introNotice: string;
+    /** 自画像为空/待确认队列为空这类「无内容」提示（注入与命令共用同一套语气）。 */
+    emptySelfPortrait: string;
+    emptyPendingQueue: string;
+}
+/** 取某语言的文案表（缺省 `'zh'`）。返回**冻结的常量表**，不要每次新建对象。 */
+export declare function localizedTexts(language?: unknown): InjectedTexts;
+/** 便利：`localizedTexts(cfg.language)`。 */
+export declare function textsFor(cfg: MemoryConfig): InjectedTexts;
 //# sourceMappingURL=lib.d.ts.map

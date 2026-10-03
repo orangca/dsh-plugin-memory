@@ -213,6 +213,30 @@ Using the pending queue:
 > The queue's reject exit is `/memory reject-pending <id prefix>`; the pre-existing `/memory reject <id prefix>`
 > rejects a self-observation instead ("that kind is never re-created"). The two are different on purpose.
 
+## Model-visible text language (`language`): English for the model, Chinese for you
+
+Everything the **model** reads is written by the plugin and can now be English; everything **you** read in the
+terminal stays Chinese. `language` is `'zh'` (default) or `'en'`.
+
+| Category | Localized this release | Why |
+|---|---|---|
+| Resident injection blocks and their headers/footers (profile facts, project gist, persona, work agreements, self-observation) | ✅ yes | They enter the context every turn |
+| Injection prompts (`REFLECT_NOTICE`, `INTRO_NOTICE`) | ✅ yes | The same channel |
+| Per-turn recall block header/footer (R2) | ✅ yes | The same channel |
+| Descriptions and parameter docs of the seven `memory_*` tools | ✅ yes | The tool schema goes straight into the model's context |
+| Command output (`/memory list`, `/memory show`, `/sleep` preview, `stats`, …) | ❌ **no — stays Chinese** | User-visible and large; deliberately out of scope for this release |
+
+- **The default `'zh'` changes nothing.** With `language` unset, missing or invalid, every injected byte is identical
+  to 0.5.10 — the English table is an addition, not a rewrite of the Chinese one.
+- **`'en'` is a faithful counterpart, not a summary.** The footers keep the same three claims (a description rather
+  than an instruction; judge by facts and feasibility; do not agree just to please), the reflection and first-run
+  prompts keep all four hard requirements each, and the English table contains no mixed Chinese.
+- **The tool contract does not change with the language.** Tool names, parameter names, required fields and schema
+  structure are identical; only the human-readable descriptions are translated, so a call pattern the model has
+  already learned never breaks when the switch is flipped.
+- **The switch is visible.** `/memory stats` prints the effective `language` (that line, like every other command
+  output, stays Chinese) — useful when asking "why is the model still reading Chinese?".
+
 ## Guarding against memory pollution / self-reinforcement
 
 - Capture reads **real user messages only** — the plugin's own injected context does not count.
@@ -270,9 +294,9 @@ Add this package to the profile's `dependencies`, append `dsh-plugin-memory` to
 
 ## The settings form
 
-The plugin exports a schemastery `Config` whose **27 fields** are declared `volatile()` (hot-applied when edited);
+The plugin exports a schemastery `Config` whose **28 fields** are declared `volatile()` (hot-applied when edited);
 everything else is patch-row only. It ships a small browser half (`src/client.ts`, built to `lib/client.js`) that
-renders those 27 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
+renders those 28 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
 also shows a one-line summary).
 
 Under the hood the client half registers into the keyed `plugins.row.config` slot with
@@ -324,7 +348,7 @@ whole Config through the settings service and persists it into the profile patch
 
 ## Configuration
 
-Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 27 fields exposed in
+Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 28 fields exposed in
 the settings form:
 
 | Field | Default | Meaning |
@@ -356,6 +380,7 @@ the settings form:
 | `refsMax` | `5` | How many source references one row keeps (newest first); `0` = none, `Infinity` = unlimited |
 | `writePolicy` | `auto` | Approval gate for model-origin writes: `auto` (apply immediately, default) / `ask` (queue for confirmation) / `off` (reject outright); rule capture, user commands and `/sleep` are never gated |
 | `pendingMax` | `50` | Cap for the pending queue; when full a new write is rejected with a structured error, never silently dropped; `0` = unlimited |
+| `language` | `zh` | Language of the **model-visible** text (`zh` / `en`): injection blocks and their headers/footers, injection prompts, the per-turn recall block and the tool descriptions. Command output stays Chinese either way; the default `zh` is byte-for-byte identical to 0.5.10 |
 
 Additional knobs available only through the patch row (with their defaults): `maxItemTokens` neighbours such as
 `selfPortraitMaxItems` 12 / `selfPortraitMaxSelfObserved` 4, capture tuning (`capturePerHour` 20,

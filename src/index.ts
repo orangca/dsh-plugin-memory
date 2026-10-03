@@ -67,10 +67,10 @@ import {
   makeRecord,
   maskPii,
   normalizeFacet,
+  normalizeLanguage,
   normalizeText,
   normalizeWritePolicy,
   pendingQueueFull,
-  INTRO_NOTICE,
   namingSettled,
   pickMergeGroups,
   planPortraitUpdate,
@@ -78,7 +78,6 @@ import {
   portraitSubjectFor,
   recallRecords,
   recordHash,
-  REFLECT_NOTICE,
   refsOf,
   refsToString,
   renderContextBlock,
@@ -89,6 +88,7 @@ import {
   shouldReflect,
   sleepPlanIsEmpty,
   splitSentences,
+  textsFor,
   tokenize,
   transcriptOf,
   withRef,
@@ -96,7 +96,7 @@ import {
 } from './lib.js'
 // 自画像 v2（M6-A）新增的纯函数与类型：签名冻结在 docs/self-portrait.md 第 3 节。
 // 类型用 `import type` 引入（verbatimModuleSyntax）：它们只参与编译期检查，运行期不存在。
-import type { PortraitAction, PortraitCandidate, PortraitDecision, SelfFacet } from './lib.js'
+import type { Language, PortraitAction, PortraitCandidate, PortraitDecision, SelfFacet } from './lib.js'
 // M8（/sleep）纯函数层的类型：签名冻结在 docs/sleep.md 第 4 节，由 lib.ts 提供。
 // 宿主只按签名调用；`SleepCandidate` 的运行期字段比声明多时也不依赖（见 sleepBackfillInput）。
 import type { SleepCandidate, SleepPlan, SleepSessionInput } from './lib.js'
@@ -723,6 +723,10 @@ function buildConfig(useVolatile: boolean): ReturnType<SchemaFactory['object']> 
     // volatile 字段 —— 不标的话用户在表单里改了存不进去（Lead 裁决时发现的实际冲突）。
     writePolicy: field(Schema!.union(['auto', 'ask', 'off']).default('auto')),
     pendingMax: field(Schema!.number().default(50)),
+    // M11：`language`（契约 docs/i18n.md §2/§4.4）—— 类型与默认值必须与 lib.ts 的 DEFAULTS 逐字一致，
+    // 且**标 volatile**：只有 volatile 字段会被 settings 服务投影到设置页（表单 27 → 28 字段）。
+    // 默认 'zh' + 容错解析（非法值回 zh），因此表单里不选它就与 0.5.10 逐字节等价。
+    language: field(Schema!.union(['zh', 'en']).default('zh')),
     // 出厂**不播种**（与 lib.js 的 DEFAULTS.seed 保持一致）：播种的演示记忆会进真实用户上下文
     seed: Schema!.boolean().default(false),
   })
@@ -794,6 +798,66 @@ function unwrapConfig(config: unknown): Record<string, unknown> {
     out[key] = isVolatile ? (value as { get: () => unknown }).get() : value
   }
   return out
+}
+
+/**
+ * M11（契约 docs/i18n.md §4.2）：7 个 `memory_*` 工具的**模型可见文案** —— 工具描述 + 参数说明。
+ *
+ * 语言**只能改变字符串**：`name` / 参数名 / 必填项 / enum / `additionalProperties` / schema 结构
+ * 全部留在 `MemoryToolDefinition[]` 的字面量里（如下），本表只喂 `description`。
+ * 因此 `language` 切换不可能改变工具契约（模型已学的调用方式不会因配置而失效）。
+ *
+ * zh 一列与 0.5.10 的内联字面量**逐字节一致**（有测试逐字比对）；en 一列不得含 CJK。
+ */
+interface ToolTexts {
+  writeDescription: string
+  writeTextParam: string
+  writeSubjectParam: string
+  writeFacetParam: string
+  recallDescription: string
+  listDescription: string
+  forgetDescription: string
+  statsDescription: string
+  maintainDescription: string
+  explainDescription: string
+  explainTextParam: string
+  explainApplyParam: string
+}
+
+const TOOL_TEXTS: Record<Language, ToolTexts> = Object.freeze({
+  zh: Object.freeze({
+    writeDescription: '写入一条长期记忆（用户偏好、项目约定、结论、做法）。写入来源由插件判定，不由本参数指定。',
+    writeTextParam: '单句、面向模型可读的记忆内容',
+    writeSubjectParam: '归一化主题键，用于去重与冲突判定，例如 editor.theme',
+    writeFacetParam: '仅 kind=agent_self 有意义：自画像面（persona=人格/表达，work=工作倾向），缺省 work。',
+    recallDescription: '按查询或过滤条件检索长期记忆，返回带来源与重要度的条目。',
+    listDescription: '列出长期记忆（不做相关性打分，按确定性顺序）。',
+    forgetDescription: '删除长期记忆。给 id 前缀直接删；给 query 时默认只预览命中，需要 confirm=true 才真正删除。',
+    statsDescription: '查看长期记忆的运行时可观测信息：条数、写入/拒绝计数、注入行数、渲染耗时、整合与召回状态。',
+    maintainDescription: '整理长期记忆：合并同主题的重复条目、把矛盾条目标记为失效、按衰减归档。后台会定期自动执行，这里用于手动触发。',
+    explainDescription: '诊断：给定一段文本，说明长期记忆会怎么处理它（命中哪条信号、被哪条排除规则拒绝、会写成什么记录）。apply=true 时真的写入。',
+    explainTextParam: '待诊断的文本（通常是一句用户消息）',
+    explainApplyParam: '默认 false，只解释不写入',
+  }),
+  en: Object.freeze({
+    writeDescription: 'Write one long-term memory (a user preference, project convention, conclusion or practice). The origin is decided by the plugin, not by these arguments.',
+    writeTextParam: 'A single sentence of model-readable memory text',
+    writeSubjectParam: 'Normalized topic key used for dedup and conflict checks, for example editor.theme',
+    writeFacetParam: 'Only meaningful for kind=agent_self: the self-portrait facet (persona=personality/expression, work=working style); defaults to work.',
+    recallDescription: 'Search long-term memory by query or filters; returns items with their source and importance.',
+    listDescription: 'List long-term memory (no relevance scoring, deterministic order).',
+    forgetDescription: 'Delete long-term memory. With an id prefix it deletes directly; with a query it only previews matches unless confirm=true.',
+    statsDescription: 'Show long-term memory runtime facts: record counts, write/reject counters, injected lines, render time, and consolidation and recall state.',
+    maintainDescription: 'Tidy long-term memory: merge duplicate items on the same topic, mark conflicting items invalid, and archive by decay. The plugin also runs this in the background; here it is triggered manually.',
+    explainDescription: 'Diagnose: given some text, explain how long-term memory would handle it (which signal matched, which exclusion rule rejected it, what record would be written). With apply=true it really writes.',
+    explainTextParam: 'The text to diagnose (usually one user message)',
+    explainApplyParam: 'Defaults to false: explain only, do not write',
+  }),
+})
+
+/** 取某语言的工具文案表（缺省/非法 → `'zh'`，与注入路径同一套容错）。 */
+function toolTexts(language: unknown): ToolTexts {
+  return normalizeLanguage(language) === 'en' ? TOOL_TEXTS.en : TOOL_TEXTS.zh
 }
 
 export function apply(ctx: DshPluginContext, config: unknown = {}): void {
@@ -2000,10 +2064,13 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
 
       // 硬预算（设计稿 §7.2）：块内固定文案先扣掉，再逐条填。不能像早期版本那样直接 map 全部命中，
       // 否则 8 条 × 60 token 会突破 maxInjectedTokens。
-      const R2_HEADER = '[相关记忆 · 本轮召回]'
+      // M11：块头/页脚按 `cfg.language` 取（zh 与旧内联字面量逐字节相同）；**预算口径不变** ——
+      // 块头尾照样先扣预算，只是英文更长会自然占更多预算（契约 §4.1/§5）。
+      const r2Texts = textsFor(cfg)
+      const R2_HEADER = r2Texts.recallHeader
       // 与 lib 的 FACTS_FOOTER 同一原则：记忆可能过时，判断以事实与实际效果为准，
       // 而不是「谁说的更新/更肯定」。原文「以当前对话为准」把顺从写进了规则。
-      const R2_FOOTER = '以上为历史记录，可能与本轮任务相关，也可能已过时；先核对事实再采用。'
+      const R2_FOOTER = r2Texts.recallFooter
       const r2Budget = Math.max(0, cfg.maxInjectedTokens - estimateTokens(`${R2_HEADER}\n${R2_FOOTER}`, cfg.charsPerToken))
       const filled = fillWithinBudget(
         hits.map((hit) => hit.record),
@@ -2104,7 +2171,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
 
       const proposed = Array.isArray(decision.messages) ? decision.messages : []
       // 注入正文一律过 clampText：折平单行（防结构伪造），预算用整块注入预算（提示本身就是一条完整块）
-      const text = clampText(REFLECT_NOTICE, Math.max(1, cfg.maxInjectedTokens ?? DEFAULTS.maxInjectedTokens), cfg.charsPerToken)
+      const text = clampText(textsFor(cfg).reflectNotice, Math.max(1, cfg.maxInjectedTokens ?? DEFAULTS.maxInjectedTokens), cfg.charsPerToken)
       const messageId = globalThis.crypto?.randomUUID?.() ?? `mem-reflect-${Date.now()}-${Math.random().toString(36).slice(2)}`
       const message = {
         role: 'user',
@@ -2157,7 +2224,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (!shouldIntroduce({ turn, asks: state.self.introAsks, settled }, cfg)) return decision
 
       const proposed = Array.isArray(decision.messages) ? decision.messages : []
-      const text = clampText(INTRO_NOTICE, Math.max(1, cfg.maxInjectedTokens ?? DEFAULTS.maxInjectedTokens), cfg.charsPerToken)
+      const text = clampText(textsFor(cfg).introNotice, Math.max(1, cfg.maxInjectedTokens ?? DEFAULTS.maxInjectedTokens), cfg.charsPerToken)
       const messageId = globalThis.crypto?.randomUUID?.() ?? `mem-intro-${Date.now()}-${Math.random().toString(36).slice(2)}`
       const message = {
         role: 'user',
@@ -2445,16 +2512,18 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     }
   }
 
+  // M11：工具文案按 `cfg.language` 取（缺省/非法 → zh）；下面的 schema 结构一字不动。
+  const tt = toolTexts(cfg.language)
   const tools: MemoryToolDefinition[] = [
     {
       name: 'memory_write',
-      description: '写入一条长期记忆（用户偏好、项目约定、结论、做法）。写入来源由插件判定，不由本参数指定。',
+      description: tt.writeDescription,
       parameters: {
         type: 'object',
         properties: {
           kind: { type: 'string', enum: ['user_profile', 'agent_self', 'project_gist', 'semantic', 'procedural', 'episodic'] },
-          text: { type: 'string', description: '单句、面向模型可读的记忆内容' },
-          subject: { type: 'string', description: '归一化主题键，用于去重与冲突判定，例如 editor.theme' },
+          text: { type: 'string', description: tt.writeTextParam },
+          subject: { type: 'string', description: tt.writeSubjectParam },
           field: { type: 'string' },
           value: { type: 'string' },
           tags: { type: 'array', items: { type: 'string' } },
@@ -2464,7 +2533,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           facet: {
             type: 'string',
             enum: ['persona', 'work'],
-            description: '仅 kind=agent_self 有意义：自画像面（persona=人格/表达，work=工作倾向），缺省 work。',
+            description: tt.writeFacetParam,
           },
         },
         required: ['kind', 'text'],
@@ -2509,7 +2578,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     {
       name: 'memory_recall',
-      description: '按查询或过滤条件检索长期记忆，返回带来源与重要度的条目。',
+      description: tt.recallDescription,
       parameters: {
         type: 'object',
         properties: {
@@ -2536,7 +2605,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     {
       name: 'memory_list',
-      description: '列出长期记忆（不做相关性打分，按确定性顺序）。',
+      description: tt.listDescription,
       parameters: {
         type: 'object',
         properties: {
@@ -2567,7 +2636,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     {
       name: 'memory_forget',
-      description: '删除长期记忆。给 id 前缀直接删；给 query 时默认只预览命中，需要 confirm=true 才真正删除。',
+      description: tt.forgetDescription,
       parameters: {
         type: 'object',
         properties: {
@@ -2621,7 +2690,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     {
       name: 'memory_stats',
-      description: '查看长期记忆的运行时可观测信息：条数、写入/拒绝计数、注入行数、渲染耗时、整合与召回状态。',
+      description: tt.statsDescription,
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       execute: async () => {
         state.toolCalls.memory_stats = (state.toolCalls.memory_stats ?? 0) + 1
@@ -2641,7 +2710,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     {
       name: 'memory_maintain',
-      description: '整理长期记忆：合并同主题的重复条目、把矛盾条目标记为失效、按衰减归档。后台会定期自动执行，这里用于手动触发。',
+      description: tt.maintainDescription,
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       execute: async () => {
         state.toolCalls.memory_maintain = (state.toolCalls.memory_maintain ?? 0) + 1
@@ -2661,12 +2730,12 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     {
       name: 'memory_explain',
-      description: '诊断：给定一段文本，说明长期记忆会怎么处理它（命中哪条信号、被哪条排除规则拒绝、会写成什么记录）。apply=true 时真的写入。',
+      description: tt.explainDescription,
       parameters: {
         type: 'object',
         properties: {
-          text: { type: 'string', description: '待诊断的文本（通常是一句用户消息）' },
-          apply: { type: 'boolean', description: '默认 false，只解释不写入' },
+          text: { type: 'string', description: tt.explainTextParam },
+          apply: { type: 'boolean', description: tt.explainApplyParam },
         },
         required: ['text'],
         additionalProperties: false,
@@ -3192,6 +3261,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         kind: 'success',
         text: [
           `域：${cfg.domainName}（opened=${state.opened}${state.openError ? `, error=${state.openError}` : ''}）`,
+          // M11：语言排在最前面 —— 「为什么模型看到中文/英文」是第一诊断问题。
+          // 命令输出本轮**仍为中文**（契约 §4.3），只有这一行显示 language 的值。
+          `语言：language=${normalizeLanguage(cfg.language)}`,
           `记录数：${state.records.size}（active ${listActive(state.records.values()).length}，播种 ${state.seeded}）`,
           `按类型：${JSON.stringify(byKind)}`,
           `写入：创建 ${state.writes.created} / 合并 ${state.writes.merged} / 拒写 ${state.writes.rejected} / 删除 ${state.writes.deleted}`,

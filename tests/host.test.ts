@@ -2794,4 +2794,386 @@ test('host#59 stats 与重启：待确认行、结构化字段、pending 随普�
   }
 })
 
+// ================================================================ M11 模型可见文本多语言
+// 契约：docs/i18n.md §4/§5/§6。宿主半边（本文件）只覆盖 index.ts 的三件事：
+//   ① R2 块头/页脚、反思提示、初次设定提示按 `cfg.language` 取文案；
+//   ② 7 个 memory_* 工具的描述与参数说明按语言取，而**工具契约（name/参数名/必填项/结构）不变**；
+//   ③ `/memory stats` 与 `memory_stats` 增加一行显示当前 language（排查「为什么模型看到中文」）。
+//
+// 关键纪律（§5 不可妥协项）：
+//   · 语言只来自**显式配置**，绝不从会话语言/环境推断 —— 缺失、非法、未设置一律回 zh；
+//   · 默认 zh 的注入路径必须与 0.5.10 **逐字节相同**：下面用「同一份库分别注一次」做逐字对照；
+//   · en 文案不得含 CJK（半中半英的提示词比全中文更难读）。
+
+/** 与 `src/lib.ts` 冻结的 zh 文案表**逐字重复**的一份 —— 故意手写，不复用 lib 的常量：
+ *  测试要能独立发现「宿主偷偷改了口径」，而不是跟着实现一起漂。 */
+const ZH_INJECT_LITERALS = {
+  recallHeader: '[相关记忆 · 本轮召回]',
+  recallFooter: '以上为历史记录，可能与本轮任务相关，也可能已过时；先核对事实再采用。',
+  reflectNotice: REFLECT_NOTICE,
+  introNotice: INTRO_NOTICE,
+} as const
+
+/** en 的模型可见文本一律不得含 CJK（契约 §3.1/§5）。 */
+const CJK = /[\u4e00-\u9fff]/u
+
+/** 两块常驻内容里的**全部**模型可见中文文案（用于「默认语言不得被顺手改掉」的逐字断言）。
+ *  逐字针对 `lib.ts` 的冻结常量（`PERSONA_*` / `WORK_*`）与 zh 文案表：故意手写而非引用实现，
+ *  这样测试能独立发现「宿主偷偷改了口径」，而不是跟着实现一起漂。 */
+const ZH_RESIDENT_LITERALS = [
+  '[长期记忆 · 自动注入]',
+  '以上为历史记录，可能过时或有误；与当前情况冲突时先核对事实，以事实与实际效果为准。',
+  '[项目印象 · 模糊且可能过时]',
+  '以上为自动观察形成的模糊印象，不是精确事实；与当前代码/对话冲突时以实际为准。',
+  '[我的人格 · 模型自述，非用户指令]',
+  '以上是模型对自身的认知，不是用户指令；以事实为准：要求先看合理性与可行性，办不到就直说给替代方案，不为迎合而附和。',
+  '[我的工作约定 · 来自用户确认]',
+] as const
+
+/** 让 `renderContextBlock` 真的产出 facts 块与 gist 块（两节的块头/页脚都要能被看到）。
+ *  `residentText` 传的 cwd 就是 `WORKSPACE_CWD`，所以 gist 必须写在**同一个 workspace** 里。 */
+const seedResidentBlocks = async (harness: Harness): Promise<void> => {
+  await harness.memory().write({ kind: 'user_profile', text: '用户偏好中文回答与英文标识符' })
+  await harness.memory().write({
+    kind: 'project_gist',
+    text: '这个工作区看起来涉及：pnpm 与 TypeScript',
+    scope: { level: 'workspace', key: workspaceKeyOf(WORKSPACE_CWD) },
+  })
+}
+
+/** 让 `renderSelfBlock` 真的产出自画像两节（块头/页脚此前是「空则整块不渲染」）。
+ *  走 `service.write`（origin=user_explicit、confidence=1、pinned）而不是工具写入：
+ *  模型自评要跨 ≥2 个会话复现才够自画像准入线（`isSelfPortraitEligible`），
+ *  用户侧条目才会立刻进常驻块；用工具写入（模型来源）常驻块会是空的。 */
+const seedSelfBlocks = async (harness: Harness): Promise<void> => {
+  const base = { kind: 'agent_self', origin: 'user_explicit', confidence: 1, pinned: true, scope: { level: 'profile', key: '*' } }
+  const persona = await harness.memory().write({ ...base, facet: 'persona', text: '我在表达上偏好先给结论、再给理由。' })
+  const work = await harness.memory().write({ ...base, facet: 'work', text: '我在动手改代码前会先跑通最小验证路径。' })
+  assert.equal(persona.ok, true, '种入人格条目失败，常驻块断言会失去意义')
+  assert.equal(work.ok, true, '种入工作约定条目失败，常驻块断言会失去意义')
+}
+
+/** 工具契约里**不随语言改变**的那部分：名称、参数名、必填项、结构。 */
+const toolContractOf = (harness: Harness): Json => {
+  const contract: Record<string, unknown> = {}
+  for (const tool of harness.tools) {
+    const parameters = tool.parameters as Json
+    const properties = parameters.properties as Record<string, Json>
+    contract[tool.name] = {
+      // description 故意不进指纹：它就是要随语言变的那部分
+      structure: { type: parameters.type, additionalProperties: parameters.additionalProperties },
+      // 参数名（顺序参与比较：JSON Schema 的 property 顺序就是模型看到的顺序）
+      names: Object.keys(properties),
+      required: parameters.required ?? null,
+      // 参数自身的契约：类型 / 枚举 / 数组元素类型
+      schema: Object.fromEntries(Object.entries(properties).map(([key, value]) => [
+        key,
+        { type: value.type, enum: value.enum ?? null, items: value.items ?? null },
+      ])),
+    }
+  }
+  return contract
+}
+
+test('host#60 language=en：R2 块头/页脚用英文，且正文/形状/来源与 zh 同规格（契约 §4.1）', async (t) => {
+  const en = makeHarness({ config: { language: 'en', recallMode: 'inject', selfIntroEnabled: false } })
+  t.after(() => en.dispose())
+  await en.settle()
+  await en.memory().write({ kind: 'user_profile', text: '构建流程统一用 pnpm，产物输出到 dist 目录' })
+
+  const extra = await stepTurn(en, 3, '请继续按构建流程用 pnpm 输出 dist')
+  assert.equal(extra.length, 1, '这一例只开 R2（反思/初次设定闸门未到或已关）')
+  assert.equal(sectionNameOf(extra[0]!), 'dsh-memory:recall')
+
+  const message = extra[0]!
+  const text = (message.content as Json[])[0]!.text as string
+  const lines = text.split('\n')
+  assert.equal(lines[0], '[Related memories · recalled for this turn]', '块头必须是 en 的 recallHeader')
+  assert.equal(
+    lines[lines.length - 1],
+    'The above are past records, possibly relevant to this turn and possibly outdated; check the facts before using them.',
+    '页脚必须是 en 的 recallFooter',
+  )
+  assert.ok(lines.some((line) => line.includes('pnpm')), '命中条目照旧进块')
+  // 条目正文本身是中文记忆（语言只改文案，不翻译数据）—— 只对块级固定文案断言无 CJK
+  for (const line of [lines[0]!, lines[lines.length - 1]!]) {
+    assert.doesNotMatch(line, CJK, 'en 的 R2 块头/页脚不得出现任何 CJK')
+  }
+
+  // 语言只换字符串：消息形状、来源与 section 名与 zh 完全一致
+  assert.equal(message.role, 'user')
+  const source = message.source as Json
+  assert.equal(source.kind, 'runtime-context')
+  assert.equal(source.form, 'snapshot')
+  const sections = source.sections as Json[]
+  assert.equal(sections.length, 1)
+  assert.equal(sections[0]!.name, 'dsh-memory:recall', 'section 名是协议的一部分，不随语言变')
+  assert.equal(sections[0]!.text, text)
+})
+
+test('host#61 language=en：反思提示与初次设定提示用英文（契约 §4.1）', async (t) => {
+  const en = makeHarness({
+    config: { language: 'en', recallMode: 'inject', selfReflectEveryTurns: 1, selfReflectMinTurn: 1, selfIntroMinTurn: 1 },
+  })
+  t.after(() => en.dispose())
+  await en.settle()
+
+  const bySection = new Map<string, Json>()
+  for (const message of await stepTurn(en, 1)) bySection.set(sectionNameOf(message), message)
+  const reflect = bySection.get('dsh-memory:self-reflect')
+  const intro = bySection.get('dsh-memory:self-intro')
+  assert.ok(reflect, '这一轮必须同时注入反思提示')
+  assert.ok(intro, '这一轮必须同时注入初次设定提示')
+
+  const reflectText = String((reflect.content as Json[])[0]!.text)
+  const introText = String((intro.content as Json[])[0]!.text)
+  assert.notEqual(reflectText, ZH_INJECT_LITERALS.reflectNotice, 'en 下不得再注入 zh 的反思提示')
+  assert.notEqual(introText, ZH_INJECT_LITERALS.introNotice, 'en 下不得再注入 zh 的初次设定提示')
+  assert.doesNotMatch(reflectText, CJK, 'en 的反思提示不得含 CJK')
+  assert.doesNotMatch(introText, CJK, 'en 的初次设定提示不得含 CJK')
+  // 语义与 zh 一一对应：四条硬要求里最关键的两条仍要在（不迎合、不改用户设置/安全边界）
+  assert.match(reflectText, /please/u)
+  assert.match(reflectText, /safety limits/u)
+  assert.match(reflectText, /memory_write/u, '工具名是契约，不随语言变')
+  assert.match(introText, /self\.persona\.name/u, '命名 subject 是契约，不随语言变')
+  // 注入正文照旧过 clampText：单行
+  assert.doesNotMatch(reflectText, /\n/u)
+  assert.doesNotMatch(introText, /\n/u)
+
+  // 两块的消息形状不变
+  for (const message of [reflect, intro]) {
+    assert.equal(message.role, 'user')
+    assert.equal((message.source as Json).kind, 'runtime-context')
+    assert.equal((message.source as Json).form, 'snapshot')
+  }
+})
+
+test('host#62 默认 zh 与改动前逐字节相同：R2 块头/页脚、反思提示、初次设定提示（契约 §5）', async (t) => {
+  // 三个实例共用同一份库内容（同一条记忆、同一段 query），因此 R2 正文可以逐字对照。
+  const configs: Array<[string, Json]> = [
+    ['依赖 DEFAULTS.language（完全没配）', {}],
+    ['显式 zh', { language: 'zh' }],
+    ['非法值回落 zh', { language: 'bau' }],
+    ['volatile 访问器形态的 zh', { language: volatile('zh') }],
+  ]
+  const texts: string[] = []
+  for (const [label, config] of configs) {
+    const harness = makeHarness({
+      config: {
+        ...config,
+        recallMode: 'inject',
+        selfReflectEveryTurns: 1,
+        selfReflectMinTurn: 1,
+        selfIntroMinTurn: 1,
+        selfIntroMaxAsks: 1,
+      },
+    })
+    try {
+      await harness.settle()
+      await harness.memory().write({ kind: 'user_profile', text: '构建流程统一用 pnpm，产物输出到 dist 目录' })
+
+      const extra = await stepTurn(harness, 1, '请继续按构建流程用 pnpm 输出 dist')
+      const bySection = new Map<string, Json>()
+      for (const message of extra) bySection.set(sectionNameOf(message), message)
+      const recall = bySection.get('dsh-memory:recall')
+      const reflect = bySection.get('dsh-memory:self-reflect')
+      const intro = bySection.get('dsh-memory:self-intro')
+      assert.ok(recall, `${label}：必须注入 R2`)
+      assert.ok(reflect, `${label}：必须注入反思提示`)
+      assert.ok(intro, `${label}：必须注入初次设定提示`)
+
+      const recallText = String((recall.content as Json[])[0]!.text)
+      const lines = recallText.split('\n')
+      assert.equal(lines[0], ZH_INJECT_LITERALS.recallHeader, `${label}：R2 块头必须逐字沿用旧字面量`)
+      assert.equal(lines[lines.length - 1], ZH_INJECT_LITERALS.recallFooter, `${label}：R2 页脚必须逐字沿用旧字面量`)
+      // 反思/初次设定提示照旧逐字等于既有导出常量（也就是 0.5.10 注入的那串字）
+      assert.equal(String((reflect.content as Json[])[0]!.text), ZH_INJECT_LITERALS.reflectNotice, `${label}：反思提示必须逐字不变`)
+      assert.equal(String((intro.content as Json[])[0]!.text), ZH_INJECT_LITERALS.introNotice, `${label}：初次设定提示必须逐字不变`)
+
+      texts.push([recallText, String((reflect.content as Json[])[0]!.text), String((intro.content as Json[])[0]!.text)].join('\n'))
+    } finally {
+      await harness.dispose()
+    }
+  }
+  // 「缺省 / 显式 zh / 非法值」三者注入的每一个字节都必须相同
+  for (const text of texts.slice(1)) {
+    assert.equal(text, texts[0], '缺省、zh 与非法值必须注入完全相同的内容')
+  }
+
+  // 常驻两块（section + context）在默认语言下也不得漏字：逐条比对既有中文文案。
+  // 注意：lib 的块头/页脚是**有内容才渲染**（空则整块不出），所以这里先把两节的记录喂进去。
+  const resident = makeHarness()
+  t.after(() => resident.dispose())
+  await resident.settle()
+  await seedResidentBlocks(resident)
+  await seedSelfBlocks(resident)
+  const rendered = residentText(resident)
+  for (const literal of ZH_RESIDENT_LITERALS) {
+    assert.ok(rendered.includes(literal), `常驻块不得漏掉既有文案：${literal}`)
+  }
+})
+
+test('host#63 language=en：7 个工具描述与参数说明都是英文，且工具契约完全不变（契约 §4.2/§5）', async (t) => {
+  const zh = makeHarness()
+  const en = makeHarness({ config: { language: 'en' } })
+  t.after(() => zh.dispose())
+  t.after(() => en.dispose())
+
+  assert.deepEqual(
+    toolContractOf(en),
+    toolContractOf(zh),
+    '工具名/参数名/必填项/schema 结构绝不能因 language 而变（否则模型已学会的调用方式会失效）',
+  )
+  assert.deepEqual(en.tools.map((tool) => tool.name), zh.tools.map((tool) => tool.name))
+
+  for (const tool of en.tools) {
+    assert.ok(typeof tool.description === 'string' && tool.description.length > 0, `${tool.name} 必须有描述`)
+    assert.doesNotMatch(String(tool.description), CJK, `${tool.name} 的 en 描述不得含 CJK`)
+  }
+  // 参数说明（schema 里的 description）也要跟着语言走
+  const enWrite = (en.tool('memory_write').parameters as Json).properties as Record<string, Json>
+  const zhWrite = (zh.tool('memory_write').parameters as Json).properties as Record<string, Json>
+  for (const key of ['text', 'subject', 'facet']) {
+    assert.ok(String(enWrite[key]!.description ?? '').length > 0, `memory_write.${key} 必须有参数说明`)
+    assert.doesNotMatch(String(enWrite[key]!.description), CJK, `memory_write.${key} 的 en 说明不得含 CJK`)
+    assert.notEqual(enWrite[key]!.description, zhWrite[key]!.description, `memory_write.${key} 的说明必须按语言切换`)
+  }
+  const enExplain = (en.tool('memory_explain').parameters as Json).properties as Record<string, Json>
+  const zhExplain = (zh.tool('memory_explain').parameters as Json).properties as Record<string, Json>
+  for (const key of ['text', 'apply']) {
+    assert.doesNotMatch(String(enExplain[key]!.description), CJK, `memory_explain.${key} 的 en 说明不得含 CJK`)
+    assert.notEqual(enExplain[key]!.description, zhExplain[key]!.description)
+  }
+})
+
+test('host#64 默认 zh：7 个工具的描述与参数说明逐字不变（契约 §5）', async (t) => {
+  // 与 0.5.10 的内联字面量逐字重复（故意手写，见文件头注释）
+  const expected: Record<string, string> = {
+    memory_write: '写入一条长期记忆（用户偏好、项目约定、结论、做法）。写入来源由插件判定，不由本参数指定。',
+    memory_recall: '按查询或过滤条件检索长期记忆，返回带来源与重要度的条目。',
+    memory_list: '列出长期记忆（不做相关性打分，按确定性顺序）。',
+    memory_forget: '删除长期记忆。给 id 前缀直接删；给 query 时默认只预览命中，需要 confirm=true 才真正删除。',
+    memory_stats: '查看长期记忆的运行时可观测信息：条数、写入/拒绝计数、注入行数、渲染耗时、整合与召回状态。',
+    memory_maintain: '整理长期记忆：合并同主题的重复条目、把矛盾条目标记为失效、按衰减归档。后台会定期自动执行，这里用于手动触发。',
+    memory_explain: '诊断：给定一段文本，说明长期记忆会怎么处理它（命中哪条信号、被哪条排除规则拒绝、会写成什么记录）。apply=true 时真的写入。',
+  }
+  const expectedParams: Record<string, Record<string, string>> = {
+    memory_write: {
+      text: '单句、面向模型可读的记忆内容',
+      subject: '归一化主题键，用于去重与冲突判定，例如 editor.theme',
+      facet: '仅 kind=agent_self 有意义：自画像面（persona=人格/表达，work=工作倾向），缺省 work。',
+    },
+    memory_explain: {
+      text: '待诊断的文本（通常是一句用户消息）',
+      apply: '默认 false，只解释不写入',
+    },
+  }
+
+  // 缺省（完全没配）、显式 zh、非法值三种情况都必须逐字落到同一份旧文案上
+  for (const [label, config] of [
+    ['缺省', {}],
+    ['显式 zh', { language: 'zh' }],
+    ['非法值回落', { language: 'zh-CN' }],
+  ] as Array<[string, Json]>) {
+    const harness = makeHarness({ config })
+    try {
+      for (const [toolName, description] of Object.entries(expected)) {
+        assert.equal(String(harness.tool(toolName).description), description, `${label}：${toolName} 的描述必须逐字不变`)
+      }
+      for (const [toolName, params] of Object.entries(expectedParams)) {
+        const properties = (harness.tool(toolName).parameters as Json).properties as Record<string, Json>
+        for (const [key, description] of Object.entries(params)) {
+          assert.equal(String(properties[key]!.description), description, `${label}：${toolName}.${key} 的说明必须逐字不变`)
+        }
+      }
+    } finally {
+      await harness.dispose()
+    }
+  }
+})
+
+test('host#65 stats：/memory stats 与 memory_stats 都显示当前 language（缺省 zh、非法值回落 zh）', async (t) => {
+  // 缺省 → zh
+  const zh = makeHarness()
+  t.after(() => zh.dispose())
+  await zh.settle()
+  const zhStats = await zh.runCommand('stats')
+  assert.equal(zhStats.kind, 'success')
+  assert.match(zhStats.text, /语言：language=zh/u, '缺省必须显示 zh（命令输出本身仍是中文）')
+  const zhTool = JSON.parse(String(await zh.tool('memory_stats').execute({}))) as Json
+  assert.match(String(zhTool.text), /语言：language=zh/u, '工具文本与 /memory stats 同步')
+
+  // 显式 en
+  const en = makeHarness({ config: { language: 'en' } })
+  t.after(() => en.dispose())
+  await en.settle()
+  assert.match((await en.runCommand('stats')).text, /语言：language=en/u, 'en 下必须显示 en')
+  const enTool = JSON.parse(String(await en.tool('memory_stats').execute({}))) as Json
+  assert.match(String(enTool.text), /语言：language=en/u, '工具文本与 /memory stats 同步')
+  // 命令输出本轮仍为中文（契约 §4.3「本轮范围外」）
+  assert.match(String(enTool.text), /域：/u, 'language=en 不得把命令输出翻译成英文')
+  assert.match((await en.runCommand('stats')).text, /记录数：/u)
+
+  // 非法值 → 回落 zh（不能显示成原始非法值，否则排查时反而误导）
+  const bogus = makeHarness({ config: { language: 'english' } })
+  t.after(() => bogus.dispose())
+  await bogus.settle()
+  assert.match((await bogus.runCommand('stats')).text, /语言：language=zh/u)
+
+  // volatile 访问器形态（运行版就是这样下发配置的）
+  const vol = makeHarness({ config: { language: volatile('en') } })
+  t.after(() => vol.dispose())
+  await vol.settle()
+  assert.match((await vol.runCommand('stats')).text, /语言：language=en/u, 'volatile 形态必须解包后再显示')
+})
+
+test('host#66 常驻注入块在两种语言下都能渲染，且只换块级文案（本轮写域边界：只做模型可见文本）', async (t) => {
+  // `renderSelfBlock`/`renderContextBlock` 的块头/页脚由 lib 侧按语言提供（上一阶段已落地）。
+  // 这里在**宿主**这一侧钉死两件事：① 宿主确实把 cfg.language 传进了渲染路径；
+  // ② 语言只换块级文案 —— 记忆正文（数据）一字不改。命令输出本轮仍是中文（§4.3）。
+  const zh = makeHarness()
+  const en = makeHarness({ config: { language: 'en' } })
+  t.after(() => zh.dispose())
+  t.after(() => en.dispose())
+  await zh.settle()
+  await en.settle()
+  for (const harness of [zh, en]) {
+    await seedResidentBlocks(harness)
+    await seedSelfBlocks(harness)
+  }
+
+  const zhResident = residentText(zh)
+  const enResident = residentText(en)
+  for (const literal of ZH_RESIDENT_LITERALS) {
+    assert.ok(zhResident.includes(literal), `默认语言必须保留既有块头：${literal}`)
+    assert.ok(!enResident.includes(literal), `en 不得混入 zh 块头：${literal}`)
+  }
+  assert.match(enResident, /\[Long-term memory · auto-injected\]/u, 'en 下 facts 块必须用英文块头')
+  assert.match(enResident, /\[Persona · model self-description\]/u, 'en 下自画像块必须用英文块头')
+  // 数据本身不翻译：中文记忆正文照样注入
+  assert.ok(zhResident.includes('用户偏好中文回答与英文标识符'))
+  assert.ok(enResident.includes('用户偏好中文回答与英文标识符'), 'language 只改文案，不改记忆正文')
+  // 命令输出仍然只有中文（本轮明确不做命令输出本地化）
+  const enStats = await en.runCommand('stats')
+  assert.match(enStats.text, /记录数：/u)
+  assert.doesNotMatch(enStats.text, /Records:/u)
+})
+
+test('host#67 language 只在显式配置时生效：会话内容/域名等其它配置不得影响语言推断', async (t) => {
+  // 契约 §5：默认语言的每一个字节都必须与现状相同 —— 因此绝不允许「猜」语言。
+  const harness = makeHarness({
+    config: { domainName: 'dsh_memory_en_looking', recallMode: 'inject', selfIntroEnabled: false },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  await harness.memory().write({ kind: 'user_profile', text: 'Build with pnpm and output to dist' })
+
+  // 全英文的对话内容也不得让注入块变成英文
+  const extra = await stepTurn(harness, 3, 'please continue with the pnpm build and output to dist')
+  const text = String(((extra[0]!.content as Json[])[0]!).text)
+  assert.ok(text.startsWith(ZH_INJECT_LITERALS.recallHeader), '语言不得从对话内容推断')
+  assert.ok(text.endsWith(ZH_INJECT_LITERALS.recallFooter))
+  assert.match(text, /pnpm/u, '英文记忆内容照旧注入')
+})
+
 

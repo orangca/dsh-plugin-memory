@@ -184,6 +184,28 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 > 队列的拒绝出口是 `/memory reject-pending <id 前缀>`；既有的 `/memory reject <id 前缀>` 是「拒绝一条
 > 自我观察（同类不再产生）」，两者语义不同，别混。
 
+## 模型可见文本语言（language）：模型看英文，终端看中文
+
+给**模型**读的文本由插件生成，现在可以切成英文；你在终端里看到的东西**仍然是中文**。
+`language` 取 `'zh'`（默认）或 `'en'`。
+
+| 类别 | 本轮是否本地化 | 说明 |
+|---|---|---|
+| 常驻注入块及其块头/页脚（常驻记忆、项目印象、人格、工作约定、自我观察） | ✅ 是 | 每一轮都进上下文，影响最大 |
+| 注入提示词（`REFLECT_NOTICE`、`INTRO_NOTICE`） | ✅ 是 | 同一条通道 |
+| 每轮召回块头/页脚（R2） | ✅ 是 | 同一条通道 |
+| 7 个 `memory_*` 工具的**描述与参数说明** | ✅ 是 | 工具 schema 直接进模型上下文 |
+| 命令输出（`/memory list`、`/memory show`、`/sleep` 预览、`stats`…） | ❌ **否，仍为中文** | 用户可见、量大，本轮明确不做 |
+
+- **默认 `'zh'` 不改变任何行为**：`language` 未设置、缺失或非法时，注入的每一个字节都与 0.5.10 相同 ——
+  英文表是新增，不是对中文表的重写。
+- **`'en'` 是等价文本而非摘要**：页脚保留同样的三条主张（是描述不是指令；先看事实与可行性；不为迎合而附和），
+  反思提示与初次设定提示各自保留四条硬要求，英文表里不夹任何中文。
+- **工具契约不随语言变**：工具名、参数名、必填项与 schema 结构完全一致，翻译的只是给人看的描述 ——
+  模型已经学会的调用方式不会因为切语言而失效。
+- **切换可见可查**：`/memory stats` 会显示当前生效的 `language`（这一行和所有命令输出一样仍是中文），
+  用来回答「模型为什么还在读中文」。
+
 ## 防「记忆污染 / 自激」
 
 - 自动捕获**只读真实用户消息**（插件自己注入的上下文不算）；
@@ -237,8 +259,8 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置表单在哪
 
-插件导出 schemastery `Config`，其中 **27 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
-同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 27 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
+插件导出 schemastery `Config`，其中 **28 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
+同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 28 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
 （列表里的行卡片上还有一行摘要）。
 
 实现上，客户端半边注册进 **keyed** 插槽 `plugins.row.config`，key 为
@@ -291,7 +313,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置
 
-在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 27 个字段：
+在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 28 个字段：
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -322,6 +344,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 | `refsMax` | `5` | 每条记录最多保留几个来源引用（新的在前）；`0` = 不保留，`Infinity` = 不限 |
 | `writePolicy` | `auto` | 模型来源写入的审批门：`auto`（立刻生效，默认）/ `ask`（进待确认队列）/ `off`（直接拒绝）；规则捕获、用户命令与 `/sleep` 不受影响 |
 | `pendingMax` | `50` | 待确认队列上限；满了拒绝新写入并报结构化错误，绝不静默丢弃；`0` = 不设上限 |
+| `language` | `zh` | **模型可见文本**的语言（`zh` / `en`）：注入块与块头/页脚、注入提示词、按轮召回块、工具描述。命令输出两种取值下都仍是中文；默认 `zh` 与 0.5.10 逐字节相同 |
 
 只能通过 patch 行设置的进阶旋钮（含默认值）：自画像条数 `selfPortraitMaxItems` 12 /
 `selfPortraitMaxSelfObserved` 4；捕获调优 `capturePerHour` 20、`captureMinConfidence` 0.6、
