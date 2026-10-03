@@ -215,6 +215,11 @@ export interface MemoryConfig {
   language: Language
   /** M12：是否按 git 分支过滤带 `branch` 标签的记录（默认 true，但无标签记录行为不变）。 */
   branchAware: boolean
+  /**
+   * M13：内存审计环容量 —— 只保存**没有落盘的尝试**（被拒/入队/批准/拒绝待确认），
+   * 成功的写事件由记录本身派生，因此不为审计新增存储。`0` = 不记录。
+   */
+  auditMax: number
   gistBudgetRatio: number
   charsPerToken: number
   sectionOrder: number

@@ -168,6 +168,9 @@ export const DEFAULTS: MemoryConfig = {
   // M12：git 分支感知（契约 docs/branch.md §2.1）。默认 true —— 但**存量记录都没有标签**，
   // 因此开箱即用的输出与 0.5.12 逐字节相同（有测试钉住）。
   branchAware: true,
+  // M13：内存审计环容量（契约 docs/audit.md §2.1）—— `0` = 不记录（显式关闭）；
+  // 默认 50 与 `pendingMax` 同量级：够放下一轮会话里被拒/入队的尝试，又有硬上限。
+  auditMax: 50,
   gistBudgetRatio: 0.3,
   charsPerToken: 2.5,
   sectionOrder: 9000,
@@ -2673,5 +2676,234 @@ export function formatBranchSummary(records: Iterable<MemoryRecord>, currentBran
   if (current === null) {
     lines.push('当前分支未知（不在 git 仓库或读不到 HEAD）：带标签的记忆此时一律不注入（fail-closed）。')
   }
+  return lines.join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// M13：写入审计与注入核对（`/memory audit`）—— 契约 docs/audit.md §2
+//
+// 与上面几节一样是**纯函数**：不依赖 ctx、不碰存储、不引依赖、不做 I/O。
+// 三条不可妥协（契约 §1/§4）：
+//  · **不为审计新增存储**：成功的写事件由记录本身派生（`observedAt`/`origin`/`refs.via`/`status`），
+//    只有**没有落盘的尝试**（被拒/入队/批准/拒绝待确认）进内存环，且有界 —— 不留第二份真相；
+//  · 环只保留最近 `cfg.auditMax` 条（`0` ＝ 不记录），**重启即失**；这是有意的取舍，输出里要写明；
+//  · **没核对就说没核对**：`verify` 为 null（未做核对）或带缺口时，只报「未做核对／无法核对 + 原因」，
+//    绝不把缺口渲染成「核对通过」—— 否则「模型可见 ⟺ 已记录」这个卖点就失去意义。
+// ---------------------------------------------------------------------------
+
+/** 审计动作（契约 §2，声明顺序即计数与渲染顺序，保证输出确定性）。 */
+export type AuditAction =
+  | 'created' | 'merged' | 'pending' | 'approved' | 'rejected-pending'
+  | 'rejected' | 'invalidated' | 'archived' | 'forgotten'
+
+/** 固定的 9 个 action（只有这一处定义，`auditCounts` 恒定包含全部键）。 */
+const AUDIT_ACTIONS: readonly AuditAction[] = [
+  'created', 'merged', 'pending', 'approved', 'rejected-pending',
+  'rejected', 'invalidated', 'archived', 'forgotten',
+]
+
+/** 一条审计事件（成功的写入也能从记录派生；这里是「尝试」视角，含被拒的）。 */
+export interface AuditEntry {
+  /** 毫秒时间戳。 */
+  at: number
+  /** 相关记录 id；被拒/队列满时可能是 null。 */
+  id: string | null
+  kind: string
+  origin: string
+  /** 写入路径：live | sleep | tool | command | solidify | import（来自 refs.via）。 */
+  via: string | null
+  action: AuditAction
+  /** 被拒原因等可读说明。 */
+  reason?: string | null
+}
+
+/** 单行字段的展示预算（与 `/sleep` 的 notes 同口径：够长，但给异常输入一个硬上限）。 */
+const AUDIT_LINE_TOKENS = 300
+
+/** id 前缀长度（与既有命令的 `shortId` 展示口径一致）。 */
+const AUDIT_ID_PREFIX = 8
+
+/**
+ * 环容量：**只有 `0` 是「显式关闭」**；NaN/±Infinity/负数都是配置写错了，回落 `DEFAULTS.auditMax`。
+ *
+ * 契约正文写「`<=0` 视为不记录」，任务说明又把「负」列入非法值 —— 这里按仓库既有的
+ * 「计数型上限」口径（`refsMaxOf`：允许 0、负数回落默认）取后者：把负数的配置静默变成
+ * 「不记录」会让审计**无声消失**（比多留几条危险得多），而 `0` 仍然精确地等于不记录。
+ */
+function auditMaxOf(cfg: MemoryConfig | null | undefined): number {
+  const value = cfg?.auditMax
+  return typeof value !== 'number' || !Number.isFinite(value) || value < 0 ? DEFAULTS.auditMax : value
+}
+
+/**
+ * 有界环：**新事件在前**，最多 `cfg.auditMax` 条（`0` ＝ 不记录 → 返回空数组）。
+ *
+ * 返回**新数组**，绝不改入参数组（调用方可能把同一个数组用在别处，也可能把它当快照）。
+ */
+export function pushAudit(entries: readonly AuditEntry[], entry: AuditEntry, cfg: MemoryConfig): AuditEntry[] {
+  const max = auditMaxOf(cfg)
+  // 先看容量：关闭时连「清空旧环」都不必做，直接给一个空数组（调用方赋值回去即可）。
+  if (max <= 0) return []
+  const list = Array.isArray(entries) ? entries : []
+  // 非对象条目视为「没发生」：宁可少一条，也不往环里塞一个渲染时才会炸的值。
+  const next = entry === null || entry === undefined || typeof entry !== 'object'
+    ? [...list]
+    : [entry, ...list]
+  return next.length > max ? next.slice(0, max) : next
+}
+
+/** 按 action 计数：**恒定包含全部 9 个键**（没有的记 0），便于渲染、统计与断言。 */
+export function auditCounts(entries: readonly AuditEntry[]): Record<AuditAction, number> {
+  const counts = {} as Record<AuditAction, number>
+  for (const action of AUDIT_ACTIONS) counts[action] = 0
+  const list = Array.isArray(entries) ? entries : []
+  for (const item of list) {
+    if (item === null || item === undefined || typeof item !== 'object') continue
+    const action: string = String(item.action)
+    // 未知动作（模型/宿主写错、旧版本事件）不计入任何键，也绝不让计数行出现 `undefined`。
+    if (Object.prototype.hasOwnProperty.call(counts, action)) counts[action as AuditAction] += 1
+  }
+  return counts
+}
+
+export interface AuditInput {
+  entries: readonly AuditEntry[]
+  records: Iterable<MemoryRecord>
+  cfg: MemoryConfig
+  /** 当前分支（可空）。 */
+  currentBranch?: string | null
+  /** `--verify` 的结果；未做核对时为 null。 */
+  verify?: { checked: number; matched: number; missing: number; sample?: string | null; gap?: string | null } | null
+}
+
+/** 展示字段：null/undefined/空白 → 占位符；一切文本先过 `clampText` 折平成单行再拼接。 */
+function auditFieldOf(value: unknown, charsPerToken: number, fallback = ''): string {
+  if (value === null || value === undefined) return fallback
+  const text = clampText(value, AUDIT_LINE_TOKENS, charsPerToken)
+  return text.length === 0 ? fallback : text
+}
+
+/** id 前缀：先折平（防换行伪造），再截前 8 个字符；没有 id 时给占位符，绝不输出 `undefined`。 */
+function auditIdOf(id: string | null | undefined, charsPerToken: number): string {
+  const text = auditFieldOf(id, charsPerToken)
+  if (text.length === 0) return '（无 id）'
+  return text.length <= AUDIT_ID_PREFIX ? text : text.slice(0, AUDIT_ID_PREFIX)
+}
+
+/** 有限数才可信：非法计数按 0 渲染（一个 NaN 不该把整行变成 `NaN`）。 */
+function auditCountOf(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+/**
+ * `/memory audit` 的渲染（命令输出，**中文**，与其它命令一致）：
+ *  1) 最近尝试（新在前：id 前缀 · action · via · origin · kind · 时间 · 原因）；
+ *  2) 按 action 与 via 的计数；
+ *  3) 库内状态汇总：active / pending / archived / invalid 计数 + 带 refs 的比例；
+ *  4) `--verify` 结果（含审计缺口：没核对就只说没核对，缺口原因原样展示）。
+ *
+ * 空环必须给「本轮没有记录到被拒或入队的尝试」而不是空白；`--limit` 由宿主裁剪 `entries` 后传入。
+ */
+export function formatAudit(input: AuditInput): string {
+  const cfg: MemoryConfig = input?.cfg ?? DEFAULTS
+  const charsPerToken = typeof cfg.charsPerToken === 'number' && Number.isFinite(cfg.charsPerToken) && cfg.charsPerToken > 0
+    ? cfg.charsPerToken
+    : DEFAULTS.charsPerToken
+  const entries: readonly AuditEntry[] = Array.isArray(input?.entries)
+    ? input.entries.filter((entry) => entry !== null && entry !== undefined)
+    : []
+  const records: MemoryRecord[] = input?.records === null || input?.records === undefined
+    ? []
+    : [...input.records].filter((record) => record !== null && record !== undefined)
+  const max = auditMaxOf(cfg)
+
+  const lines: string[] = [`[记忆审计 · 内存尝试环 ${entries.length} 条 · 容量 ${max}]`]
+
+  // ---- 1) 最近尝试（新在前）
+  if (entries.length === 0) {
+    lines.push('最近尝试：本轮没有记录到被拒或入队的尝试。')
+    if (max <= 0) {
+      lines.push(`（auditMax=${max}：审计环关闭，任何尝试都不记录；成功的写入仍由记录本身派生，见下方库内状态。）`)
+    }
+  } else {
+    lines.push('最近尝试（新在前；成功的写入由记录本身派生，不在此列；内存环重启即失）：')
+    for (const entry of entries) {
+      const parts = [
+        auditIdOf(entry.id, charsPerToken),
+        auditFieldOf(entry.action, charsPerToken, '（未知动作）'),
+        `via=${auditFieldOf(entry.via, charsPerToken, '（无）')}`,
+        `origin=${auditFieldOf(entry.origin, charsPerToken, '（未知）')}`,
+        `kind=${auditFieldOf(entry.kind, charsPerToken, '（未知）')}`,
+        stampOf(entry.at),
+      ]
+      const reason = auditFieldOf(entry.reason, charsPerToken)
+      if (reason.length > 0) parts.push(`原因：${reason}`)
+      lines.push(`  - ${parts.join(' · ')}`)
+    }
+  }
+
+  // ---- 2) 按 action 与 via 的计数（action 恒定 9 个键；via 按「多→少、同名字典序」定序）
+  const counts = auditCounts(entries)
+  lines.push(`按 action 计数：${AUDIT_ACTIONS.map((action) => `${action} ${counts[action]}`).join(' · ')}`)
+  const vias = new Map<string, number>()
+  for (const entry of entries) {
+    const via = auditFieldOf(entry.via, charsPerToken, '（无 via）')
+    vias.set(via, (vias.get(via) ?? 0) + 1)
+  }
+  if (vias.size === 0) {
+    lines.push('按 via 计数：（本轮没有尝试）')
+  } else {
+    const viaParts = [...vias.entries()]
+      .sort((a, b) => (b[1] - a[1]) || compareText(a[0], b[0]))
+      .map(([via, count]) => `${via} ${count}`)
+    lines.push(`按 via 计数：${viaParts.join(' · ')}`)
+  }
+
+  // ---- 3) 库内状态汇总（记录派生；不为审计新增存储，重启后这些仍在）
+  let active = 0
+  let pending = 0
+  let archived = 0
+  let invalid = 0
+  let withRefs = 0
+  for (const record of records) {
+    if (record.status === 'active') active += 1
+    else if (record.status === 'pending') pending += 1
+    else if (record.status === 'archived') archived += 1
+    else if (record.status === 'invalid') invalid += 1
+    if (refsOf(record).length > 0) withRefs += 1
+  }
+  const refsRatio = records.length === 0 ? 0 : Math.round((withRefs * 100) / records.length)
+  const branch = auditFieldOf(normalizeBranch(input?.currentBranch ?? null) ?? 'unknown', charsPerToken, 'unknown')
+  lines.push(`库内状态：共 ${records.length} 条 · active ${active} · pending ${pending}`
+    + ` · archived ${archived} · invalid ${invalid}（当前分支：${branch}）。`)
+  lines.push(`来源引用：带 refs 的 ${withRefs} 条（占 ${refsRatio}%）；成功写入/合并/失效/归档都由记录派生，重启后仍在。`)
+
+  // ---- 4) `--verify` 结果：缺口要说出来，绝不渲染成「通过」
+  const verify = input?.verify ?? null
+  if (verify === null) {
+    // 未做核对是**缺口**，必须显式说明；这里刻意不出现「通过」二字。
+    lines.push('--verify：未做核对 —— 本轮没有比对注入内容是否逐字出现在会话日志里；未核对不等于一致。')
+  } else {
+    const checked = auditCountOf(verify.checked)
+    const matched = auditCountOf(verify.matched)
+    const missing = auditCountOf(verify.missing)
+    const gap = auditFieldOf(verify.gap, charsPerToken)
+    const sample = auditFieldOf(verify.sample, charsPerToken)
+    if (gap.length > 0) {
+      // 缺口原因**原样**展示（只经过 clampText 折平，不改写、不省略）。
+      lines.push(`--verify：无法核对 —— 原因：${gap}`)
+      lines.push(`  已尝试核对 ${checked} 行（命中 ${matched} · 缺失 ${missing}）；缺口存在时不能把「没核对到」读成一致。`)
+    } else {
+      lines.push(`--verify：核对 ${checked} 行 · 命中 ${matched} 行 · 缺失 ${missing} 行（逐字 includes 判定，不做模糊匹配）。`)
+      if (missing > 0) {
+        lines.push(sample.length > 0 ? `  未命中样例：${sample}` : '  未命中样例：（本次未提供样例）')
+      } else if (checked > 0) {
+        lines.push('  逐字核对通过：注入内容全部出现在会话日志里。')
+      } else {
+        lines.push('  本会话日志里没有可比对的注入行（checked=0），因此这次核对没有结论。')
+      }
+    }
+  }
+
   return lines.join('\n')
 }

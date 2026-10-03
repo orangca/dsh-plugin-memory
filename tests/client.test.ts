@@ -269,8 +269,13 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
   assert.equal(byName('branchAware').format(true), '1')
   assert.equal(byName('branchAware').format(undefined), '')
 
-  // 29 个字段都要有规格，且与 Host 侧 volatile 字段一一对应
-  assert.equal(specs.length, 29)
+  // M13：审计环容量是普通数字字段
+  assert.deepEqual(byName('auditMax').parse('7'), { kind: 'set', value: 7 })
+  assert.equal(byName('auditMax').parse('abc'), undefined)
+  assert.deepEqual(byName('auditMax').parse(''), { kind: 'clear' })
+
+  // 30 个字段都要有规格，且与 Host 侧 volatile 字段一一对应
+  assert.equal(specs.length, 30)
   for (const name of [
     'selfIntroEnabled', 'selfIntroMinTurn', 'selfIntroMaxAsks',
     'sleepEnabled', 'sleepSessions', 'sleepMaxBackfill',
@@ -278,6 +283,7 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
     'writePolicy', 'pendingMax',
     'language',
     'branchAware',
+    'auditMax',
   ] as const) {
     assert.ok(specs.some((spec) => spec.field === name), `设置页缺少 ${name}`)
   }

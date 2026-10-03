@@ -3,6 +3,46 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.14 — 2026-10-03
+
+**Write audit and injection verification: "the model can see it" ⟺ "it was recorded".** The fifth competitive
+direction. `/memory audit` shows two views of the same history without keeping a second copy of it: successful
+writes, merges, invalidations, archives and pending rows are **derived from the records themselves** (so they survive
+a restart), while the attempts that never landed — rejected writes (sensitive / echo / write policy / queue full),
+queued, approved and rejected-pending — go into a new **bounded in-memory ring**. `--verify` checks this session's
+injected lines against the session log with a literal `includes` test, and any gap (no `sessionQuery`, unknown session
+id, unreadable log, no `user/message` events) is **stated**, never rendered as success. Contract: `docs/audit.md`.
+
+### Added
+
+- `auditMax` (`number`, default `50`): the capacity of the in-memory attempt ring; `0` = record no attempts. It is the
+  **30th** field of the settings form (**29 → 30**), labelled in both languages, and the ring is **cleared on
+  restart** (the output says so).
+- `/memory audit [--limit N] [--verify]` (read-only): without flags it renders the recent attempts (id prefix ·
+  action · via · origin · kind · time · reason), the per-action and per-via counts, and the in-store summary
+  (active / pending / archived / invalid, plus the share of rows carrying refs). `--limit` selects how many recent
+  attempts to show (default `20`, capped at `200`; `--limit=N` is accepted, a missing or non-positive value falls back
+  to the default). `--verify` compares the lines injected this session with the session log using **verbatim
+  `includes`** and reports `checked` / `matched` / `missing` plus one unmatched sample.
+- `/memory stats` and `memory_stats` gained a one-line audit summary (recent attempts · store rows · verification
+  misses); the detail stays in `/memory audit`.
+- Both READMEs gained a "`/memory audit`" section with the two-source table (record-derived = persistent, in-memory
+  ring = attempts including rejections), the `--limit` / `--verify` usage, the verbatim rule, the gap-is-stated rule,
+  the read-only / never-blocks note and the no-extra-storage design note, plus the new configuration row.
+
+### Changed
+
+- **The default changes nothing, byte for byte.** `auditMax: 50` only fills an in-memory ring: no stored record, no
+  read path and no file format changes, and a restart clears the ring either way. The audit adds **no storage** — the
+  successful-write view is derived from the records that already exist.
+- **The audit is read-only and cannot block anything.** `/memory audit` and `--verify` modify no record, no state and
+  no counter — reading the audit does not push an audit event of its own (otherwise one `--verify` would change the
+  next one's input). Every push, render and comparison is wrapped in `try/catch`: an audit failure never affects a
+  write or an injection.
+- **A gap is never a pass.** Without `sessionQuery`, with an unknown session id, when the session log cannot be read,
+  or when the log contains no `user/message` event, the output says that it cannot verify and why; without `--verify`
+  it says that no check was run. "Not checked" is never rendered as "checked and consistent".
+
 ## 0.5.13 — 2026-10-03
 
 **Branch-aware project memory: feature-branch decisions stay on their branch.** The fourth competitive direction — a

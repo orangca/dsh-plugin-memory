@@ -647,4 +647,53 @@ export declare function isBranchVisible(record: MemoryRecord | null | undefined,
  *  · 分组按「条数多→少、同名按字典序」输出，结果确定性可测。
  */
 export declare function formatBranchSummary(records: Iterable<MemoryRecord>, currentBranch: string | null): string;
+/** 审计动作（契约 §2，声明顺序即计数与渲染顺序，保证输出确定性）。 */
+export type AuditAction = 'created' | 'merged' | 'pending' | 'approved' | 'rejected-pending' | 'rejected' | 'invalidated' | 'archived' | 'forgotten';
+/** 一条审计事件（成功的写入也能从记录派生；这里是「尝试」视角，含被拒的）。 */
+export interface AuditEntry {
+    /** 毫秒时间戳。 */
+    at: number;
+    /** 相关记录 id；被拒/队列满时可能是 null。 */
+    id: string | null;
+    kind: string;
+    origin: string;
+    /** 写入路径：live | sleep | tool | command | solidify | import（来自 refs.via）。 */
+    via: string | null;
+    action: AuditAction;
+    /** 被拒原因等可读说明。 */
+    reason?: string | null;
+}
+/**
+ * 有界环：**新事件在前**，最多 `cfg.auditMax` 条（`0` ＝ 不记录 → 返回空数组）。
+ *
+ * 返回**新数组**，绝不改入参数组（调用方可能把同一个数组用在别处，也可能把它当快照）。
+ */
+export declare function pushAudit(entries: readonly AuditEntry[], entry: AuditEntry, cfg: MemoryConfig): AuditEntry[];
+/** 按 action 计数：**恒定包含全部 9 个键**（没有的记 0），便于渲染、统计与断言。 */
+export declare function auditCounts(entries: readonly AuditEntry[]): Record<AuditAction, number>;
+export interface AuditInput {
+    entries: readonly AuditEntry[];
+    records: Iterable<MemoryRecord>;
+    cfg: MemoryConfig;
+    /** 当前分支（可空）。 */
+    currentBranch?: string | null;
+    /** `--verify` 的结果；未做核对时为 null。 */
+    verify?: {
+        checked: number;
+        matched: number;
+        missing: number;
+        sample?: string | null;
+        gap?: string | null;
+    } | null;
+}
+/**
+ * `/memory audit` 的渲染（命令输出，**中文**，与其它命令一致）：
+ *  1) 最近尝试（新在前：id 前缀 · action · via · origin · kind · 时间 · 原因）；
+ *  2) 按 action 与 via 的计数；
+ *  3) 库内状态汇总：active / pending / archived / invalid 计数 + 带 refs 的比例；
+ *  4) `--verify` 结果（含审计缺口：没核对就只说没核对，缺口原因原样展示）。
+ *
+ * 空环必须给「本轮没有记录到被拒或入队的尝试」而不是空白；`--limit` 由宿主裁剪 `entries` 后传入。
+ */
+export declare function formatAudit(input: AuditInput): string;
 //# sourceMappingURL=lib.d.ts.map

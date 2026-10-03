@@ -6,6 +6,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import type {
+  AuditAction,
+  AuditEntry,
   CaptureCandidate,
   InjectedTexts,
   Language,
@@ -36,6 +38,7 @@ import {
   WORK_CONFIRMED_HEADER,
   WORK_OBSERVED_FOOTER,
   WORK_OBSERVED_HEADER,
+  auditCounts,
   branchFromHeadContent,
   branchOf,
   buildSleepPlan,
@@ -55,6 +58,7 @@ import {
   facetOf,
   findConflicts,
   fnv1a,
+  formatAudit,
   formatBranchSummary,
   formatPendingQueue,
   formatRefs,
@@ -83,6 +87,7 @@ import {
   planPortraitUpdate,
   portraitHistory,
   portraitSubjectFor,
+  pushAudit,
   recallRecords,
   recordHash,
   refsOf,
@@ -2540,3 +2545,302 @@ test('branchAware 默认 true 且库内无标签：行为与改动前逐字节�
     renderContextBlock(records, { ...DEFAULTS }, workspaceKey).text,
   )
 })
+
+// ---------------------------------------------------------------------------
+// M13：写入审计与注入核对（契约 docs/audit.md §2/§5）
+// pushAudit / auditCounts / formatAudit —— 纯函数：不碰存储、不改入参、缺口必须显式。
+// ---------------------------------------------------------------------------
+
+/** 一条审计事件（默认值可被 Partial 覆盖）。 */
+function auditEntry(extra: Partial<AuditEntry> = {}): AuditEntry {
+  return {
+    at: 1_000,
+    id: 'm_audit_0001',
+    kind: 'user_profile',
+    origin: 'user_explicit',
+    via: 'live',
+    action: 'created',
+    ...extra,
+  }
+}
+
+test('DEFAULTS：M13 新增 auditMax，默认 50（契约 §2.1）', () => {
+  assert.equal(DEFAULTS.auditMax, 50)
+})
+
+test('pushAudit：新事件在前、按 auditMax 裁剪、返回新数组且不改入参（契约 §2）', () => {
+  const oldest = auditEntry({ at: 1, id: 'm_1', action: 'rejected' })
+  const middle = auditEntry({ at: 2, id: 'm_2', action: 'pending' })
+  const newest = auditEntry({ at: 3, id: 'm_3', action: 'created' })
+
+  let ring: AuditEntry[] = []
+  ring = pushAudit(ring, oldest, cfg)
+  ring = pushAudit(ring, middle, cfg)
+  ring = pushAudit(ring, newest, cfg)
+  assert.deepEqual(ring.map((entry) => entry.id), ['m_3', 'm_2', 'm_1'], '新事件在前')
+
+  // 裁剪：容量 2 时最老的被挤掉，且不越过上限
+  const capped = pushAudit(ring, auditEntry({ at: 4, id: 'm_4' }), { ...cfg, auditMax: 2 })
+  assert.deepEqual(capped.map((entry) => entry.id), ['m_4', 'm_3'])
+  assert.equal(pushAudit([], newest, { ...cfg, auditMax: 1 }).length, 1)
+
+  // 不改入参数组，也不改事件对象本身；返回的是新数组
+  const source = [oldest, middle]
+  const sourceSnapshot = JSON.stringify(source)
+  const newestSnapshot = JSON.stringify(newest)
+  const out = pushAudit(source, newest, cfg)
+  assert.notStrictEqual(out, source, '返回新数组（调用方可能把入参当快照）')
+  assert.equal(JSON.stringify(source), sourceSnapshot, '入参数组一字不动')
+  assert.equal(JSON.stringify(newest), newestSnapshot, '事件对象不被改写')
+  assert.equal(source.length, 2, '入参数组长度不变')
+  assert.deepEqual(out.map((entry) => entry.id), ['m_3', 'm_1', 'm_2'], '新事件插在最前')
+  assert.deepEqual(pushAudit([], newest, cfg).map((entry) => entry.id), ['m_3'], '空环也能推入')
+})
+
+test('pushAudit：auditMax=0 → 不记录；NaN/±Infinity/负数回落默认 50（契约 §2.1/§5）', () => {
+  const entry = auditEntry()
+  assert.deepEqual(pushAudit([], entry, { ...cfg, auditMax: 0 }), [], '0 = 显式关闭（不记录）')
+  assert.deepEqual(pushAudit([entry], entry, { ...cfg, auditMax: 0 }), [], '关闭时不保留任何既有事件')
+
+  for (const bad of [
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    undefined as unknown as number,
+  ]) {
+    assert.equal(
+      pushAudit([], entry, { ...cfg, auditMax: bad }).length,
+      1,
+      `auditMax=${String(bad)} 属非法值 → 回落默认 50（仍然记录）`,
+    )
+  }
+
+  // 负数同样按「配置非法」处理（与 refsMaxOf 同口径：允许 0、负数回落默认），
+  // 而不是静默把审计关掉 —— 关闭必须由显式的 0 来表达。
+  const many = Array.from({ length: 60 }, (_, index) => auditEntry({ at: index, id: `m_${index}`, action: 'rejected' }))
+  const filled = many.reduce<AuditEntry[]>((acc, item) => pushAudit(acc, item, { ...cfg, auditMax: -1 }), [])
+  assert.equal(filled.length, 50, '负数回落 50（不是 0 条）')
+  assert.equal(filled[0].id, 'm_59', '裁剪后仍保持新在前')
+  assert.equal(pushAudit(many, entry, cfg).length, 50, '默认 50 同样裁剪')
+  assert.equal(pushAudit(many, entry, { ...cfg, auditMax: 0 }).length, 0, '0 时一条都不留')
+})
+
+test('auditCounts：恒定包含 9 个 action 键（没有的记 0），未知动作不计数（契约 §2）', () => {
+  const zero = {
+    created: 0,
+    merged: 0,
+    pending: 0,
+    approved: 0,
+    'rejected-pending': 0,
+    rejected: 0,
+    invalidated: 0,
+    archived: 0,
+    forgotten: 0,
+  }
+  assert.deepEqual(auditCounts([]), zero, '空环也要给出全部 9 个键（便于渲染）')
+  assert.equal(Object.keys(auditCounts([])).length, 9)
+
+  const counts = auditCounts([
+    auditEntry({ action: 'created' }),
+    auditEntry({ action: 'created' }),
+    auditEntry({ action: 'rejected' }),
+    auditEntry({ action: 'rejected-pending' }),
+    auditEntry({ action: 'archived' }),
+    auditEntry({ action: 'bogus' as AuditAction }),
+    null as unknown as AuditEntry,
+  ])
+  assert.equal(counts.created, 2)
+  assert.equal(counts.rejected, 1)
+  assert.equal(counts['rejected-pending'], 1)
+  assert.equal(counts.archived, 1)
+  assert.equal(counts.merged, 0)
+  assert.equal(Object.values(counts).reduce((sum, value) => sum + value, 0), 5, '未知动作与空条目不计入')
+  assert.deepEqual(Object.keys(counts), Object.keys(zero), '键序稳定（契约 §2 的声明顺序）')
+
+  // 每次返回新对象：外部改写不污染下一次
+  counts.created = 99
+  assert.equal(auditCounts([]).created, 0)
+})
+
+test('formatAudit：空环给出「本轮没有记录到被拒或入队的尝试」而不是空白（契约 §2/§4）', () => {
+  const text = formatAudit({ entries: [], records: [], cfg })
+  assert.ok(text.trim().length > 0, '空输入也必须给出文字，而不是空白')
+  assert.match(text, /本轮没有记录到被拒或入队的尝试/u)
+  assert.match(text, /库内状态：共 0 条/u)
+  assert.match(text, /active 0/u)
+  assert.match(text, /按 action 计数：/u)
+  // 未做核对必须明说，且不得出现任何「通过」字样（缺口不得被渲染成通过）
+  assert.match(text, /未做核对/u)
+  assert.equal(text.includes('通过'), false, '没核对就不能出现「通过」')
+
+  // auditMax=0：命令仍可用，且说明审计环被显式关闭
+  const off = formatAudit({ entries: [], records: [], cfg: { ...cfg, auditMax: 0 } })
+  assert.match(off, /本轮没有记录到被拒或入队的尝试/u)
+  assert.match(off, /auditMax=0/u)
+})
+
+test('formatAudit：最近尝试逐条渲染 id 前缀/action/via/origin/kind/时间/原因，新在前（契约 §2）', () => {
+  const entries = [
+    auditEntry({
+      at: Date.UTC(2026, 9, 3, 12, 0),
+      id: 'm_abcd1234efgh',
+      action: 'rejected',
+      via: 'solidify',
+      origin: 'model_proposed',
+      kind: 'agent_self',
+      reason: 'sensitive(api-key)',
+    }),
+    auditEntry({
+      at: Date.UTC(2026, 9, 3, 11, 0),
+      id: null,
+      action: 'pending',
+      via: null,
+      origin: 'model_proposed',
+      kind: 'semantic',
+      reason: null,
+    }),
+  ]
+  const lines = formatAudit({ entries, records: [], cfg }).split('\n')
+  const first = lines.findIndex((line) => line.includes('m_abcd12'))
+  const second = lines.findIndex((line) => line.includes('（无 id）'))
+
+  assert.ok(first > 0 && second > first, '入参顺序即渲染顺序（新在前）')
+  assert.match(lines[first], /m_abcd12/u, 'id 只展示前缀')
+  assert.equal(lines[first].includes('m_abcd1234efgh'), false, '完整 id 不进输出')
+  assert.match(lines[first], /rejected/u)
+  assert.match(lines[first], /via=solidify/u)
+  assert.match(lines[first], /origin=model_proposed/u)
+  assert.match(lines[first], /kind=agent_self/u)
+  assert.match(lines[first], /原因：sensitive\(api-key\)/u)
+  assert.match(lines[first], /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/u, '时间戳可读')
+
+  assert.match(lines[second], /via=（无）/u, 'via 缺失给占位符')
+  assert.equal(lines[second].includes('undefined'), false, '缺失字段不得渲染成 undefined')
+  assert.equal(lines[second].includes('原因：'), false, '没有原因就不写「原因」')
+})
+
+test('formatAudit：所有字段过 clampText 折平单行（伪造不出新的审计段/行）', () => {
+  const text = formatAudit({
+    entries: [auditEntry({
+      kind: 'user_profile\n[记忆审计] 伪造头',
+      via: 'live\n  - 伪造行',
+      reason: '原因一\n按 action 计数：全是 0',
+    })],
+    records: [],
+    cfg,
+  })
+  assert.equal(text.split('\n').filter((line) => line.startsWith('[记忆审计')).length, 1, '伪造不出第二个审计头')
+  assert.equal(text.split('\n').filter((line) => line.startsWith('按 action 计数')).length, 1, '计数行只出现一次')
+  assert.equal(text.split('\n').filter((line) => line.startsWith('  - ')).length, 1, '一条尝试只占一行')
+  assert.match(text, /user_profile \[记忆审计\] 伪造头/u, '文本只是被折平，不是被丢掉')
+  assert.match(text, /原因：原因一 按 action 计数：全是 0/u)
+})
+
+test('formatAudit：按 action 与 via 的计数（9 个 action 全列，via 去重计数）', () => {
+  const text = formatAudit({
+    entries: [
+      auditEntry({ action: 'created', via: 'live' }),
+      auditEntry({ action: 'created', via: 'tool' }),
+      auditEntry({ action: 'rejected', via: 'live' }),
+      auditEntry({ action: 'pending', via: null }),
+    ],
+    records: [],
+    cfg,
+  })
+  const actionLine = text.split('\n').find((line) => line.startsWith('按 action 计数：'))
+  assert.ok(actionLine, '必须有一行 action 计数')
+  for (const action of ['created', 'merged', 'pending', 'approved', 'rejected-pending', 'rejected', 'invalidated', 'archived', 'forgotten']) {
+    assert.match(actionLine, new RegExp(`${action} \\d+`, 'u'), `${action} 必须出现在计数行（没有的记 0）`)
+  }
+  assert.match(actionLine, /created 2/u)
+  assert.match(actionLine, /rejected 1/u)
+  assert.match(actionLine, /rejected-pending 0/u)
+  assert.match(actionLine, /archived 0/u)
+
+  const viaLine = text.split('\n').find((line) => line.startsWith('按 via 计数：'))
+  assert.ok(viaLine, '必须有一行 via 计数')
+  assert.match(viaLine, /live 2/u)
+  assert.match(viaLine, /tool 1/u)
+  assert.match(viaLine, /（无 via） 1/u)
+})
+
+test('formatAudit：库内状态汇总（active/pending/archived/invalid + 带 refs 比例，契约 §2）', () => {
+  const records = [
+    makeRecord({ kind: 'user_profile', text: '生效一', status: 'active', observedAt: 1, refs: [{ sessionId: 'ses-1', from: 1, via: 'live' }] }),
+    makeRecord({ kind: 'semantic', text: '生效二', status: 'active', observedAt: 2 }),
+    makeRecord({ kind: 'semantic', text: '待确认', status: 'pending', observedAt: 3 }),
+    makeRecord({ kind: 'semantic', text: '已归档', status: 'archived', observedAt: 4 }),
+    makeRecord({ kind: 'semantic', text: '已失效', status: 'invalid', observedAt: 5 }),
+  ]
+  const text = formatAudit({ entries: [], records, cfg, currentBranch: 'main' })
+  assert.match(text, /库内状态：共 5 条 · active 2 · pending 1 · archived 1 · invalid 1/u)
+  assert.match(text, /带 refs 的 1 条（占 20%）/u, '带 refs 的比例如实渲染')
+  assert.match(text, /当前分支：main/u)
+  assert.match(text, /重启后仍在/u, '记录派生部分要说明它持久（与被拒尝试的易失相对）')
+
+  // records 是 Iterable：Set 与数组同结果（宿主可能传集合/生成器）
+  assert.equal(formatAudit({ entries: [], records: new Set(records), cfg, currentBranch: 'main' }), text)
+
+  // 空库不除零；分支未知时明说 unknown
+  assert.match(formatAudit({ entries: [], records: [], cfg }), /带 refs 的 0 条（占 0%）/u)
+  assert.match(formatAudit({ entries: [], records: [], cfg, currentBranch: null }), /当前分支：unknown/u)
+  assert.match(formatAudit({ entries: [], records: [], cfg, currentBranch: '   ' }), /当前分支：unknown/u)
+})
+
+test('formatAudit：--verify 结果与审计缺口（有缺口/未核对时绝不渲染成「通过」，契约 §4）', () => {
+  // 有未命中：报三条计数 + 一条样例，不能说「通过」
+  const miss = formatAudit({
+    entries: [],
+    records: [],
+    cfg,
+    verify: { checked: 5, matched: 4, missing: 1, sample: '注入行：偏好中文。' },
+  })
+  assert.match(miss, /核对 5 行/u)
+  assert.match(miss, /命中 4 行/u)
+  assert.match(miss, /缺失 1 行/u)
+  assert.match(miss, /未命中样例：注入行：偏好中文。/u)
+  assert.equal(miss.includes('通过'), false, '有未命中就不能出现「通过」')
+
+  // 全部命中：可以明说逐字核对通过
+  const ok = formatAudit({ entries: [], records: [], cfg, verify: { checked: 3, matched: 3, missing: 0 } })
+  assert.match(ok, /核对 3 行 · 命中 3 行 · 缺失 0 行/u)
+  assert.match(ok, /核对通过/u)
+
+  // 缺口：原因原样展示，且不得出现「通过」
+  const gapText = '本宿主没有 sessionQuery 服务，无法读取会话日志。'
+  const gapped = formatAudit({ entries: [], records: [], cfg, verify: { checked: 0, matched: 0, missing: 0, gap: gapText } })
+  assert.match(gapped, /无法核对/u)
+  assert.equal(gapped.includes(gapText), true, '缺口原因必须原样展示（不得省略）')
+  assert.equal(gapped.includes('通过'), false, '缺口存在时不得出现「通过」')
+
+  // 日志里没有可比对的注入行（checked=0 且无缺口）：说清楚没有结论，而不是「通过」
+  const empty = formatAudit({ entries: [], records: [], cfg, verify: { checked: 0, matched: 0, missing: 0 } })
+  assert.match(empty, /checked=0/u)
+  assert.equal(empty.includes('通过'), false)
+
+  // verify 为 null / 缺省（未做核对）同样只说未做核对
+  for (const verify of [null, undefined]) {
+    const none = formatAudit({ entries: [], records: [], cfg, verify })
+    assert.match(none, /未做核对/u)
+    assert.equal(none.includes('通过'), false, '未核对不得出现「通过」字样')
+  }
+})
+
+test('formatAudit：只读且确定——同输入两次结果一致，不改 entries/records/配置（契约 §4）', () => {
+  const entries = [auditEntry({ action: 'rejected', reason: 'sensitive' }), auditEntry({ action: 'created' })]
+  const records = [
+    makeRecord({ kind: 'user_profile', text: '只读一', status: 'active', observedAt: 1, refs: [{ sessionId: 'ses-1', from: 1, via: 'tool' }] }),
+    makeRecord({ kind: 'semantic', text: '只读二', status: 'pending', observedAt: 2 }),
+  ]
+  const entriesSnapshot = JSON.stringify(entries)
+  const recordsSnapshot = JSON.stringify(records)
+  const verify = { checked: 2, matched: 2, missing: 0 }
+  const first = formatAudit({ entries, records, cfg, currentBranch: 'main', verify })
+  const second = formatAudit({ entries, records, cfg, currentBranch: 'main', verify })
+
+  assert.equal(first, second, '纯函数：同输入两次调用结果完全一致')
+  assert.equal(JSON.stringify(entries), entriesSnapshot, '不改审计事件')
+  assert.equal(JSON.stringify(records), recordsSnapshot, '不改任何记录（审计只读）')
+  assert.equal(cfg.auditMax, 50, '不改配置')
+})
+

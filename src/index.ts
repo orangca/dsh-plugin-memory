@@ -38,6 +38,7 @@ import type {
 } from './types.js'
 import {
   DEFAULTS,
+  auditCounts,
   branchFromHeadContent,
   branchOf,
   buildSleepPlan,
@@ -57,6 +58,7 @@ import {
   fillWithinBudget,
   findConflicts,
   fnv1a,
+  formatAudit,
   formatBranchSummary,
   formatRefs,
   formatSleepPlan,
@@ -81,6 +83,7 @@ import {
   planPortraitUpdate,
   portraitHistory,
   portraitSubjectFor,
+  pushAudit,
   recallRecords,
   recordHash,
   refsOf,
@@ -101,7 +104,7 @@ import {
 } from './lib.js'
 // 自画像 v2（M6-A）新增的纯函数与类型：签名冻结在 docs/self-portrait.md 第 3 节。
 // 类型用 `import type` 引入（verbatimModuleSyntax）：它们只参与编译期检查，运行期不存在。
-import type { Language, PortraitAction, PortraitCandidate, PortraitDecision, SelfFacet } from './lib.js'
+import type { AuditAction, AuditEntry, Language, PortraitAction, PortraitCandidate, PortraitDecision, SelfFacet } from './lib.js'
 // M8（/sleep）纯函数层的类型：签名冻结在 docs/sleep.md 第 4 节，由 lib.ts 提供。
 // 宿主只按签名调用；`SleepCandidate` 的运行期字段比声明多时也不依赖（见 sleepBackfillInput）。
 import type { SleepCandidate, SleepPlan, SleepSessionInput } from './lib.js'
@@ -540,6 +543,12 @@ interface PluginState {
   budget: BudgetCheck | null
   turnBuffer: TurnBuffer
   recentEvents: Array<string | undefined>
+  /**
+   * M13：内存尝试环（契约 docs/audit.md §1/§3.1）—— 只放**没有落盘 / 需要解释的尝试**
+   * （被拒、入队、批准、拒绝待确认…）；成功的写事件由记录本身派生，不在这里。
+   * 有界（容量 `cfg.auditMax`，`0` ＝ 不记录）、新事件在前、**重启即失**。
+   */
+  audit: AuditEntry[]
 }
 
 /** 自报告文档（写盘给开发期诊断用）。 */
@@ -646,6 +655,8 @@ interface MemoryCommandHandlers extends Record<string, CommandHandler> {
   'reject-pending'(args: string[]): Promise<DshCommandResult>
   clear(args: string[]): Promise<DshCommandResult>
   import(args: string[]): Promise<DshCommandResult>
+  /** M13：审计视图（`/memory audit [--limit N] [--verify]`，只读）。 */
+  audit(args: string[]): Promise<DshCommandResult>
   stats(): DshCommandResult
   consolidate(): Promise<DshCommandResult>
   /** `/memory self …`：查看/设定/查看修订链/重置自画像（契约 4.3）。 */
@@ -657,6 +668,12 @@ interface MemoryCommandHandlers extends Record<string, CommandHandler> {
 interface MemoryConfigExtras {
   exportDir?: string
   simulateCaptureError?: boolean
+  /**
+   * M13：故障注入（与 `simulateCaptureError` 同一套路，只走 patch 行，不进设置页）。
+   * 置 true 时**每一次审计推事件都会抛**，用来证明「审计失败不影响写入/注入主流程」——
+   * 默认缺省即与 0.5.13 逐字节相同。
+   */
+  simulateAuditError?: boolean
   /**
    * M6-A 在 `MemoryConfig` / `DEFAULTS` 里新增的 7 个自画像键（契约 3.1）。
    * 这里同样声明一遍：`cfg` 是 `MemoryConfig & MemoryConfigExtras`，两边都声明时取交集，
@@ -792,6 +809,9 @@ function buildConfig(useVolatile: boolean): ReturnType<SchemaFactory['object']> 
     language: field(Schema!.union(['zh', 'en']).default('zh')),
     // 出厂**不播种**（与 lib.js 的 DEFAULTS.seed 保持一致）：播种的演示记忆会进真实用户上下文
     seed: Schema!.boolean().default(false),
+    // M13：审计尝试环容量（契约 docs/audit.md §2.1）——类型与默认值必须与 lib.ts 的 DEFAULTS 逐字一致。
+    // 标 volatile：用户在设置页要能改（表单 29 → 30 字段；客户端字段由 client 半边的 M13 补齐）。
+    auditMax: field(Schema!.number().default(50)),
   })
 }
 
@@ -985,6 +1005,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     budget: null,
     turnBuffer: { user: [], assistant: [], tools: [], lastAt: 0, closedAt: 0 },
     recentEvents: [],
+    // M13：审计尝试环（新在前、有界；容量与裁剪交给 lib 的 pushAudit）
+    audit: [],
   }
 
   let domain: DshDomain | null = null
@@ -1104,6 +1126,13 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         // M9：refs（序号跟踪 + 附着/核对计数）
         seq: { ...state.seq },
         refs: refsSummary(),
+        // M13：审计尝试环（新在前、有界；成功写入由记录派生，见 audit 命令）
+        audit: {
+          entries: state.audit.length,
+          capacity: Number.isFinite(cfg.auditMax) ? cfg.auditMax : DEFAULTS.auditMax,
+          last: state.audit[0] ?? null,
+          actions: auditCounts(state.audit),
+        },
         self: {
           added: state.self.added,
           refined: state.self.refined,
@@ -1253,6 +1282,54 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
 
   /** 用户命令路径的单点引用（`/memory pin|archive|restore|refresh|confirm|reject` 走这里）。 */
   const commandRefs = (): MemoryRef[] => pendingRefs({ refVia: 'command' })
+
+  // ---------------- M13：写入审计（尝试环，契约 docs/audit.md §3.1） ----------------
+  //
+  // 三条硬约束（§1/§4），实现时必须原样守住：
+  //   · **不为审计新增存储**：成功的写事件由记录本身派生（`observedAt`/`origin`/`refs.via`/`status`），
+  //     只有**没有落盘的尝试**（被拒/入队/批准/拒绝待确认）进这个内存环 —— 不留第二份真相；
+  //   · **有界、重启即失**：容量由 `cfg.auditMax` 决定（`0` ＝ 不记录），「新在前」与「不改入参数组」
+  //     由 lib 的 `pushAudit`（上游已冻结）负责，宿主只负责推；
+  //   · **审计失败不影响主流程**：每一次推入都包在 try/catch 里 —— 审计是观测，不是前置条件。
+  //     因此调用方**永远不需要**为审计再写 try/catch。
+
+  /** 一条记录派生出来的 `via`（refs 的来源路径：live|tool|command|solidify|sleep|import）；没有则 null。 */
+  const viaOfRecord = (record: MemoryRecord | null | undefined): string | null => {
+    try {
+      return refsOf(record)[0]?.via ?? null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 推一条审计尝试（契约 §3.1）。
+   *
+   * `reason` 取**既有错误码**（`rejected_sensitive` / `rejected_echo` / `pending_queue_full` …），
+   * 这样审计输出与工具返回值能对上号；`via` 取该记录 refs 的 via（没有记录 / 没有引用 → null）。
+   */
+  const auditPush = (action: AuditAction, fields: {
+    id?: string | null
+    kind?: unknown
+    origin?: unknown
+    via?: string | null
+    reason?: string | null
+  } = {}): void => {
+    try {
+      // 故障注入：证明「审计抛异常时写入照常成功」（默认缺省 → 零影响）。
+      if (cfg.simulateAuditError === true) throw new Error('simulated audit failure (fault injection)')
+      const entry: AuditEntry = {
+        at: Date.now(),
+        id: fields.id === null || fields.id === undefined ? null : String(fields.id),
+        kind: typeof fields.kind === 'string' ? fields.kind : String(fields.kind ?? ''),
+        origin: typeof fields.origin === 'string' ? fields.origin : String(fields.origin ?? ''),
+        via: fields.via ?? null,
+        action,
+      }
+      if (fields.reason !== undefined) entry.reason = fields.reason
+      state.audit = pushAudit(state.audit, entry, cfg)
+    } catch { /* 审计失败绝不影响写入/注入主流程 */ }
+  }
 
   /**
    * `makeRecord` 会拷贝 `input.refs`，所以「完全跳过」必须在这里也关掉一道：
@@ -1586,6 +1663,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     await persist(target)
     state.writes.merged += 1
     state.self.refined += 1
+    // M13：reinforce / refine 是「合并到既有条目」（不是新建）——审计按 merged 记。
+    auditPush('merged', { id: target.id, kind: target.kind, origin: target.origin, via: viaOfRecord(target) })
     flush()
     return { ok: true, status: 'merged', id: target.id, record: target, boosted: false, portrait: plan.outcome }
   }
@@ -1620,10 +1699,13 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       target.status = 'archived'
       asPortrait(target).supersededBy = record.id
       await persist(target)
+      // M13：被取代的旧条目归档也是「库内状态变化」，如实记一条。
+      auditPush('archived', { id: target.id, kind: target.kind, origin: target.origin, via: viaOfRecord(target) })
     }
     await persist(record)
     state.writes.created += 1
     state.self.superseded += 1
+    auditPush('created', { id: record.id, kind: record.kind, origin: record.origin, via: viaOfRecord(record) })
     flush()
     return { ok: true, status: 'created', id: record.id, record, portrait: plan.outcome }
   }
@@ -1631,18 +1713,21 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   /** 写入：敏感过滤 → PII 脱敏 → 回声剔除 → 自画像收敛 → hash 去重合并 → 落盘。（工具与命令共用） */
   const writeMemory = async (input: WriteMemoryInput): Promise<WriteMemoryResult> => {
     let text = String(input.text ?? '')
+    // 来源判定先算出来（纯读取）：审计在**每一条 early return** 上都要拿到与记录一致的 origin。
+    const origin = input.origin ?? 'model_proposed'
     const sensitive = scanSensitive(text)
     if (sensitive) {
       state.writes.rejected += 1
+      auditPush('rejected', { kind: input.kind, origin, reason: 'rejected_sensitive' })
       flush()
       return { ok: false, error: `rejected_sensitive: 命中 ${sensitive}，长期记忆默认不保存敏感信息` }
     }
     // 硬秘密（密钥/私钥/密码/身份证/银行卡）在上面已拒写；邮箱与手机号按策略脱敏（设计稿 §8.3）
     if (cfg.piiPolicy !== 'reject') text = maskPii(text)
     // 防自激闸门 2：模型自评若只是复述刚注入的内容，不作为「新观察」写入。
-    const origin = input.origin ?? 'model_proposed'
     if (origin === 'model_proposed' && isEcho(text, [...state.injected.section, ...state.injected.context], cfg.echoThreshold)) {
       state.writes.rejected += 1
+      auditPush('rejected', { kind: input.kind, origin, reason: 'rejected_echo' })
       flush()
       return { ok: false, error: 'rejected_echo: 与刚注入的记忆高度相似（疑似复述），不作为新观察' }
     }
@@ -1657,6 +1742,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     const decision = decideModelWrite(cfg.writePolicy, origin)
     if (decision === 'reject') {
       state.writes.rejected += 1
+      auditPush('rejected', { kind: input.kind, origin, reason: 'rejected_write_policy' })
       flush()
       return {
         ok: false,
@@ -1677,6 +1763,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       })
       if (origin === 'model_proposed' && state.rejectedHashes.has(queuedHash)) {
         state.writes.rejected += 1
+        auditPush('rejected', { kind: input.kind, origin, reason: 'rejected_by_user' })
         flush()
         return { ok: false, error: 'rejected_by_user: 这类自我观察已被用户拒绝过' }
       }
@@ -1684,6 +1771,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (pendingQueueFull(pendingCount, cfg)) {
         const max = Number.isFinite(cfg.pendingMax) ? cfg.pendingMax : DEFAULTS.pendingMax
         state.writes.rejected += 1
+        auditPush('rejected', { kind: input.kind, origin, reason: 'pending_queue_full' })
         flush()
         return {
           ok: false,
@@ -1700,13 +1788,17 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         status: 'pending',
         subject: input.subject,
       })
-      if (!queued.text) return { ok: false, error: 'rejected_invalid: text 不能为空' }
+      if (!queued.text) {
+        auditPush('rejected', { kind: input.kind, origin, reason: 'rejected_invalid' })
+        return { ok: false, error: 'rejected_invalid: text 不能为空' }
+      }
       // M9：待确认记录照常带引用与指纹（指纹不含 status/refs，因此批准后去重仍然对得上）。
       queued.status = 'pending'
       attachRefs(queued, pendingRefs(input))
       queued.hash = recordHash(queued)
       await persist(queued)
       state.writes.pending += 1
+      auditPush('pending', { id: queued.id, kind: queued.kind, origin: queued.origin, via: viaOfRecord(queued) })
       flush()
       return { ok: true, pending: true, id: queued.id, text: queued.text }
     }
@@ -1720,6 +1812,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (planned) {
         if (planned.decision.action === 'skip') {
           state.self.skipped += 1
+          auditPush('rejected', { kind: 'agent_self', origin, reason: 'portrait_skipped' })
           flush()
           return { ok: false, error: `portrait_skipped: ${planned.decision.reason}`, portrait: planned.outcome }
         }
@@ -1743,12 +1836,16 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       subject: portraitPlan ? portraitPlan.outcome.subject : input.subject,
       confidence: portraitPlan ? portraitPlan.decision.confidence : input.confidence,
     })
-    if (!record.text) return { ok: false, error: 'rejected_invalid: text 不能为空' }
+    if (!record.text) {
+      auditPush('rejected', { kind: record.kind, origin, reason: 'rejected_invalid' })
+      return { ok: false, error: 'rejected_invalid: text 不能为空' }
+    }
     // M9：新建的条目带上本次写入的引用（指纹不受影响，§5）。
     attachRefs(record, incomingRefs)
     // 用户明确拒绝过的自我观察不再重复产生（/memory reject 会登记指纹）
     if (origin === 'model_proposed' && state.rejectedHashes.has(record.hash)) {
       state.writes.rejected += 1
+      auditPush('rejected', { kind: record.kind, origin, reason: 'rejected_by_user' })
       flush()
       return { ok: false, error: 'rejected_by_user: 这类自我观察已被用户拒绝过' }
     }
@@ -1776,6 +1873,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       attachRefs(merged, incomingRefs)
       await persist(merged)
       state.writes.merged += 1
+      auditPush('merged', { id: merged.id, kind: merged.kind, origin: merged.origin, via: viaOfRecord(merged) })
       flush()
       return { ok: true, status: 'merged', id: merged.id, record: merged, boosted: isNewSession }
     }
@@ -1783,6 +1881,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     await persist(record)
     state.writes.created += 1
     if (portraitPlan) state.self.added += 1
+    auditPush('created', { id: record.id, kind: record.kind, origin: record.origin, via: viaOfRecord(record) })
     flush()
     return {
       ok: true,
@@ -2491,6 +2590,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           extra.status = 'archived'
           await persist(extra)
           summary.merged += 1
+          // M13：被领头者吸收的重复条目（归档不删）——审计记为 merged，与 summary.merged 同口径。
+          auditPush('merged', { id: extra.id, kind: extra.kind, origin: extra.origin, via: viaOfRecord(extra) })
         }
         await persist(lead)
       }
@@ -2503,6 +2604,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         await persist(loser)
         await persist(winner)
         summary.invalidated += 1
+        auditPush('invalidated', { id: loser.id, kind: loser.kind, origin: loser.origin, via: viaOfRecord(loser) })
       }
       // 3) 衰减与归档
       for (const record of listActive(branchVisible(state.records.values()))) {
@@ -2511,6 +2613,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           record.status = 'archived'
           await persist(record)
           summary.archived += 1
+          auditPush('archived', { id: record.id, kind: record.kind, origin: record.origin, via: viaOfRecord(record) })
         }
       }
       // 4) 规则式摘要（零模型调用；摘要条目标记 summary，不再参与后续整合）
@@ -2911,6 +3014,13 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           pending: pendingPool().length,
           pendingMax: Number.isFinite(cfg.pendingMax) ? cfg.pendingMax : DEFAULTS.pendingMax,
           pendingPath: '模型写入进入待确认队列；只有用户能用 /memory approve <id 前缀> 让它生效（模型无法自我批准）。',
+          // M13：审计的结构化字段（与 stats 文本那行同口径；详细看 /memory audit）
+          audit: {
+            entries: state.audit.length,
+            records: state.records.size,
+            mismatchChecks: refsSummary().mismatched,
+            auditMax: Number.isFinite(cfg.auditMax) ? cfg.auditMax : DEFAULTS.auditMax,
+          },
           writes: { ...state.writes },
         })
       },
@@ -3053,6 +3163,102 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       items: [...state.records.values()].filter((record) => record.status !== ('deleted' as MemoryRecord['status'])),
     }, null, 2))
     return file
+  }
+
+  // ---------------- M13：`/memory audit`（只读；契约 docs/audit.md §3.2） ----------------
+  //
+  // 命令**只读**：不写记录、不改状态、不动任何计数器（连审计环自己都不推 —— 审计读取不该被审计，
+  // 否则一次 `--verify` 会改变下一次 `--verify` 的输入）。渲染交给 lib 的 `formatAudit`（上游已冻结）。
+
+  /** `--limit` 的口径（契约 §3.2）：默认 20，上限 200；非法值回落默认值。 */
+  const AUDIT_LIMIT_DEFAULT = 20
+  const AUDIT_LIMIT_MAX = 200
+
+  interface AuditCommandArgs {
+    limit: number
+    verify: boolean
+  }
+
+  /**
+   * 解析 `/memory audit [--limit N] [--verify]`。
+   *
+   * `--limit=N` 与 `--limit N` 两种写法都认；`--limit` 后面紧跟另一个开关时**不吞掉**它
+   * （否则 `--limit --verify` 会把 --verify 吃掉）。未知参数忽略，与其它子命令同一口径。
+   */
+  const parseAuditArgs = (args: readonly string[]): AuditCommandArgs => {
+    let limit = AUDIT_LIMIT_DEFAULT
+    let verify = false
+    const limitOf = (raw: string): number => {
+      const value = Number.parseInt(raw, 10)
+      return Number.isFinite(value) && value > 0 ? Math.min(AUDIT_LIMIT_MAX, value) : AUDIT_LIMIT_DEFAULT
+    }
+    for (let index = 0; index < args.length; index += 1) {
+      const part = String(args[index] ?? '')
+      if (part === '--verify') { verify = true; continue }
+      if (part.startsWith('--limit=')) { limit = limitOf(part.slice('--limit='.length)); continue }
+      if (part === '--limit') {
+        const next = args[index + 1]
+        limit = next !== undefined && !String(next).startsWith('--') ? limitOf(String(next)) : AUDIT_LIMIT_DEFAULT
+        if (next !== undefined && !String(next).startsWith('--')) index += 1
+      }
+    }
+    return { limit, verify }
+  }
+
+  /** `--verify` 的结果（形状与 lib 的 `AuditInput.verify` 一致；缺口用 `gap` 如实说明）。 */
+  interface AuditVerifyResult {
+    checked: number
+    matched: number
+    missing: number
+    sample: string | null
+    gap: string | null
+  }
+
+  /** 一条会话事件里可核对的文本（与 `/memory verify` 同一抽取口径，另补 system/message）。 */
+  const auditEventText = (event: DshSessionEvent): string => {
+    const direct = refEventText(event)
+    if (direct.length > 0) return direct
+    if (event?.type === 'system/message') return textOfContent(event.data?.content)
+    return ''
+  }
+
+  /**
+   * `--verify`：把**本会话已注入的行**逐字比对到会话日志里（契约 §3.2）。
+   *
+   * 判定只有一种：日志文本 `includes(注入行)` —— 逐字就是逐字，不做 token 相似度，不做模糊匹配。
+   * 拿不到日志（没有 sessionQuery / 会话 id 未知 / 读失败 / 日志里没有 user/message 事件）时
+   * **如实报缺口**（`gap`），绝不把「没核对」渲染成「核对通过」。
+   */
+  const verifyInjection = async (): Promise<AuditVerifyResult> => {
+    const lines = [...state.injected.section, ...state.injected.context]
+      .filter((line): line is string => typeof line === 'string' && line.length > 0)
+    const gapOf = (gap: string): AuditVerifyResult => ({ checked: 0, matched: 0, missing: 0, sample: null, gap })
+    const sq = ctx.get<DshSessionQuery>('sessionQuery')
+    if (!sq || typeof sq.readSession !== 'function') {
+      return gapOf('本宿主没有 sessionQuery 服务，无法读会话日志核对注入内容。')
+    }
+    const sessionId = state.seq.sessionId !== '' ? state.seq.sessionId : String(state.lastSession?.id ?? '')
+    if (sessionId === '') {
+      return gapOf('当前会话 id 未知（本会话还没有 session/event），不知道要读哪一份日志。')
+    }
+    let events: DshSessionEvent[] = []
+    try {
+      const snapshot = await sq.readSession(sessionId)
+      events = Array.isArray(snapshot?.events) ? [...snapshot.events] : []
+    } catch (error) {
+      return gapOf(`读取会话 ${sessionId} 失败：${errorText(error)}`)
+    }
+    if (!events.some((event) => event?.type === 'user/message')) {
+      return gapOf(`会话 ${sessionId} 的日志里没有任何 user/message 事件，无法逐字核对注入内容。`)
+    }
+    const logText = events.map((event) => auditEventText(event)).filter((text) => text.length > 0).join('\n')
+    let matched = 0
+    let sample: string | null = null
+    for (const line of lines) {
+      if (logText.includes(line)) matched += 1
+      else if (sample === null) sample = line
+    }
+    return { checked: lines.length, matched, missing: lines.length - matched, sample, gap: null }
   }
 
   const handlers: MemoryCommandHandlers = {
@@ -3210,6 +3416,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
             await persist(record)
             state.writes.approved += 1
             state.self.refined += 1
+            auditPush('approved', { id: record.id, kind: record.kind, origin: record.origin, via: viaOfRecord(record) })
             flush()
             return {
               kind: 'success',
@@ -3225,6 +3432,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
             asPortrait(target).supersededBy = record.id
             record.supersedes = [...new Set([...(record.supersedes ?? []), target.id])]
             await persist(target)
+            auditPush('archived', { id: target.id, kind: target.kind, origin: target.origin, via: viaOfRecord(target) })
           }
           state.self.superseded += 1
         } else if (planned) {
@@ -3241,6 +3449,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
 
       await persist(record)
       state.writes.approved += 1
+      auditPush('approved', { id: record.id, kind: record.kind, origin: record.origin, via: viaOfRecord(record) })
       flush()
       const detail = record.kind === 'agent_self' ? '（自画像已在批准时收敛）' : ''
       return { kind: 'success', text: `已批准 ${record.id.slice(0, 8)}：status → active${detail}，从现在起它可以被注入。\n${record.text}` }
@@ -3261,6 +3470,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       attachRefs(record, commandRefs())
       await persist(record)
       state.writes.pendingRejected += 1
+      auditPush('rejected-pending', { id: record.id, kind: record.kind, origin: record.origin, via: viaOfRecord(record) })
       flush()
       return {
         kind: 'success',
@@ -3284,6 +3494,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (blocked) return blocked
       if (!(await remove(target.id))) return { kind: 'error', text: removeFailureText(target.id) }
       state.writes.deleted += 1
+      // M13：删除是不可逆的，审计必须留一条（记录本身已不在，审计是唯一痕迹）。
+      auditPush('forgotten', { id: target.id, kind: target.kind, origin: target.origin, via: viaOfRecord(target) })
       flush()
       return { kind: 'success', text: `已删除 ${target.id}\n${target.text}` }
     },
@@ -3492,6 +3704,38 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         return { kind: 'error', text: `导入失败：${errorText(error)}` }
       }
     },
+    /**
+     * M13：`/memory audit [--limit N] [--verify]`（契约 §3.2，**只读**）。
+     *
+     * 默认渲染「记录派生 + 尝试环」；`--verify` 额外核对本会话注入是否逐字出现在日志里。
+     * 渲染与核对都在 try/catch 里：审计不可用也绝不能让命令抛给宿主。
+     */
+    async audit(args: string[]): Promise<DshCommandResult> {
+      const parsed = parseAuditArgs(args)
+      let verify: AuditVerifyResult | null = null
+      if (parsed.verify) {
+        try {
+          verify = await verifyInjection()
+        } catch (error) {
+          // 核对本身出错也是「缺口」，不是「通过」。
+          verify = { checked: 0, matched: 0, missing: 0, sample: null, gap: `核对过程异常：${errorText(error)}` }
+        }
+      }
+      try {
+        return {
+          kind: 'success',
+          text: formatAudit({
+            entries: state.audit.slice(0, parsed.limit),
+            records: state.records.values(),
+            cfg,
+            currentBranch: currentBranch(),
+            verify,
+          }),
+        }
+      } catch (error) {
+        return { kind: 'error', text: `审计渲染失败：${errorText(error)}` }
+      }
+    },
     stats(): DshCommandResult {
       const byKind: Record<string, number> = {}
       for (const record of state.records.values()) byKind[record.kind] = (byKind[record.kind] ?? 0) + 1
@@ -3526,6 +3770,10 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
             + `（核对 命中 ${refs.verified} / 未命中 ${refs.mismatched}）`
             + (cfg.refsEnabled === false ? '；refsEnabled=false（新写入不附着引用）' : '')
             + (refs.lastError ? `；lastError=${refs.lastError}` : ''),
+          // M13：审计摘要（契约 §3.3）——「最近尝试几条、记录档几条、核对未命中几次」一眼可见；
+          // 详细内容（含 `--verify` 的注入核对）在 `/memory audit`。
+          `审计：最近尝试 ${state.audit.length} 条（记录档 ${state.records.size} 条）；`
+            + `核对未命中 ${refs.mismatched} 次（详见 /memory audit）`,
           `turn-stopping：plain=${state.turnStopping.plain}${state.turnStopping.last ? `，last=${state.turnStopping.last.at}（${state.turnStopping.last.channel}）` : '，last=none'}`,
           `设置页：${settingsLine()}`,
         ].join('\n'),
@@ -3702,7 +3950,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       return { kind: 'error', text: `未知的 self 子命令「${sub}」。${SELF_USAGE}` }
     },
     help(): DshCommandResult {
-      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | verify <id> | branch [--all] | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | pending | approve <id> | reject-pending <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
+      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | verify <id> | audit [--limit N] [--verify] | branch [--all] | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | pending | approve <id> | reject-pending <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
     },
   }
 
@@ -3930,6 +4178,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         extra.status = 'archived'
         await persist(extra)
         counts.merged += 1
+        auditPush('merged', { id: extra.id, kind: extra.kind, origin: extra.origin, via: viaOfRecord(extra) })
       }
       await persist(lead)
     }
@@ -3952,6 +4201,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       await persist(drop)
       await persist(keep)
       counts.invalidated += 1
+      auditPush('invalidated', { id: drop.id, kind: drop.kind, origin: drop.origin, via: viaOfRecord(drop) })
     }
 
     // 4) 归档（shouldArchive 已排除 pinned 与自画像，这里再防一层）。
@@ -3971,6 +4221,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       record.status = 'archived'
       await persist(record)
       counts.archived += 1
+      auditPush('archived', { id: record.id, kind: record.kind, origin: record.origin, via: viaOfRecord(record) })
     }
 
     // 5) 项目印象：同 workspace 只刷新不新增（与捕获路径同一策略）。
@@ -4115,7 +4366,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     ctx.commands.register({
       name: 'memory',
       description: '查看与管理长期记忆',
-      input: { hint: 'list | show <id> | verify <id> | branch [--all] | pending | self | forget <id> | export | stats' },
+      input: { hint: 'list | show <id> | verify <id> | audit [--limit N] [--verify] | branch [--all] | pending | self | forget <id> | export | stats' },
       handler: async (invocation) => {
         const parts = String(invocation?.rawInput ?? '').trim().split(/\s+/u).filter(Boolean)
         const sub = parts.shift() ?? 'list'

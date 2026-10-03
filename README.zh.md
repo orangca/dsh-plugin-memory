@@ -235,6 +235,38 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 
 `branchAware`（默认 `true`）在设置页表单里以 `0` / `1` 表达。
 
+## `/memory audit`：写入审计与注入核对
+
+不是每一次写入都会留下一行记录：**被拒**的写入什么都不留，于是「为什么这条没进记忆」没有答案。
+`/memory audit` 把两种视角摆在一起，却不留第二份真相：
+
+| 来源 | 覆盖 | 持久性 |
+|---|---|---|
+| **记录本身派生**（`observedAt` / `origin` / `refs.via` / `status` / `invalidAt` / `supersededBy`） | 成功的写入、合并、失效、归档、待确认 | **天然持久** —— 它就在库里，重启后仍在 |
+| **内存尝试环**（新，有界） | 没有落盘的尝试：被拒写（敏感 / 回声 / 审批策略 / 队列满）、入队、批准、拒绝待确认 | **进程内** —— 重启即清空，输出里会写明 |
+
+正因如此，审计**不新增存储**：成功的写事件由记录本身派生，只有「尝试」这一侧 —— 包括所有被拒的 —— 放进有界的环里。
+
+```
+/memory audit [--limit N] [--verify]
+```
+
+- **`--limit N`**：最多显示最近 N 条尝试（默认 `20`，上限 `200`；也认 `--limit=N`；缺值或非正数回落默认值）。
+  未知参数忽略，与其它子命令同口径。
+- **`--verify`**：核对**本会话自己注入的内容**是否出现在会话日志里 —— 注入快照里记录的每一行都与会话事件做
+  逐字 `includes` 比对。**逐字就是逐字**：不做 token 相似度、不做模糊匹配；输出 `checked` / `matched` /
+  `missing` 与一条未命中的样例。
+- **缺口要说出来，绝不藏。** 没有 `sessionQuery`、当前会话 id 未知、日志读不到、日志里没有任何 `user/message`
+  事件时，命令**明说「无法核对」及原因**；不带 `--verify` 时也会说明「本轮没有核对」。
+  「没核对」永远不会被渲染成「核对通过」—— 否则「模型可见 ⟺ 已记录」就失去意义。
+- **只读，且绝不挡路。** `/memory audit` 与 `--verify` 不改任何记录、不改状态、不动任何计数器 ——
+  读审计不会自己推一条审计事件（否则一次 `--verify` 会改变下一次的输入）。推事件、渲染、比对全部包在
+  `try/catch` 里：审计出异常也**不影响写入与注入**。
+- `auditMax`（默认 `50`）是环的容量；`0` = 不记录任何尝试（命令照常可用，库内汇总仍会显示）。
+  `/memory stats` 与 `memory_stats` 会带一行摘要（最近尝试 · 记录档条数 · 核对未命中次数），详细内容在这里。
+
+`auditMax`（默认 `50`）是设置页里的普通数字字段。
+
 ## 防「记忆污染 / 自激」
 
 - 自动捕获**只读真实用户消息**（插件自己注入的上下文不算）；
@@ -288,8 +320,8 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置表单在哪
 
-插件导出 schemastery `Config`，其中 **29 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
-同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 29 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
+插件导出 schemastery `Config`，其中 **30 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
+同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 30 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
 （列表里的行卡片上还有一行摘要）。
 
 实现上，客户端半边注册进 **keyed** 插槽 `plugins.row.config`，key 为
@@ -318,6 +350,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 /memory self history [subject]                   自画像修订链（旧 → 新，含归档时间）
 /memory self reset [persona|work]                归档当前自画像（保留历史，不删除）
 /memory verify <id prefix>                    回到引用指向的事件核对这条记忆的来源（只读）
+/memory audit [--limit N] [--verify]            写入审计：最近尝试 + 库内汇总；--verify 核对本会话注入是否逐字出现在会话日志里（只读）
 /memory export [path]                            导出 JSON
 /memory import <path>                            导入 JSON（按指纹去重；逐字段校验、数值夹取、`pinned` 强制关闭、来源一律降级为 `observed`）
 /memory clear --all --yes                        永久清空全部（`--all` 与下面的筛选条件互斥）
@@ -343,7 +376,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置
 
-在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 29 个字段：
+在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 30 个字段：
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -376,6 +409,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 | `pendingMax` | `50` | 待确认队列上限；满了拒绝新写入并报结构化错误，绝不静默丢弃；`0` = 不设上限 |
 | `language` | `zh` | **模型可见文本**的语言（`zh` / `en`）：注入块与块头/页脚、注入提示词、按轮召回块、工具描述。命令输出两种取值下都仍是中文；默认 `zh` 与 0.5.10 逐字节相同 |
 | `branchAware` | `true` | 按当前 git 分支过滤带标签的记录；表单里 `0`=关、`1`=开。关掉即完全忽略标签；默认 `true` 因存量记录都没有标签而与 0.5.12 逐字节相同 |
+| `auditMax` | `50` | **内存审计尝试环**的容量：只记录没有落盘的尝试（被拒 / 入队 / 批准 / 拒绝待确认）。成功的写事件由记录本身派生，所以审计不新增存储；`0` = 不记录（命令照常可用）；重启后环清空 |
 
 只能通过 patch 行设置的进阶旋钮（含默认值）：自画像条数 `selfPortraitMaxItems` 12 /
 `selfPortraitMaxSelfObserved` 4；捕获调优 `capturePerHour` 20、`captureMinConfidence` 0.6、

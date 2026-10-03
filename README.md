@@ -271,6 +271,44 @@ that holds only on `feat/x` should not keep steering the model after you switch 
 
 `branchAware` (default `true`) appears in the settings form as a `0` / `1` toggle.
 
+## `/memory audit`: write audit and injection verification
+
+Not every write leaves a row behind: a **rejected** write leaves nothing at all, so "why is this not in memory?" had
+no answer. `/memory audit` shows both views side by side without keeping a second copy of the truth:
+
+| Source | Covers | Persistence |
+|---|---|---|
+| **Derived from the records** (`observedAt` / `origin` / `refs.via` / `status` / `invalidAt` / `supersededBy`) | successful writes, merges, invalidations, archives, pending rows | **naturally persistent** — it is the store itself, so it survives a restart |
+| **In-memory attempt ring** (new, bounded) | attempts that never landed: rejected writes (sensitive / echo / write policy / queue full), queued, approved, rejected-pending | **process-local** — cleared on restart, and the output says so |
+
+That is why the audit adds **no storage**: successful write events are derived from the rows, and only the "attempts"
+view — including everything that was rejected — lives in the bounded ring.
+
+```
+/memory audit [--limit N] [--verify]
+```
+
+- **`--limit N`** shows at most `N` recent attempts (default `20`, capped at `200`; `--limit=N` is accepted too, and a
+  missing or non-positive value falls back to the default). Unknown arguments are ignored, as in every other
+  subcommand.
+- **`--verify`** checks **this session's own injection** against the session log: every line recorded in the injected
+  snapshot is compared with the session events with a literal `includes` test. **Verbatim means verbatim** — no token
+  similarity, no fuzzy matching; the output reports `checked` / `matched` / `missing` and one sample line that did not
+  match.
+- **A gap is stated, never hidden.** Without a `sessionQuery` service, with an unknown session id, when the log cannot
+  be read, or when the log contains no `user/message` event at all, the command says that it **cannot verify, and
+  why**. With no `--verify` at all it says that no check was run. "Not checked" is never rendered as "checked and
+  consistent" — otherwise "the model can see it ⟺ it was recorded" would mean nothing.
+- **Read-only, and it never gets in the way.** `/memory audit` and `--verify` modify no record, no state and no
+  counter — reading the audit does not push an audit event of its own (otherwise one `--verify` would change the next
+  one's input). Every push, render and comparison runs inside `try/catch`: an audit failure never blocks a write or an
+  injection.
+- `auditMax` (default `50`) caps the ring; `0` = record no attempts (the command still works and still shows the
+  store-derived summary). `/memory stats` and `memory_stats` carry a one-line summary (recent attempts · store rows ·
+  verification misses); the detail is here.
+
+`auditMax` (default `50`) is a plain number field in the settings form.
+
 ## Guarding against memory pollution / self-reinforcement
 
 - Capture reads **real user messages only** — the plugin's own injected context does not count.
@@ -328,9 +366,9 @@ Add this package to the profile's `dependencies`, append `dsh-plugin-memory` to
 
 ## The settings form
 
-The plugin exports a schemastery `Config` whose **29 fields** are declared `volatile()` (hot-applied when edited);
+The plugin exports a schemastery `Config` whose **30 fields** are declared `volatile()` (hot-applied when edited);
 everything else is patch-row only. It ships a small browser half (`src/client.ts`, built to `lib/client.js`) that
-renders those 29 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
+renders those 30 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
 also shows a one-line summary).
 
 Under the hood the client half registers into the keyed `plugins.row.config` slot with
@@ -358,6 +396,8 @@ whole Config through the settings service and persists it into the profile patch
 /memory self set <persona|work> [name|address_user|address_self] <text>            set/override it directly (user-side, pinned, confidence 1); a naming key on persona settles the names
 /memory self history [subject]                   self-portrait revision chain (old → new, with archival time)
 /memory self reset [persona|work]                archive the current self-portrait (history kept, nothing deleted)
+/memory audit [--limit N] [--verify]             write audit: recent attempts + store summary; --verify checks this session's injection against the session log (read-only)
+/memory verify <id prefix>                       walk back to the cited events and check where this memory came from (read-only)
 /memory export [path]                            export JSON
 /memory import <path>                            import JSON (deduplicated by fingerprint; every field is validated, numbers are clamped, `pinned` is forced off and the origin is downgraded to `observed`)
 /memory clear --all --yes                        permanently clear everything (`--all` is mutually exclusive with the filters below)
@@ -383,7 +423,7 @@ whole Config through the settings service and persists it into the profile patch
 
 ## Configuration
 
-Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 29 fields exposed in
+Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 30 fields exposed in
 the settings form:
 
 | Field | Default | Meaning |
@@ -417,6 +457,7 @@ the settings form:
 | `pendingMax` | `50` | Cap for the pending queue; when full a new write is rejected with a structured error, never silently dropped; `0` = unlimited |
 | `language` | `zh` | Language of the **model-visible** text (`zh` / `en`): injection blocks and their headers/footers, injection prompts, the per-turn recall block and the tool descriptions. Command output stays Chinese either way; the default `zh` is byte-for-byte identical to 0.5.10 |
 | `branchAware` | `true` | Filter branch-tagged rows by the current git branch; in the form `0` = off, `1` = on. Off ignores tags entirely; the default `true` is byte-for-byte identical to 0.5.12 because no existing row is tagged |
+| `auditMax` | `50` | Capacity of the **in-memory audit attempt ring**: it records only attempts that never landed (rejected / queued / approved / rejected-pending). Successful write events are derived from the records themselves, so the audit adds no storage; `0` = record nothing (the command still works); the ring is cleared on restart |
 
 Additional knobs available only through the patch row (with their defaults): `maxItemTokens` neighbours such as
 `selfPortraitMaxItems` 12 / `selfPortraitMaxSelfObserved` 4, capture tuning (`capturePerHour` 20,

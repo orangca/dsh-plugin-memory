@@ -3610,4 +3610,369 @@ test('host#78 当前分支带 5 秒 TTL 缓存：TTL 内不重读，换 cwd 立�
   assert.equal(reread.branch, 'switched')
 })
 
+// ================================================================ M13 写入审计与注入核对（`/memory audit`）
+// 契约：docs/audit.md 第 3/4/5 节。宿主侧四件事：各写入路径推尝试事件（异常一律吞掉）、
+// `/memory audit [--limit N] [--verify]` 的**只读**渲染、`/memory stats` 的最小摘要、
+// 以及 `auditMax` 的 Schema 行（volatile）。这里用 `state.audit`（经自报告）与命令输出双向钉死。
+
+const SECRET_TEXT = '这台机器的部署密钥是 sk-abcdefghijklmnop123456，请记住'
+
+test('host#79 审计：成功创建 / 合并 / 忘记 / 被拒各推一条尝试（state.audit + 输出）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const created = await harness.memory().write({ kind: 'user_profile', text: '审计探针：用户偏好中文回答与英文标识符', origin: 'user_explicit' })
+  assert.equal(created.ok, true)
+  assert.equal(created.status, 'created')
+
+  // 同一指纹的第二次写入必须走合并（不是新建）——两个动作各推一条，不能混为一谈。
+  const merged = await harness.memory().write({ kind: 'user_profile', text: '审计探针：用户偏好中文回答与英文标识符', origin: 'user_explicit' })
+  assert.equal(merged.ok, true)
+  assert.equal(merged.status, 'merged', '前置条件：第二次同一指纹写入必须合并')
+
+  assert.equal((await harness.runCommand(`forget ${String(created.id).slice(0, 8)}`)).kind, 'success')
+
+  const rejected = await writeTool(harness, { kind: 'user_profile', text: SECRET_TEXT })
+  assert.equal(rejected.ok, false, '前置条件：敏感文本必须被拒')
+
+  const audit = harness.reportState().audit as Json
+  const actions = audit.actions as Json
+  assert.equal(Number(audit.entries), 4, '四次尝试各一条（created / merged / forgotten / rejected）')
+  assert.equal(Number(actions.created), 1)
+  assert.equal(Number(actions.merged), 1)
+  assert.equal(Number(actions.forgotten), 1)
+  assert.equal(Number(actions.rejected), 1)
+
+  // 环是**新在前**：最近一条就是刚被拒的那次；被拒的尝试没有记录，id/via 必须是 null（不得编造）
+  const last = audit.last as Json
+  assert.equal(last.action, 'rejected')
+  assert.equal(last.reason, 'rejected_sensitive', 'reason 取既有错误码，便于与工具返回值对号')
+  assert.equal(last.kind, 'user_profile')
+  assert.equal(last.id, null)
+  assert.equal(last.via, null, '没有记录 → refs 取不到 → via 必须是 null')
+  assert.equal(typeof last.at, 'number')
+
+  // 命令输出：最近尝试清单 + 原因 + 无 via 的占位符；忘记事件带被删记录的 id 前缀
+  const out = await harness.runCommand('audit')
+  assert.equal(out.kind, 'success', out.text)
+  assert.match(out.text, /最近尝试（新在前/u)
+  assert.match(out.text, /原因：rejected_sensitive/u)
+  assert.match(out.text, /via=（无）/u)
+  assert.match(out.text, new RegExp(String(created.id).slice(0, 8), 'u'), 'forgotten 的 id 前缀要能对上')
+})
+
+test('host#80 审计：入队 / 批准 / 拒绝待确认各推一条；/memory audit 渲染含最近尝试与库内汇总', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const first = await writeTool(harness, { kind: 'semantic', text: '审计探针：构建统一用 bun，产物落在 build 目录' })
+  const second = await writeTool(harness, { kind: 'semantic', text: '审计探针：发布统一走 npm publish，先跑一遍完整测试' })
+  assert.equal(first.pending, true)
+  assert.equal(second.pending, true)
+  // 用**完整 id**：同一毫秒创建的两条记录前 8 位会撞前缀，前缀会命中多条（既有测试也有同样的告示）
+  assert.equal((await harness.runCommand(`approve ${String(first.id)}`)).kind, 'success')
+  assert.equal((await harness.runCommand(`reject-pending ${String(second.id)}`)).kind, 'success')
+
+  const audit = harness.reportState().audit as Json
+  const actions = audit.actions as Json
+  assert.equal(Number(actions.pending), 2, '两次入队各一条')
+  assert.equal(Number(actions.approved), 1)
+  assert.equal(Number(actions['rejected-pending']), 1)
+  assert.equal(Number(actions.created), 0, '入队不是创建（没有落盘的 active 记录）')
+
+  const out = await harness.runCommand('audit')
+  assert.equal(out.kind, 'success', out.text)
+  assert.match(out.text, /最近尝试（新在前/u)
+  assert.match(
+    out.text,
+    /按 action 计数：created 0 · merged 0 · pending 2 · approved 1 · rejected-pending 1 · rejected 0 · invalidated 0 · archived 0 · forgotten 0/u,
+  )
+  // 库内汇总来自**记录本身**（不是尝试环）：批准的 active 1 条 + 拒绝的 invalid 1 条
+  assert.match(out.text, /库内状态：共 2 条 · active 1 · pending 0 · archived 0 · invalid 1（当前分支：unknown）/u)
+  assert.match(out.text, /来源引用：带 refs 的 0 条（占 0%）/u)
+  assert.match(out.text, /--verify：未做核对/u, '没跑 --verify 时必须说「未做核对」，不能渲染成通过')
+
+  // 命令只读：连跑一次之后，记录与整份自报告（含所有计数器）必须一字不动
+  const rowsBefore = JSON.stringify(harness.memory().list())
+  const reportBefore = JSON.stringify(harness.reportState())
+  await harness.runCommand('audit')
+  assert.equal(JSON.stringify(harness.memory().list()), rowsBefore, 'audit 只读：记录一字不动')
+  assert.equal(JSON.stringify(harness.reportState()), reportBefore, 'audit 只读：状态与计数器一字不动')
+
+  // help 与 input.hint 同步（与其它子命令同一口径）
+  assert.match((await harness.runCommand('help')).text, /audit \[--limit N\] \[--verify\]/u)
+  const hint = String((harness.command() as unknown as { input?: { hint?: string } }).input?.hint ?? '')
+  assert.match(hint, /audit/u, '命令的 input.hint 也要提到 audit')
+
+  // 契约 §3.3：`/memory stats` 与 `memory_stats` 的最小摘要（最近尝试条数、核对未命中次数）
+  const stats = await harness.runCommand('stats')
+  assert.match(stats.text, /审计：最近尝试 4 条（记录档 2 条）；核对未命中 0 次（详见 \/memory audit）/u)
+  const raw = JSON.parse(String(await harness.tool('memory_stats').execute({}))) as Json
+  const auditField = raw.audit as Json
+  assert.ok(auditField, 'memory_stats 必须带结构化的 audit 字段')
+  assert.equal(Number(auditField.entries), 4)
+  assert.equal(Number(auditField.records), 2)
+  assert.equal(Number(auditField.mismatchChecks), 0)
+  assert.equal(Number(auditField.auditMax), 50, '结构化字段里的容量与默认值一致')
+  assert.match(String(raw.text), /审计：最近尝试 4 条/u, '工具文本与 /memory stats 同步')
+})
+
+test('host#81 /memory audit --limit：默认 20、上限 200、非法值回落默认', async (t) => {
+  // 环容量调大，才能真正验证 `--limit` 的 200 上限（默认 auditMax=50 会先截断环）。
+  const harness = makeHarness({ noReport: true, config: { auditMax: 300 } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  for (let index = 0; index < 205; index += 1) {
+    const result = await writeTool(harness, { kind: 'user_profile', text: `第 ${index} 条：${SECRET_TEXT}` })
+    assert.equal(result.ok, false, `第 ${index} 条写入必须被拒（用来填满尝试环）`)
+  }
+  const entryLines = (text: string): number => text.split('\n').filter((line) => line.startsWith('  - ')).length
+
+  const byDefault = await harness.runCommand('audit')
+  assert.match(byDefault.text, /内存尝试环 20 条/u, '默认渲染最近 20 条')
+  assert.equal(entryLines(byDefault.text), 20, '渲染的条目行数必须等于 limit')
+
+  const byShort = await harness.runCommand('audit --limit 5')
+  assert.match(byShort.text, /内存尝试环 5 条/u)
+  assert.equal(entryLines(byShort.text), 5)
+
+  const byInline = await harness.runCommand('audit --limit=7')
+  assert.match(byInline.text, /内存尝试环 7 条/u, '--limit=N 与 --limit N 等价')
+
+  const byInvalid = await harness.runCommand('audit --limit abc')
+  assert.match(byInvalid.text, /内存尝试环 20 条/u, '非法值回落默认 20')
+
+  const byZero = await harness.runCommand('audit --limit 0')
+  assert.match(byZero.text, /内存尝试环 20 条/u, '0 不是合法条数，回落默认')
+
+  const byBig = await harness.runCommand('audit --limit 500')
+  assert.match(byBig.text, /内存尝试环 200 条/u, '上限 200（环里有 205 条）')
+
+  // 两个开关可以叠加：`--limit` 后面紧跟另一个开关时不得把它吞掉
+  const both = await harness.runCommand('audit --limit --verify')
+  assert.match(both.text, /内存尝试环 20 条/u)
+  assert.match(both.text, /--verify：/u, '--limit 后面的 --verify 必须仍然生效')
+})
+
+test('host#82 /memory audit --verify：有 sessionQuery 时给出 checked/matched/missing，且完全只读', async (t) => {
+  const spec: FakeSessionSpec = { id: 'session-1', cwd: WORKSPACE_CWD, createdAt: 1_000, events: [] }
+  const fake = makeFakeSessionQuery([spec])
+  const harness = makeHarness({
+    sessionQuery: fake.query,
+    config: { selfIntroEnabled: false, selfReflectEnabled: false },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 会话身份（readSession 的目标）+ 日志里至少一条 user/message（缺口判定的前提）
+  emitSeqEvent(harness, refsSession(), seqUserEvent('先推进 seq。', 5))
+  const contextOf = (): string => String(harness.contexts[0]!.text({ agent: { session: { header: { cwd: WORKSPACE_CWD } } } }))
+  const sectionOf = (): string => String(harness.sections[0]!.text())
+
+  await writeToolInWorkspace(harness, { kind: 'semantic', text: '构建流程统一用 pnpm，产物输出到 dist 目录', subject: 'build.tool' }, WORKSPACE_CWD)
+  await writeToolInWorkspace(harness, { kind: 'semantic', text: '发布流程统一走 npm publish，先跑一遍完整测试', subject: 'deploy.flow' }, WORKSPACE_CWD)
+  const rendered = contextOf()
+  const section = sectionOf()
+  assert.match(rendered, /构建流程统一用 pnpm/u, '前提：注入块确实渲染了这两条')
+
+  // 「模型可见 ⟺ 已记录」：把刚落盘的注入快照逐字写进会话日志（user/message 事件）
+  spec.events.push(seqUserEvent(`${section}\n${rendered}`, 6))
+
+  const rowsBefore = JSON.parse(JSON.stringify(harness.memory().list())) as Json[]
+  const reportBefore = JSON.parse(JSON.stringify(harness.reportState())) as Json
+  const verified = await harness.runCommand('audit --verify')
+  assert.equal(verified.kind, 'success', verified.text)
+  const matched = /--verify：核对 (\d+) 行 · 命中 (\d+) 行 · 缺失 (\d+) 行/u.exec(verified.text)
+  assert.ok(matched, `必须给出核对结论：${verified.text}`)
+  const checked = Number(matched[1])
+  assert.ok(checked >= 2, `注入行至少两条（实际 ${checked}）`)
+  assert.equal(Number(matched[2]), checked, '日志逐字包含全部注入行 → 应全命中')
+  assert.equal(Number(matched[3]), 0)
+  assert.match(verified.text, /逐字核对通过/u)
+  assert.match(verified.text, /via=tool/u, 'created 事件的 via 来自记录 refs（工具写入 → tool）')
+  assert.ok(fake.read.includes('session-1'), '--verify 必须读当前会话的日志')
+
+  // **只读**：记录快照与整份自报告（写入计数、refs 计数…）都必须逐字节相同
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.memory().list())), rowsBefore, '审计只读：记录快照必须逐字节相同')
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.reportState())), reportBefore, '审计只读：状态与计数器必须逐字节相同')
+  assert.match((await harness.runCommand('stats')).text, /核对未命中 0 次/u, '--verify 不得推任何计数器')
+  assert.match((await harness.runCommand('stats')).text, /审计：最近尝试 2 条（记录档 2 条）/u)
+
+  // 缺失路径：注入之后又新增一条（日志里没有它）→ missing=1，并给出一条未命中样例
+  await writeToolInWorkspace(harness, { kind: 'semantic', text: '审计核对探针：这条在注入之后才写入，日志里没有它', subject: 'audit.probe' }, WORKSPACE_CWD)
+  assert.match(contextOf(), /审计核对探针/u, '前提：新条目确实进了注入行')
+  const missing = await harness.runCommand('audit --verify')
+  const missingMatch = /--verify：核对 (\d+) 行 · 命中 (\d+) 行 · 缺失 (\d+) 行/u.exec(missing.text)
+  assert.ok(missingMatch, missing.text)
+  assert.equal(Number(missingMatch[1]), checked + 1)
+  assert.equal(Number(missingMatch[2]), checked)
+  assert.equal(Number(missingMatch[3]), 1, `只有那条新增的注入行不在日志里：${missing.text}`)
+  assert.match(missing.text, /未命中样例：- \(workspace\) 审计核对探针/u, '必须给出一条未命中的样例（逐字语义）')
+})
+
+test('host#83 /memory audit --verify：三种缺口都明说原因（无服务 / 会话 id 未知 / 无 user 事件）', async (t) => {
+  // ① 宿主没有 sessionQuery 服务
+  const noService = makeHarness()
+  t.after(() => noService.dispose())
+  await noService.settle()
+  emitSeqEvent(noService, refsSession(), seqUserEvent('先推进 seq。', 5))
+  await writeToolInWorkspace(noService, { kind: 'semantic', text: '缺口探针：没有 sessionQuery 时的注入行', subject: 'gap.a' }, WORKSPACE_CWD)
+  String(noService.contexts[0]!.text({ agent: { session: { header: { cwd: WORKSPACE_CWD } } } }))
+  const noServiceOut = await noService.runCommand('audit --verify')
+  assert.equal(noServiceOut.kind, 'success', noServiceOut.text)
+  assert.match(noServiceOut.text, /--verify：无法核对 —— 原因：/u)
+  assert.match(noServiceOut.text, /sessionQuery/u, '必须点名缺的是哪个服务')
+  assert.doesNotMatch(noServiceOut.text, /逐字核对通过/u, '缺口绝不能渲染成通过')
+  assert.doesNotMatch(noServiceOut.text, /--verify：核对 \d/u, '缺口不是「核对 0 行」')
+
+  // ② 有 sessionQuery，但本会话还没有任何 session/event → 当前会话 id 未知
+  const known = makeFakeSessionQuery([{ id: 'session-1', cwd: WORKSPACE_CWD, createdAt: 1_000, events: [seqUserEvent('这一条在日志里。', 1)] }])
+  const unknown = makeHarness({ sessionQuery: known.query })
+  t.after(() => unknown.dispose())
+  await unknown.settle()
+  await writeToolInWorkspace(unknown, { kind: 'semantic', text: '缺口探针：会话 id 未知时的注入行', subject: 'gap.b' }, WORKSPACE_CWD)
+  String(unknown.contexts[0]!.text({ agent: { session: { header: { cwd: WORKSPACE_CWD } } } }))
+  const unknownOut = await unknown.runCommand('audit --verify')
+  assert.match(unknownOut.text, /无法核对 —— 原因：.*会话 id 未知/u)
+  assert.equal(known.read.length, 0, '会话 id 未知时不得猜一个 id 去读日志')
+
+  // ③ 会话 id 已知、日志也读到了，但日志里没有任何 user/message 事件
+  const assistantOnly = makeFakeSessionQuery([
+    { id: 'session-1', cwd: WORKSPACE_CWD, createdAt: 1_000, events: [sleepAssistantEvent('日志里只有助手消息。', 2)] },
+  ])
+  const noUser = makeHarness({ sessionQuery: assistantOnly.query })
+  t.after(() => noUser.dispose())
+  await noUser.settle()
+  emitSeqEvent(noUser, refsSession(), seqUserEvent('先推进 seq。', 5))
+  String(noUser.contexts[0]!.text({ agent: { session: { header: { cwd: WORKSPACE_CWD } } } }))
+  const noUserOut = await noUser.runCommand('audit --verify')
+  assert.match(noUserOut.text, /无法核对 —— 原因：.*没有任何 user\/message 事件/u)
+  assert.ok(assistantOnly.read.includes('session-1'), '会话 id 已知时必须真的去读日志')
+})
+
+test('host#84 auditMax=0：不记录任何尝试，命令仍可用；volatile 形态照常解包与裁剪', async (t) => {
+  const off = makeHarness({ config: { auditMax: 0 } })
+  t.after(() => off.dispose())
+  await off.settle()
+
+  const created = await off.memory().write({ kind: 'user_profile', text: '审计环关闭时的正常写入', origin: 'user_explicit' })
+  assert.equal(created.ok, true, '审计关不改变写入结果')
+  const rejected = await writeTool(off, { kind: 'user_profile', text: SECRET_TEXT })
+  assert.equal(rejected.ok, false, '审计关不改变拒写结果')
+
+  const audit = off.reportState().audit as Json
+  assert.equal(Number(audit.entries), 0, 'auditMax=0 → 一条尝试都不记录')
+  assert.equal(Number(audit.capacity), 0)
+  const out = await off.runCommand('audit')
+  assert.equal(out.kind, 'success', '环关闭时命令仍必须可用')
+  assert.match(out.text, /最近尝试：本轮没有记录到被拒或入队的尝试/u)
+  assert.match(out.text, /auditMax=0：审计环关闭/u, '必须明说环是关的，别让人以为「什么都没发生」')
+  assert.match(out.text, /库内状态：共 1 条 · active 1/u, '记录派生汇总与环无关，仍然可用')
+
+  // volatile 形态（运行版把 volatile 字段以访问器下发）+ 容量裁剪：3 条尝试只留最近 2 条
+  const vol = makeHarness({ config: { auditMax: volatile(2) } })
+  t.after(() => vol.dispose())
+  await vol.settle()
+  for (let index = 0; index < 3; index += 1) {
+    const result = await writeTool(vol, { kind: 'user_profile', text: `第 ${index} 条：${SECRET_TEXT}` })
+    assert.equal(result.ok, false)
+  }
+  const volAudit = vol.reportState().audit as Json
+  assert.equal(Number(volAudit.capacity), 2, 'volatile 形态必须解包成 2')
+  assert.equal(Number(volAudit.entries), 2, '环容量 2 → 只保留最近两条')
+  assert.match((await vol.runCommand('audit')).text, /内存尝试环 2 条 · 容量 2/u)
+})
+
+test('host#85 审计推事件抛异常：写入 / 入队 / 批准 / 删除 / 拒写主流程全部照常', async (t) => {
+  const harness = makeHarness({ config: { simulateAuditError: true, writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const created = await harness.memory().write({ kind: 'user_profile', text: '审计故障注入下的正常写入', origin: 'user_explicit' })
+  assert.equal(created.ok, true, '审计抛异常不得影响写入成功')
+  assert.equal(created.status, 'created')
+  assert.equal(harness.memory().list().length, 1, '记录确实落库了')
+
+  const queued = await writeTool(harness, { kind: 'semantic', text: '审计故障注入下的模型猜想' })
+  assert.equal(queued.pending, true, '入队路径照常')
+  assert.equal((await harness.runCommand(`approve ${String(queued.id).slice(0, 8)}`)).kind, 'success', '批准路径照常')
+  assert.equal((await harness.runCommand(`forget ${String(created.id).slice(0, 8)}`)).kind, 'success', '删除路径照常')
+  const rejected = await writeTool(harness, { kind: 'user_profile', text: SECRET_TEXT })
+  assert.equal(rejected.ok, false, '拒写路径照常')
+  assert.match(String(rejected.error), /rejected_sensitive/u, '错误码不变')
+
+  // 每一次推入都被吞掉（环始终为空），而计数器照常推进 —— 审计失败只是少一条观测
+  const state = harness.reportState()
+  assert.equal(Number((state.audit as Json).entries), 0, '审计异常被吞掉：环为空')
+  const writes = state.writes as Json
+  assert.equal(Number(writes.created), 1)
+  assert.equal(Number(writes.pending), 1)
+  assert.equal(Number(writes.approved), 1)
+  assert.equal(Number(writes.deleted), 1)
+  assert.equal(Number(writes.rejected), 1)
+  const out = await harness.runCommand('audit')
+  assert.equal(out.kind, 'success', '审计异常不影响命令可用')
+  assert.match(out.text, /最近尝试：本轮没有记录到被拒或入队的尝试/u)
+})
+
+test('host#86 配置 Schema：auditMax 默认 50 且标 volatile（无 schemastery 时跳过）', async () => {
+  if (Config === undefined) {
+    assert.equal(Config, undefined)
+    return
+  }
+  const dict = (Config as { dict?: Record<string, { meta?: { default?: unknown; volatile?: unknown } }> }).dict ?? {}
+  const entry = dict.auditMax
+  assert.ok(entry, 'Schema 必须声明 auditMax')
+  assert.equal(entry.meta?.default, 50, '默认值必须与契约 §2.1 一致')
+  assert.equal(entry.meta?.volatile, true, 'auditMax 必须标 volatile，否则设置页看不到/存不下它')
+})
+
+test('host#87 审计：整合的失效与归档各推一条（invalidated / archived）', async (t) => {
+  // 先造一条「180 天前、重要度极低」的记录：写路径只能给当下时间戳，因此用 seedDomainRows 播种旧记录。
+  const seedHarness = makeHarness()
+  t.after(() => seedHarness.dispose())
+  await seedHarness.settle()
+  const aged = await seedHarness.memory().write({
+    kind: 'semantic', text: '一年前的旧约定：这条早已衰减到该归档的程度。', origin: 'observed', importance: 0.05, subject: 'legacy.decay',
+  })
+  assert.equal(aged.ok, true)
+  const staleRow = [...seedHarness.domain.rows.values()][0]!
+  staleRow.observedAt = Date.now() - 400 * 86_400_000
+  delete staleRow.lastUsedAt
+  const seeded = new Map<string, Json>([[String(staleRow.id), staleRow]])
+
+  const harness = makeHarness({ seedDomainRows: seeded, config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  assert.equal(harness.memory().list().length, 1, '前置条件：旧记录已从盘上加载')
+
+  // 同槽位（kind|scope|subject|field）、不同 value、文本不相近 → 整合判为冲突 → 失效较旧的一条
+  const file = join(harness.tempDir, 'conflicts.json')
+  writeFileSync(file, JSON.stringify({
+    items: [
+      { kind: 'semantic', subject: 'conflict.slot', field: 'mode', value: 'a', text: '构建流程走 gulp 并且产物落在 out 目录。' },
+      { kind: 'semantic', subject: 'conflict.slot', field: 'mode', value: 'b', text: '数据库迁移统一用 goose，连接串从环境变量读。' },
+    ],
+  }))
+  assert.equal((await harness.runCommand(`import ${file}`)).kind, 'success')
+
+  const consolidated = await harness.runCommand('consolidate')
+  assert.equal(consolidated.kind, 'success', consolidated.text)
+  assert.match(consolidated.text, /冲突失效 1/u, `前提：确实发生了一次冲突失效：${consolidated.text}`)
+  assert.match(consolidated.text, /归档 1/u, `前提：确实发生了一次衰减归档：${consolidated.text}`)
+
+  const audit = harness.reportState().audit as Json
+  const actions = audit.actions as Json
+  assert.equal(Number(actions.invalidated), 1, '整合的失效要推 invalidated')
+  assert.equal(Number(actions.archived), 1, '整合的归档要推 archived')
+
+  const out = await harness.runCommand('audit')
+  assert.match(out.text, /invalidated 1/u)
+  assert.match(out.text, /archived 1/u)
+  assert.match(out.text, /库内状态：共 3 条 · active 1 · pending 0 · archived 1 · invalid 1/u)
+})
+
 
