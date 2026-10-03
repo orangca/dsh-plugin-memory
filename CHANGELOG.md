@@ -3,6 +3,37 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.10 — 2026-10-02
+
+**An optional write approval gate: the model only proposes — you decide.** The two leading memory plugins in the
+community directory both make this their safety story ("the approval gate cannot be bypassed", "AI-authored memories
+land in a pending queue"); ours wrote model-origin rows straight to the store. Model writes can now wait for a user
+decision — while the default keeps the old behaviour exactly.
+
+### Added
+
+- `writePolicy` (`'auto' | 'ask' | 'off'`, default `'auto'`): model-origin writes apply immediately, wait in a
+  pending queue, or are rejected outright with a readable reason. Rule capture (`observed`), explicit user asks and
+  user corrections are **never** gated — they are the user's own words, and queuing them would only drown them.
+- `pendingMax` (default `50`): cap for the pending queue. A full queue **rejects** the new write with a structured
+  error (`pending_queue_full: …`) instead of silently dropping it; `0` = unlimited. Pending rows are persisted like
+  any other row and a `rejected` write never touches the disk.
+- `/memory pending` (read-only listing), `/memory approve <id prefix>` (the only path that turns `pending` into
+  `active`; a self-portrait row converges at that moment, not when it is queued) and
+  `/memory reject-pending <id prefix>` (sets `invalid` and keeps the row for audit). No model tool can change a
+  `pending` status, so **the model cannot approve itself**.
+- Settings form: both keys are editable, **25 → 27 fields**; both READMEs gained a "write approval gate" section
+  with the three-tier table, the queue commands and the two new configuration rows.
+
+### Changed
+
+- Default `auto` is 0.5.9 behaviour, byte for byte: model writes still apply immediately and never enter the queue.
+- **Pending never reaches context.** The resident block, per-turn recall, the self-portrait, project gists, search,
+  consolidation and `/sleep` all skip it; `/memory pending` and the `memory_explain` diagnostics are the only two
+  windows that show it. `/memory stats` and `memory_stats` report the pending count together with the policy.
+- The gate sits **after** the existing safety checks: in `ask` mode secrets are still refused before a row is
+  queued, so the queue is not a masking back door.
+
 ## 0.5.9 — 2026-10-02
 
 **Verifiable references.** Two independent memory plugins in the community directory lead with provenance

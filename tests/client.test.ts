@@ -229,6 +229,13 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
   assert.equal(byName('refsEnabled').format(true), '1')
   assert.equal(byName('refsEnabled').format(undefined), '')
 
+  // M10：写入审批门 —— 枚举字段只认三档，数字字段是队列上限
+  assert.deepEqual(byName('writePolicy').parse('ask'), { kind: 'set', value: 'ask' })
+  assert.deepEqual(byName('writePolicy').parse('off'), { kind: 'set', value: 'off' })
+  assert.deepEqual(byName('writePolicy').parse('auto'), { kind: 'set', value: 'auto' })
+  assert.equal(byName('writePolicy').parse('bogus'), undefined, 'writePolicy 只认 auto/ask/off')
+  assert.deepEqual(byName('writePolicy').parse(''), { kind: 'clear' })
+
   // 其余 5 个键是普通数字字段（默认值见契约 3.1：80 / 0.6 / 12 / 4 / 3）
   for (const name of [
     'selfPersonaMaxTokens',
@@ -241,18 +248,20 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
     'sleepSessions',
     'sleepMaxBackfill',
     'refsMax',
+    'pendingMax',
   ] as const) {
     assert.deepEqual(byName(name).parse('7'), { kind: 'set', value: 7 }, `${name} 应为数字字段`)
     assert.equal(byName(name).parse('abc'), undefined, `${name}: 非法草稿应为 invalid`)
     assert.deepEqual(byName(name).parse(''), { kind: 'clear' }, `${name}: 空草稿 = 清除覆盖`)
   }
 
-  // 25 个字段都要有规格，且与 Host 侧 volatile 字段一一对应
-  assert.equal(specs.length, 25)
+  // 27 个字段都要有规格，且与 Host 侧 volatile 字段一一对应
+  assert.equal(specs.length, 27)
   for (const name of [
     'selfIntroEnabled', 'selfIntroMinTurn', 'selfIntroMaxAsks',
     'sleepEnabled', 'sleepSessions', 'sleepMaxBackfill',
     'refsEnabled', 'refsMax',
+    'writePolicy', 'pendingMax',
   ] as const) {
     assert.ok(specs.some((spec) => spec.field === name), `设置页缺少 ${name}`)
   }

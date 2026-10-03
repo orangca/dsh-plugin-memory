@@ -168,6 +168,51 @@ Each memory records its **source**: which session, and which event-sequence rang
 `refsEnabled` (default `true`) turns collection off for new rows (existing references stay); `refsMax` (default `5`)
 caps how many references one row keeps.
 
+## Write approval gate (`writePolicy`): the model proposes, you decide
+
+`memory_write` rows are **the model's own proposals**. By default they take effect immediately (the 0.5.9
+behaviour); to separate "the model proposed it" from "you settled it", set `writePolicy` to `ask` or `off`:
+
+| `writePolicy` | Model-origin writes | Every other origin (rule capture / user commands / `/sleep` / import) |
+|---|---|---|
+| `auto` (**default**) | applied immediately (= current behaviour) | applied immediately |
+| `ask` | queued for confirmation (`status: 'pending'`) until you approve | applied immediately |
+| `off` | rejected outright with a readable reason | applied immediately |
+
+- **The default `auto` changes nothing**: after upgrading you should notice no difference — model writes still
+  take effect immediately and never enter the queue.
+- **Only rows the model proposed are gated.** Rule capture (`observed`), explicit user asks (`user_explicit`)
+  and user corrections (`user_correction`) are **never** gated: they are your own words, and queuing them would
+  only drown them.
+- **The model cannot approve itself.** No model tool can change a `pending` status; only your `/memory approve` can.
+
+Using the pending queue:
+
+```
+/memory pending                     list pending writes (id · kind/facet · origin · time · refs · text preview)
+/memory approve <id prefix>         approve → takes effect immediately (a self-portrait row converges at this point)
+/memory reject-pending <id prefix>  reject → set to invalid (kept for audit, never physically deleted)
+```
+
+- **Pending never enters context.** The resident block (R1), per-turn recall (R2), the self-portrait, project
+  gists, search and consolidation never see it — an unapproved model guess reaching the system prompt is this
+  feature's worst failure mode, and every read path is pinned by a test. Only two windows show it on purpose:
+  `/memory pending` and the diagnostic output of `memory_explain`.
+- **Bounded and honest.** `pendingMax` (default `50`) caps the queue. When it is full, a new write is **rejected
+  with a structured error** — never silently dropped, never auto-compacted; process a few rows through
+  `/memory pending` first. `0` = unlimited.
+- **Approval does not bypass the safety gate.** In `ask` mode sensitive content is still rejected *before* the row
+  is queued; the queue is not a masking back door.
+- **Rejection leaves a trace.** `reject-pending` sets `invalid` rather than deleting, so audit and `/memory verify`
+  can still see that the row existed.
+- Pending rows are persisted like any other row (they survive a restart), and `/memory stats` / `memory_stats`
+  report the pending count together with the active policy (e.g. `待确认：1 条（writePolicy=ask）`).
+
+`writePolicy` (default `auto`) and `pendingMax` (default `50`) both appear in the settings form.
+
+> The queue's reject exit is `/memory reject-pending <id prefix>`; the pre-existing `/memory reject <id prefix>`
+> rejects a self-observation instead ("that kind is never re-created"). The two are different on purpose.
+
 ## Guarding against memory pollution / self-reinforcement
 
 - Capture reads **real user messages only** — the plugin's own injected context does not count.
@@ -225,9 +270,9 @@ Add this package to the profile's `dependencies`, append `dsh-plugin-memory` to
 
 ## The settings form
 
-The plugin exports a schemastery `Config` whose **25 fields** are declared `volatile()` (hot-applied when edited);
+The plugin exports a schemastery `Config` whose **27 fields** are declared `volatile()` (hot-applied when edited);
 everything else is patch-row only. It ships a small browser half (`src/client.ts`, built to `lib/client.js`) that
-renders those 25 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
+renders those 27 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
 also shows a one-line summary).
 
 Under the hood the client half registers into the keyed `plugins.row.config` slot with
@@ -247,6 +292,9 @@ whole Config through the settings service and persists it into the profile patch
 /memory refresh <id prefix>                      refresh (restart the decay clock)
 /memory confirm <id prefix>                      promote a model self-observation to user-confirmed
 /memory reject <id prefix>                       reject a self-observation (that kind is never re-created)
+/memory pending                                  list pending writes (read-only; ids feed approve / reject-pending)
+/memory approve <id prefix>                      approve a pending write, it takes effect immediately (the writePolicy=ask exit)
+/memory reject-pending <id prefix>               reject a pending write (set to invalid, kept for audit)
 /memory self                                     self-portrait: list the persona and work subsections
 /memory self set <persona|work> [name|address_user|address_self] <text>            set/override it directly (user-side, pinned, confidence 1); a naming key on persona settles the names
 /memory self history [subject]                   self-portrait revision chain (old → new, with archival time)
@@ -276,7 +324,7 @@ whole Config through the settings service and persists it into the profile patch
 
 ## Configuration
 
-Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 25 fields exposed in
+Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 27 fields exposed in
 the settings form:
 
 | Field | Default | Meaning |
@@ -306,6 +354,8 @@ the settings form:
 | `sleepMaxBackfill` | `20` | Maximum rows one `/sleep --apply` may backfill (only things you explicitly asked to remember) |
 | `refsEnabled` | `true` | Record where each memory came from (session + event seq range); in the form `0` = off, `1` = on. Off only affects new rows |
 | `refsMax` | `5` | How many source references one row keeps (newest first); `0` = none, `Infinity` = unlimited |
+| `writePolicy` | `auto` | Approval gate for model-origin writes: `auto` (apply immediately, default) / `ask` (queue for confirmation) / `off` (reject outright); rule capture, user commands and `/sleep` are never gated |
+| `pendingMax` | `50` | Cap for the pending queue; when full a new write is rejected with a structured error, never silently dropped; `0` = unlimited |
 
 Additional knobs available only through the patch row (with their defaults): `maxItemTokens` neighbours such as
 `selfPortraitMaxItems` 12 / `selfPortraitMaxSelfObserved` 4, capture tuning (`capturePerHour` 20,

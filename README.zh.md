@@ -146,6 +146,44 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 
 `refsEnabled`（默认 `true`）关掉后新记录不再带引用（已有引用不受影响）；`refsMax`（默认 `5`）限制每条保留几个。
 
+## 写入审批门（writePolicy）：AI 只提议、你决定
+
+`memory_write` 写的是**模型自己提出的记忆**。默认它立刻生效（＝ 0.5.9 行为）；想分开「模型提议」与「你拍板」，
+把 `writePolicy` 调成 `ask` 或 `off`：
+
+| `writePolicy` | 模型来源的写入 | 其它来源（规则捕获 / 用户命令 / `/sleep` / 导入） |
+|---|---|---|
+| `auto`（**默认**） | 立刻生效（＝ 现状） | 立刻生效 |
+| `ask` | 先进**待确认队列**（`status: 'pending'`），你批准后才生效 | 立刻生效 |
+| `off` | 直接拒绝并给出可读原因 | 立刻生效 |
+
+- **默认 `auto` 不改变任何现有行为**：升级后不该察觉差异 —— 模型写入照旧立刻生效、不进队列。
+- **只门控模型自己提出的记忆**：规则捕获（`observed`）、你明确要求（`user_explicit`）、你的纠正
+  （`user_correction`）**不受门控** —— 那些本来就是你说的话，塞进队列只会淹没它们。
+- **模型不能自我批准**：没有任何模型工具能改 `pending`；只有你敲 `/memory approve` 才行。
+
+待确认队列怎么用：
+
+```
+/memory pending                    列出待确认写入（id · kind/facet · 来源 · 时间 · 引用 · 正文预览）
+/memory approve <id 前缀>          批准 → 立刻生效（若是自画像，此刻才跑收敛）
+/memory reject-pending <id 前缀>   拒绝 → 置为 invalid（保留用于审计，不物理删除）
+```
+
+- **pending 绝不进上下文**：常驻注入（R1）、按轮召回（R2）、自画像、项目印象、检索与整合一律看不见它 ——
+  未批准的模型猜想进系统提示是本功能最严重的失效模式，每条读取路径都有测试钉死。
+  只有两个窗口能显式看到它：`/memory pending`，以及 `memory_explain` 的诊断输出。
+- **有界且诚实**：`pendingMax`（默认 `50`）封顶；队列满了**拒绝新写入并报结构化错误**，
+  绝不静默丢弃、也不自动压缩 —— 先用 `/memory pending` 处理掉几条；`0` = 不设上限。
+- **审批不绕过安全闸**：`ask` 模式下敏感信息照样在**入队前**就被拒写，队列不是脱敏的后门。
+- **拒绝留痕**：`reject-pending` 置 `invalid` 而非删除，审计与 `/memory verify` 仍能看到它曾经存在。
+- 待确认记录照常落盘（进程重启后仍在）；`/memory stats` 与 `memory_stats` 会显示「待确认：N 条（writePolicy=…）」。
+
+`writePolicy`（默认 `auto`）与 `pendingMax`（默认 `50`）都在设置页表单里。
+
+> 队列的拒绝出口是 `/memory reject-pending <id 前缀>`；既有的 `/memory reject <id 前缀>` 是「拒绝一条
+> 自我观察（同类不再产生）」，两者语义不同，别混。
+
 ## 防「记忆污染 / 自激」
 
 - 自动捕获**只读真实用户消息**（插件自己注入的上下文不算）；
@@ -199,8 +237,8 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置表单在哪
 
-插件导出 schemastery `Config`，其中 **25 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
-同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 25 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
+插件导出 schemastery `Config`，其中 **27 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
+同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 27 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
 （列表里的行卡片上还有一行摘要）。
 
 实现上，客户端半边注册进 **keyed** 插槽 `plugins.row.config`，key 为
@@ -220,6 +258,9 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 /memory refresh <id 前缀>                        刷新（衰减重新计时）
 /memory confirm <id 前缀>                        把模型自评升级为用户确认
 /memory reject <id 前缀>                         拒绝一条自我观察（同类不再产生）
+/memory pending                                  列出待确认写入（只读；id 供 approve / reject-pending 取用）
+/memory approve <id 前缀>                        批准一条待确认写入，立刻生效（writePolicy=ask 的出口）
+/memory reject-pending <id 前缀>                 拒绝一条待确认写入（置 invalid 保留审计）
 /memory self                                     自画像：列出人格与工作两小节
 /memory self set <persona|work> [name|address_user|address_self] <正文>            直接设定/覆盖自画像（用户侧、固定、置信度 1）；带命名 key 时同时定下称呼
 /memory self history [subject]                   自画像修订链（旧 → 新，含归档时间）
@@ -250,7 +291,7 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置
 
-在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 25 个字段：
+在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 27 个字段：
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -279,6 +320,8 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 | `sleepMaxBackfill` | `20` | 一次 `/sleep --apply` 最多补录几条（只补你明确要求记住的内容） |
 | `refsEnabled` | `true` | 是否为每条记忆记下来源（会话 + 事件序号区间）；表单里 `0`=关、`1`=开。关掉只影响新记录 |
 | `refsMax` | `5` | 每条记录最多保留几个来源引用（新的在前）；`0` = 不保留，`Infinity` = 不限 |
+| `writePolicy` | `auto` | 模型来源写入的审批门：`auto`（立刻生效，默认）/ `ask`（进待确认队列）/ `off`（直接拒绝）；规则捕获、用户命令与 `/sleep` 不受影响 |
+| `pendingMax` | `50` | 待确认队列上限；满了拒绝新写入并报结构化错误，绝不静默丢弃；`0` = 不设上限 |
 
 只能通过 patch 行设置的进阶旋钮（含默认值）：自画像条数 `selfPortraitMaxItems` 12 /
 `selfPortraitMaxSelfObserved` 4；捕获调优 `capturePerHour` 20、`captureMinConfidence` 0.6、

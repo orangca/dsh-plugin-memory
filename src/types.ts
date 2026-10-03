@@ -16,7 +16,13 @@ export type MemoryOrigin = 'user_explicit' | 'user_correction' | 'model_proposed
  * 仅 `agent_self` 记录使用。
  */
 export type SelfFacet = 'persona' | 'work'
-export type MemoryStatus = 'active' | 'invalid' | 'archived'
+/**
+ * 记录状态。`'pending'` 是 M10 写入审批门新增的：**待用户确认，绝不进任何注入路径**。
+ * 严禁把它扩进「注入用的状态集合」——只有 `'active'` 才允许进上下文。
+ */
+export type MemoryStatus = 'active' | 'pending' | 'invalid' | 'archived'
+/** M10：模型来源写入的处置策略（默认 `'auto'` ＝ 0.5.9 行为）。 */
+export type WritePolicy = 'auto' | 'ask' | 'off'
 export type MemoryPrecision = 'exact' | 'gist'
 export type ScopeLevel = 'profile' | 'workspace' | 'session'
 
@@ -194,6 +200,10 @@ export interface MemoryConfig {
   refsEnabled: boolean
   /** M9：每条记录最多保留几个引用。 */
   refsMax: number
+  /** M10：模型来源写入的策略（`auto` 默认＝立刻生效；`ask` 进待确认队列；`off` 直接拒绝）。 */
+  writePolicy: WritePolicy
+  /** M10：待确认队列上限；满了拒绝新写入并报结构化错误。 */
+  pendingMax: number
   gistBudgetRatio: number
   charsPerToken: number
   sectionOrder: number

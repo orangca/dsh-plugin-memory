@@ -57,14 +57,19 @@ import {
   fnv1a,
   formatRefs,
   formatSleepPlan,
+  decideModelWrite,
+  formatPendingQueue,
   isEcho,
   isExcluded,
   isUserSideOrigin,
   listActive,
+  listPending,
   makeRecord,
   maskPii,
   normalizeFacet,
   normalizeText,
+  normalizeWritePolicy,
+  pendingQueueFull,
   INTRO_NOTICE,
   namingSettled,
   pickMergeGroups,
@@ -222,6 +227,16 @@ interface MemoryWrites {
   merged: number
   rejected: number
   deleted: number
+  /**
+   * M10：进入待确认队列的次数（`ask` 模式下模型来源写入）。
+   * 「批准/拒绝」各一条路径，计数分列在 `approved` / `pendingRejected` 里 ——
+   * 与上面四个计数（写入动作）不是一回事，所以不混进 `rejected`。
+   */
+  pending: number
+  /** M10：`/memory approve` 成功把它置为 active 的次数。 */
+  approved: number
+  /** M10：`/memory reject` 置为 invalid 的次数（保留审计痕迹，不物理删除）。 */
+  pendingRejected: number
 }
 
 interface MemoryRenders {
@@ -574,6 +589,13 @@ interface WriteMemoryResult {
   error?: string
   /** 仅自画像写入（agent_self + facet）带：本次执行的收敛决策。 */
   portrait?: PortraitOutcome
+  /**
+   * M10：`ask` 模式下写入没有生效，而是进了待确认队列（契约 §4.1）。
+   * 工具据此如实告诉模型「已提议、待用户确认」，而不是「已记住」。
+   */
+  pending?: boolean
+  /** 队列路径返回的正文（模型需要看到自己提了什么）。 */
+  text?: string
 }
 
 /** `/memory` 子命令处理器。 */
@@ -584,6 +606,8 @@ interface MemoryCommandHandlers extends Record<string, CommandHandler> {
   show(args: string[]): DshCommandResult
   /** M9：核对引用的只读命令（`/memory verify <id>`）。 */
   verify(args: string[]): Promise<DshCommandResult>
+  /** M10：待确认队列的查看（`/memory pending`，只读）。 */
+  pending(): DshCommandResult
   forget(args: string[]): Promise<DshCommandResult>
   restore(args: string[]): Promise<DshCommandResult>
   pin(args: string[]): Promise<DshCommandResult>
@@ -593,6 +617,15 @@ interface MemoryCommandHandlers extends Record<string, CommandHandler> {
   refresh(args: string[]): Promise<DshCommandResult>
   confirm(args: string[]): Promise<DshCommandResult>
   reject(args: string[]): Promise<DshCommandResult>
+  /** M10：批准一条待确认写入（`/memory approve <id 前缀>`，唯一的 pending → active 出口）。 */
+  approve(args: string[]): Promise<DshCommandResult>
+  /** M10：拒绝一条待确认写入（`/memory reject-pending <id 前缀>`）。 */
+  rejectPending(args: string[]): Promise<DshCommandResult>
+  /**
+   * 命令行的 kebab-case 键（`/memory reject-pending …` 直接按 `parts[0]` 查表）。
+   * 与 `rejectPending` 指向同一个实现：既有 `/memory reject` 语义不变，队列出口另起一个明确的名字。
+   */
+  'reject-pending'(args: string[]): Promise<DshCommandResult>
   clear(args: string[]): Promise<DshCommandResult>
   import(args: string[]): Promise<DshCommandResult>
   stats(): DshCommandResult
@@ -685,6 +718,11 @@ function buildConfig(useVolatile: boolean): ReturnType<SchemaFactory['object']> 
     consolidateIntervalMinutes: field(Schema!.number().default(30)),
     // 非 volatile：仅供 patch 行/诊断使用，不进表单
     reportPath: Schema!.string(),
+    // M10：写入审批门（契约 docs/write-policy.md §2.1）——默认值必须与 lib.ts 的 DEFAULTS 逐字一致。
+    // 两个键都标 volatile：契约 §6 要求它们出现在设置页（表单 27 字段），而 settings 服务只投影
+    // volatile 字段 —— 不标的话用户在表单里改了存不进去（Lead 裁决时发现的实际冲突）。
+    writePolicy: field(Schema!.union(['auto', 'ask', 'off']).default('auto')),
+    pendingMax: field(Schema!.number().default(50)),
     // 出厂**不播种**（与 lib.js 的 DEFAULTS.seed 保持一致）：播种的演示记忆会进真实用户上下文
     seed: Schema!.boolean().default(false),
   })
@@ -771,7 +809,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     records: new Map(),
     collectionVersion: 0,
     seeded: 0,
-    writes: { created: 0, merged: 0, rejected: 0, deleted: 0 },
+    writes: { created: 0, merged: 0, rejected: 0, deleted: 0, pending: 0, approved: 0, pendingRejected: 0 },
     renders: { context: 0, section: 0 },
     renderMs: { last: 0, max: 0 },
     injected: { context: [], section: [] },
@@ -1354,6 +1392,70 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       state.writes.rejected += 1
       flush()
       return { ok: false, error: 'rejected_echo: 与刚注入的记忆高度相似（疑似复述），不作为新观察' }
+    }
+
+    // ---- M10：写入审批门（契约 §4.1）----
+    // 门只认 `origin === 'model_proposed'`：规则捕获（observed）、用户的话（user_explicit /
+    // user_correction）与用户命令**永远**走 'apply'，行为与 0.5.9 逐字相同。
+    //
+    // `queue` 分支刻意放在**安全闸之后、自画像收敛之前**：
+    //   · 队列不是绕过脱敏的后门 —— 敏感拒写、PII 脱敏、回声剔除都已执行（§5）；
+    //   · 收敛推迟到批准时（批准 = 用户确认，此时此刻才有资格按**当时的库状态**重算 add/reinforce/…）。
+    const decision = decideModelWrite(cfg.writePolicy, origin)
+    if (decision === 'reject') {
+      state.writes.rejected += 1
+      flush()
+      return {
+        ok: false,
+        error: `rejected_write_policy: 模型来源的写入已被拒绝（writePolicy=off）。`
+          + '需要长期记住的内容请明确要求，或让用户在配置里改成 auto/ask。',
+      }
+    }
+    if (decision === 'queue') {
+      // 「用户明确拒绝过的自我观察不再重复产生」这条闸门同样要在**入队前**生效：
+      // 否则被拒绝的模型猜想会一次次回到队列里，用户每拒绝一次就再看到一次（骚扰），
+      // 而 `/memory reject-pending` 登记的指纹也就形同虚设。
+      const queuedText = text
+      const queuedHash = recordHash({
+        kind: input.kind as MemoryKind,
+        scope: input.scope ?? { level: defaultScopeFor(input.kind as MemoryKind), key: '*' },
+        subject: input.subject ?? null,
+        text: queuedText,
+      })
+      if (origin === 'model_proposed' && state.rejectedHashes.has(queuedHash)) {
+        state.writes.rejected += 1
+        flush()
+        return { ok: false, error: 'rejected_by_user: 这类自我观察已被用户拒绝过' }
+      }
+      const pendingCount = listPending(state.records.values()).length
+      if (pendingQueueFull(pendingCount, cfg)) {
+        const max = Number.isFinite(cfg.pendingMax) ? cfg.pendingMax : DEFAULTS.pendingMax
+        state.writes.rejected += 1
+        flush()
+        return {
+          ok: false,
+          error: `pending_queue_full: 待确认队列已满（${pendingCount}/${max}），请先 /memory pending 处理`,
+        }
+      }
+      const queued = makeRecord({
+        ...input,
+        refs: refsForRecord(input),
+        ...portraitRecordFields(input.facet),
+        kind: input.kind as MemoryKind,
+        text,
+        origin,
+        status: 'pending',
+        subject: input.subject,
+      })
+      if (!queued.text) return { ok: false, error: 'rejected_invalid: text 不能为空' }
+      // M9：待确认记录照常带引用与指纹（指纹不含 status/refs，因此批准后去重仍然对得上）。
+      queued.status = 'pending'
+      attachRefs(queued, pendingRefs(input))
+      queued.hash = recordHash(queued)
+      await persist(queued)
+      state.writes.pending += 1
+      flush()
+      return { ok: true, pending: true, id: queued.id, text: queued.text }
     }
 
     // ---- 自画像收敛（仅显式 facet 的 agent_self 写入）----
@@ -2328,6 +2430,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           .sort(compareRecords)
           .slice(0, 20)
           .map(portraitRecordView),
+        // M10：诊断必须能**显式看到**待确认记录（契约 §4.3 的唯一例外之一）——
+        // 其它读取路径一律不得出现 pending，这里必须出现，否则「为什么自画像没生效」无法定位。
+        pending: pendingPool().map(portraitRecordView),
         totals: {
           added: state.self.added,
           refined: state.self.refined,
@@ -2336,7 +2441,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         },
       }
     } catch (error) {
-      return { records: [], error: errorText(error) }
+      return { records: [], pending: [], error: errorText(error) }
     }
   }
 
@@ -2391,7 +2496,15 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           // M9：模型工具写入 → 单点引用（from = 最近一条事件的 seq）
           refVia: 'tool',
         })
-        return json(result)
+        // M10：`ask` 模式下写入没有生效，而是带着 id 进了待确认队列 —— 必须如实说明，
+        // 否则模型会以为「我已经记住了」，此后不再重提，用户也就永远看不到这条提议。
+        return json(result.pending === true
+          ? {
+            ...result,
+            notice: '已提议，尚未生效：writePolicy=ask 时模型来源的写入进待确认队列，'
+              + `只有用户能用 /memory approve ${String(result.id)} 让它生效（模型无法自我批准）。`,
+          }
+          : result)
       },
     },
     {
@@ -2439,6 +2552,10 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         const status = args?.status ?? 'active'
         const rows = [...state.records.values()]
           .filter((record) => (status === 'all' ? true : record.status === status))
+          // M10：`pending` 只有 `/memory pending` 与 `memory_explain` 能看到（契约 §4.3）。
+          // 这里必须显式排除：`status:'all'` 会把待确认记录顺带列出来，而 `list()` 服务面又是
+          // 外部消费者最常用的入口 —— 一条未批准的模型猜想不该出现在任何普通列表里。
+          .filter((record) => record.status !== 'pending')
           .filter((record) => (args?.kind ? record.kind === args.kind : true))
           .sort(compareRecords)
           .slice(0, Math.max(1, Math.min(100, args?.limit ?? 50)))
@@ -2466,6 +2583,17 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         if (args?.id) {
           const target = [...state.records.values()].find((record) => record.id === args.id || record.id.startsWith(args.id as string))
           if (!target) return json({ ok: false, error: 'not_found' })
+          // M10：删除是**改状态**的路径，因此对 pending 一律拒绝并指路 —— 否则 forgot 就成了
+          // 「绕过审批直接清掉队列」的后门，而且用户会以为它「从未存在过」。
+          if (target.status === 'pending') {
+            return json({
+              ok: false,
+              error: 'pending_requires_decision',
+              id: target.id,
+              hint: `这是一条待确认写入：用 /memory approve ${target.id} 让它生效，`
+                + `或 /memory reject-pending ${target.id} 拒绝（保留审计）。`,
+            })
+          }
           // 落盘失败必须如实回报：否则「已删除」的条目重启后会复活。
           if (!(await remove(target.id))) return json({ ok: false, error: 'delete_failed', id: target.id, detail: state.openError })
           state.writes.deleted += 1
@@ -2498,7 +2626,17 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       execute: async () => {
         state.toolCalls.memory_stats = (state.toolCalls.memory_stats ?? 0) + 1
         // 结构化字段与 `/memory stats` 的文本同步（契约 §5.4 / refs §4.5）：模型不必去解析那几行中文。
-        return json({ ...handlers.stats(), sleep: { ...state.sleep }, refs: refsSummary() })
+        // M10：`writePolicy` / `pending` / `pendingMax` 同样进结构化字段 —— 模型要能自查「我写的记忆为什么没生效」。
+        return json({
+          ...handlers.stats(),
+          sleep: { ...state.sleep },
+          refs: refsSummary(),
+          writePolicy: normalizeWritePolicy(cfg.writePolicy),
+          pending: pendingPool().length,
+          pendingMax: Number.isFinite(cfg.pendingMax) ? cfg.pendingMax : DEFAULTS.pendingMax,
+          pendingPath: '模型写入进入待确认队列；只有用户能用 /memory approve <id 前缀> 让它生效（模型无法自我批准）。',
+          writes: { ...state.writes },
+        })
       },
     },
     {
@@ -2584,6 +2722,50 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   const listLine = (record: MemoryRecord): string =>
     `${record.id.slice(0, 8)}  ${record.kind.padEnd(13)} ${record.scope.level.padEnd(9)}${record.pinned ? '★' : ' '} ${record.text}`
 
+  /**
+   * M10：**除 `/memory approve` 之外没有任何路径能把 `pending` 改成 `active`**（契约 §5）。
+   * 因此所有「按 id 前缀改状态」的治理命令（restore / pin / archive / confirm / refresh…）在动手前
+   * 都要在这里被拦下并指路 —— 否则一个 `/memory restore <id>` 就等于绕过审批门。
+   */
+  const pendingGuard = (record: MemoryRecord, action: string): DshCommandResult | null =>
+    record.status === 'pending'
+      ? {
+        kind: 'error',
+        text: `这条是待确认写入（pending），/memory ${action} 不适用于它：`
+          + `先用 /memory approve ${record.id} 批准，或 /memory reject-pending ${record.id} 拒绝。`,
+      }
+      : null
+
+  // ---------------- M10：待确认队列的用户侧出口（契约 §4.2） ----------------
+  //
+  // **这是把 `pending` 变成 `active` 的唯一路径**，且只能由用户敲命令触发：
+  // 没有任何工具能改状态（`memory_*` 工具里不存在 approve/reject），模型也无法自我批准。
+  // 拒绝是置 `invalid` 而不是删除 —— 审计与 `/memory verify` 仍能看到它曾经存在（§5）。
+
+  /** 待确认记录池（含 id 前缀匹配）：approve/reject 只在这个池子里找，绝不碰其它状态。 */
+  const pendingPool = (): MemoryRecord[] => listPending(state.records.values())
+
+  /**
+   * 按 id 前缀定位一条待确认记录。
+   * 前缀不唯一 → 明确报错并列出候选；找不到 → 明确报错（都不猜、不取第一条）。
+   */
+  const resolvePending = (idPrefix: string, action: string): { record: MemoryRecord } | { error: string } => {
+    if (!idPrefix) return { error: `用法：/memory ${action} <id 前缀>（用 /memory pending 查看待确认写入）` }
+    const pool = pendingPool()
+    const matched = pool.filter((record) => record.id.startsWith(idPrefix))
+    if (matched.length === 0) {
+      return {
+        error: `待确认队列里没有匹配 "${idPrefix}" 的写入（当前 ${pool.length} 条；用 /memory pending 查看）。`
+          + '（已批准/已拒绝的记录不在队列里：/memory approve 与 /memory reject 只处理 pending。）',
+      }
+    }
+    if (matched.length > 1) {
+      const candidates = matched.map((record) => `${record.id.slice(0, 12)}  ${record.kind}  ${record.text.slice(0, 40)}`)
+      return { error: `id 前缀 "${idPrefix}" 不唯一，命中 ${matched.length} 条，请写长一点：\n${candidates.join('\n')}` }
+    }
+    return { record: matched[0]! }
+  }
+
   const exportRecords = (targetPath?: string): string => {
     const dir = cfg.exportDir ?? (cfg.reportPath ? dirname(cfg.reportPath) : process.cwd())
     const file = targetPath && isAbsolute(targetPath) ? targetPath : join(dir, targetPath ?? `memory-export-${Date.now()}.json`)
@@ -2627,11 +2809,171 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     async verify(args: string[]): Promise<DshCommandResult> {
       return await verifyRecord(String(args[0] ?? ''))
     },
+    /**
+     * M10：`/memory pending`（只读）——把待确认队列摆出来。
+     * 这是**用户唯一能看到 pending 的命令通道**（另一个是 `memory_explain` 的诊断输出）。
+     */
+    pending(): DshCommandResult {
+      const queue = pendingPool()
+      const policy = normalizeWritePolicy(cfg.writePolicy)
+      const head = `写入策略：${policy}（待确认队列对模型来源写入生效；规则捕获与用户命令不受影响）`
+      const body = formatPendingQueue(state.records.values(), cfg)
+      if (queue.length === 0) return { kind: 'success', text: `${head}\n${body}` }
+      const hint = policy === 'ask'
+        ? ''
+        : `\n（提示：当前 writePolicy=${policy}，新写入不会自动进队列；队列里这些是此前 writePolicy=ask 时留下的。）`
+      return { kind: 'success', text: `${head}\n${body}${hint}` }
+    },
+    /**
+     * M10：`/memory approve <id 前缀>` —— 让一条待确认写入生效。
+     *
+     * 获批的若是 `agent_self`，**此刻才**跑 `planPortraitUpdate` 收敛（契约 §4.2）：
+     * 入队时不知道将来库状态如何，批准时才知道 —— 按当时的库状态决定 add/reinforce/refine/supersede。
+     * 收敛被跳过（如撞上用户所有物 / too-short）时**不落盘、不改状态**，如实报错。
+     */
+    async approve(args: string[]): Promise<DshCommandResult> {
+      const idPrefix = String(args[0] ?? '')
+      const resolved = resolvePending(idPrefix, 'approve')
+      if ('error' in resolved) return { kind: 'error', text: resolved.error }
+      const record = resolved.record
+      record.status = 'active'
+      // M9：批准是用户命令 → 附着单点引用（与 /memory restore 同一语义）
+      attachRefs(record, commandRefs())
+      const portraitFields = asPortrait(record)
+
+      // agent_self：批准时才收敛。计划基于**当时的**库状态，因此候选要排除它自己
+      // （它正从 pending 变 active，不应该被当成「既有条目」而自我 reinforce）。
+      if (record.kind === 'agent_self') {
+        const others = [...state.records.values()].filter((candidate) => candidate.id !== record.id)
+        let planned: PortraitPlan | null = null
+        try {
+          const facet = normalizeFacet(portraitFields.facet, 'work')
+          const candidate: PortraitCandidate = {
+            text: record.text,
+            facet,
+            subject: portraitSubjectFor(facet, portraitKeyOf(record.subject)),
+            origin: record.origin,
+            confidence: portraitConfidenceOf(record.confidence),
+            observedAt: record.observedAt,
+          }
+          const plannedDecision = planPortraitUpdate(candidate, others, cfg)
+          planned = {
+            candidate,
+            decision: plannedDecision,
+            outcome: {
+              action: plannedDecision.action,
+              reason: plannedDecision.reason,
+              facet,
+              subject: portraitSubjectFor(facet, portraitKeyOf(record.subject)),
+              targetId: plannedDecision.targetId,
+            },
+          }
+        } catch (error) {
+          state.self.lastError = `portrait plan failed: ${errorText(error)}`
+          planned = null
+        }
+        if (planned && planned.decision.action === 'skip') {
+          // 不落盘、不改状态：这条待确认写入在批准时被保护规则挡下，如实报错。
+          state.self.skipped += 1
+          return {
+            kind: 'error',
+            text: `批准未生效：这条自画像写入被自画像保护规则挡下（${planned.decision.reason}）。`
+              + '它仍留在待确认队列里（可用 /memory reject 清除）。',
+          }
+        }
+        if (planned && (planned.decision.action === 'reinforce' || planned.decision.action === 'refine')) {
+          const targetId = planned.decision.targetId
+          const target = targetId ? state.records.get(targetId) : undefined
+          if (target) {
+            // 先撤销刚才的置位：这次批准收敛为「更新既有条目」，不新建、不留 pending 副本。
+            record.status = 'invalid'
+            record.invalidAt = Date.now()
+            target.text = planned.decision.text || target.text
+            target.confidence = planned.decision.confidence
+            target.observedAt = Date.now()
+            asPortrait(target).facet = planned.outcome.facet
+            if (ORIGIN_RANK[record.origin] > ORIGIN_RANK[target.origin]) target.origin = record.origin
+            if (record.pinned === true) target.pinned = true
+            const sessions = new Set([...(target.reinforcement?.sessions ?? []), ...(record.reinforcement?.sessions ?? [])])
+            target.reinforcement = { sessions: [...sessions], count: (target.reinforcement?.count ?? 0) + 1 }
+            attachRefs(target, refsOf(record))
+            target.hash = recordHash(target)
+            await persist(target)
+            await persist(record)
+            state.writes.approved += 1
+            state.self.refined += 1
+            flush()
+            return {
+              kind: 'success',
+              text: `已批准 ${record.id.slice(0, 8)}：收敛为 ${planned.decision.action}（${planned.decision.reason}）`
+                + `，更新既有自画像条目 ${target.id.slice(0, 8)}，未新建。\n${target.text}`,
+            }
+          }
+        }
+        if (planned && planned.decision.action === 'supersede') {
+          const target = planned.decision.targetId ? state.records.get(planned.decision.targetId) : undefined
+          if (target && planned.decision.archiveTarget) {
+            target.status = 'archived'
+            asPortrait(target).supersededBy = record.id
+            record.supersedes = [...new Set([...(record.supersedes ?? []), target.id])]
+            await persist(target)
+          }
+          state.self.superseded += 1
+        } else if (planned) {
+          state.self.added += 1
+        }
+        portraitFields.facet = planned ? planned.outcome.facet : portraitFields.facet
+        if (planned) record.subject = planned.outcome.subject
+        if (planned) {
+          record.text = planned.decision.text || record.text
+          record.confidence = planned.decision.confidence
+        }
+        record.hash = recordHash(record)
+      }
+
+      await persist(record)
+      state.writes.approved += 1
+      flush()
+      const detail = record.kind === 'agent_self' ? '（自画像已在批准时收敛）' : ''
+      return { kind: 'success', text: `已批准 ${record.id.slice(0, 8)}：status → active${detail}，从现在起它可以被注入。\n${record.text}` }
+    },
+    /**
+     * M10：`/memory reject <id 前缀>` —— 拒绝一条待确认写入。
+     * 置 `invalid` 而**不删除**：审计与 `/memory verify` 仍能看到它曾经存在（契约 §5）。
+     */
+    async rejectPending(args: string[]): Promise<DshCommandResult> {
+      const idPrefix = String(args[0] ?? '')
+      const resolved = resolvePending(idPrefix, 'reject-pending')
+      if ('error' in resolved) return { kind: 'error', text: resolved.error }
+      const record = resolved.record
+      record.status = 'invalid'
+      record.invalidAt = Date.now()
+      // 登记指纹：同类自我观察不再重复产生（与 /memory reject 同一效果）
+      state.rejectedHashes.add(record.hash)
+      attachRefs(record, commandRefs())
+      await persist(record)
+      state.writes.pendingRejected += 1
+      flush()
+      return {
+        kind: 'success',
+        text: `已拒绝 ${record.id.slice(0, 8)}：status → invalid（保留用于审计，不会注入）。`
+          + `同类自我观察也不会再产生。\n${record.text}`,
+      }
+    },
+    /**
+     * 命令行的 kebab-case 入口：`/memory reject-pending <id 前缀>`。
+     * 与 `rejectPending` 是同一个实现（两条键指向同一个函数对象），只是键名要能被命令行查到。
+     */
+    async 'reject-pending'(args: string[]): Promise<DshCommandResult> {
+      return await handlers.rejectPending(args)
+    },
     async forget(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
       if (!id) return { kind: 'error', text: '用法：/memory forget <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
+      const blocked = pendingGuard(target, 'forget')
+      if (blocked) return blocked
       if (!(await remove(target.id))) return { kind: 'error', text: removeFailureText(target.id) }
       state.writes.deleted += 1
       flush()
@@ -2642,6 +2984,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (!id) return { kind: 'error', text: '用法：/memory restore <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
+      // M10：restore 会把状态改成 active —— 对 pending 就是绕过审批门，必须拦下。
+      const blocked = pendingGuard(target, 'restore')
+      if (blocked) return blocked
       target.status = 'active'
       target.invalidAt = null
       // M9：用户命令也是「出处」——把本次命令附着为单点引用
@@ -2665,6 +3010,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (!id) return { kind: 'error', text: '用法：/memory pin <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
+      const blocked = pendingGuard(target, 'pin')
+      if (blocked) return blocked
       target.pinned = !target.pinned
       attachRefs(target, commandRefs())
       await persist(target)
@@ -2675,6 +3022,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (!id) return { kind: 'error', text: '用法：/memory archive <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
+      const blocked = pendingGuard(target, 'archive')
+      if (blocked) return blocked
       target.status = 'archived'
       attachRefs(target, commandRefs())
       await persist(target)
@@ -2722,6 +3071,11 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       if (!id) return { kind: 'error', text: '用法：/memory reject <id 前缀>（拒绝一条自我观察）' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
+      // M10：待确认记录**只能**用取待确认队列的 `reject-pending` 处理，避免两条路径语义重叠
+      // （这条会把 origin/状态当成「已生效的自我观察」，与审批门的语义不同）。
+      if (target.status === 'pending') {
+        return { kind: 'error', text: `这是一条待确认写入，请改用 /memory reject-pending ${target.id}（待确认队列的专用出口）。` }
+      }
       target.status = 'invalid'
       target.invalidAt = Date.now()
       state.rejectedHashes.add(target.hash)
@@ -2751,9 +3105,18 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       const kind = kindRaw as MemoryKind | undefined
       const scope = scopeRaw as ScopeLevel | undefined
       // 多条件 **AND**（旧实现是 OR：`--kind=a --scope=b` 会删掉「所有 a」加上「所有 b」）。
+      // M10：待确认记录不参与 clear —— 它是「等用户决定」的东西，不该被 `--all` 顺手抹掉
+      // （要清就明确地 /memory approve 或 /memory reject-pending，审计链才完整）。
+      const pendingSkipped = [...state.records.values()].filter((record) =>
+        record.status === 'pending'
+        && (all || (kind !== undefined && record.kind === kind)) && (scope === undefined || record.scope.level === scope)).length
       const victims = [...state.records.values()].filter((record) =>
-        (all || (kind !== undefined && record.kind === kind)) && (scope === undefined || record.scope.level === scope))
-      if (victims.length === 0) return { kind: 'success', text: '没有匹配的记忆，未删除任何条目。' }
+        record.status !== 'pending'
+        && (all || (kind !== undefined && record.kind === kind)) && (scope === undefined || record.scope.level === scope))
+      const pendingNote = pendingSkipped > 0 ? `（跳过 ${pendingSkipped} 条待确认写入：请用 /memory pending 处理）` : ''
+      if (victims.length === 0) {
+        return { kind: 'success', text: pendingSkipped > 0 ? `没有可删除的记忆${pendingNote}` : '没有匹配的记忆，未删除任何条目。' }
+      }
       let deleted = 0
       let failed = 0
       for (const victim of victims) {
@@ -2769,7 +3132,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           text: `已永久删除 ${deleted} 条；${failed} 条落盘失败（${state.openError ?? '未知错误'}），重启后仍在。`,
         }
       }
-      return { kind: 'success', text: `已永久删除 ${deleted} 条记忆（不可恢复）。` }
+      return { kind: 'success', text: `已永久删除 ${deleted} 条记忆（不可恢复）${pendingNote}。` }
     },
     async import(args: string[]): Promise<DshCommandResult> {
       const path = args[0]
@@ -2832,6 +3195,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           `记录数：${state.records.size}（active ${listActive(state.records.values()).length}，播种 ${state.seeded}）`,
           `按类型：${JSON.stringify(byKind)}`,
           `写入：创建 ${state.writes.created} / 合并 ${state.writes.merged} / 拒写 ${state.writes.rejected} / 删除 ${state.writes.deleted}`,
+          // M10：N 为 0 时也要显示策略值 —— 否则「为什么模型写入没进队列」只能靠猜配置。
+          `待确认：${pendingPool().length} 条（writePolicy=${normalizeWritePolicy(cfg.writePolicy)}；`
+            + `累计入队 ${state.writes.pending} / 批准 ${state.writes.approved} / 拒绝 ${state.writes.pendingRejected}）`,
           `工具调用：${JSON.stringify(state.toolCalls)}`,
           `渲染：context=${state.renders.context} section=${state.renders.section}，耗时 last=${state.renderMs.last}ms max=${state.renderMs.max}ms`,
           `注入：context=${state.injected.context.length} 行 / section=${state.injected.section.length} 行`,
@@ -3023,7 +3389,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       return { kind: 'error', text: `未知的 self 子命令「${sub}」。${SELF_USAGE}` }
     },
     help(): DshCommandResult {
-      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | verify <id> | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
+      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | verify <id> | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | pending | approve <id> | reject-pending <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
     },
   }
 
@@ -3435,7 +3801,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     ctx.commands.register({
       name: 'memory',
       description: '查看与管理长期记忆',
-      input: { hint: 'list | show <id> | verify <id> | self | forget <id> | export | stats' },
+      input: { hint: 'list | show <id> | verify <id> | pending | self | forget <id> | export | stats' },
       handler: async (invocation) => {
         const parts = String(invocation?.rawInput ?? '').trim().split(/\s+/u).filter(Boolean)
         const sub = parts.shift() ?? 'list'

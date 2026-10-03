@@ -8,15 +8,18 @@ import assert from 'node:assert/strict'
 import type {
   MakeRecordInput,
   MemoryConfig,
+  MemoryOrigin,
   MemoryRecord,
   MemoryRef,
   MemoryScope,
+  ModelWriteDecision,
   PortraitCandidate,
   ReflectInput,
   SelfFacet,
   SleepCandidate,
   SleepPlan,
   SleepSessionInput,
+  WritePolicy,
 } from '../lib/lib.js'
 
 import {
@@ -35,6 +38,7 @@ import {
   composeGistText,
   composeSubjectSummary,
   containment,
+  decideModelWrite,
   deriveOriginFromMessages,
   detectWorkspaceMarkers,
   effectiveImportance,
@@ -44,6 +48,7 @@ import {
   facetOf,
   findConflicts,
   fnv1a,
+  formatPendingQueue,
   formatRefs,
   formatSleepPlan,
   isEcho,
@@ -51,6 +56,7 @@ import {
   INTRO_NOTICE,
   lexicalMatch,
   listActive,
+  listPending,
   makeRecord,
   maskPii,
   memoryMatch,
@@ -59,6 +65,8 @@ import {
   normalizeFacet,
   normalizeRefs,
   normalizeText,
+  normalizeWritePolicy,
+  pendingQueueFull,
   pickMergeGroups,
   planPortraitUpdate,
   portraitHistory,
@@ -1848,4 +1856,178 @@ test('formatSleepPlan：补录候选行带引用（指回原消息 seq）；无�
     origin: 'user_explicit', confidence: 1, hash: 'h',
   }
   assert.match(formatSleepPlan({ ...plan, backfill: [bare] }, cfg), /会话 ses-lega/u)
+})
+
+// ---------------- M10：写入审批门（契约 docs/write-policy.md §3/§6） ----------------
+
+/** 一条待确认记录的最小形状（默认 user_profile）。 */
+function pendingRecord(text: string, observedAt: number): MemoryRecord {
+  return makeRecord({ kind: 'user_profile', text, status: 'pending', observedAt })
+}
+
+test('DEFAULTS：M10 新增 2 个配置键与默认值（契约 §2.1）', () => {
+  assert.equal(DEFAULTS.writePolicy, 'auto', '默认 auto ＝ 0.5.9 行为：模型写入立刻生效')
+  assert.equal(DEFAULTS.pendingMax, 50)
+})
+
+test('normalizeWritePolicy：合法值原样返回，非法/缺失回落 auto（契约 §3/§6）', () => {
+  assert.equal(normalizeWritePolicy('auto'), 'auto')
+  assert.equal(normalizeWritePolicy('ask'), 'ask')
+  assert.equal(normalizeWritePolicy('off'), 'off')
+  assert.equal(normalizeWritePolicy(' Ask '), 'ask', '容忍空白与大小写（与 normalizeFacet 同口径）')
+  for (const bad of [undefined, null, '', 'auto!', 'always', 'on', 0, 1, true, false, {}, [], Number.NaN]) {
+    assert.equal(normalizeWritePolicy(bad), 'auto', `${String(bad)} 应回落 auto`)
+  }
+})
+
+test('decideModelWrite：3 策略 × 4 来源（契约 §3/§6）', () => {
+  const origins: MemoryOrigin[] = ['model_proposed', 'observed', 'user_explicit', 'user_correction']
+  const expectations: Array<{ policy: WritePolicy; decisions: ModelWriteDecision[] }> = [
+    { policy: 'auto', decisions: ['apply', 'apply', 'apply', 'apply'] },
+    { policy: 'ask', decisions: ['queue', 'apply', 'apply', 'apply'] },
+    { policy: 'off', decisions: ['reject', 'apply', 'apply', 'apply'] },
+  ]
+  for (const { policy, decisions } of expectations) {
+    assert.deepEqual(
+      origins.map((origin) => decideModelWrite(policy, origin)),
+      decisions,
+      `策略 ${policy}`,
+    )
+  }
+  // 非法/缺失策略按 auto；非模型来源即使策略非法也永远 apply（门控不碰用户与规则捕获）
+  for (const bad of [undefined, null, '', 'bogus', 42, {}, []]) {
+    assert.equal(decideModelWrite(bad, 'model_proposed'), 'apply', `${String(bad)} 按 auto`)
+    assert.equal(decideModelWrite(bad, 'observed'), 'apply')
+    assert.equal(decideModelWrite(bad, 'user_correction'), 'apply')
+  }
+  assert.equal(decideModelWrite(DEFAULTS.writePolicy, 'model_proposed'), 'apply', '默认配置下行为不变')
+})
+
+test('listPending：只取 pending，按 observedAt 从新到旧，且不改动入参', () => {
+  const records = [
+    pendingRecord('老', 100),
+    makeRecord({ kind: 'user_profile', text: '生效', status: 'active', observedAt: 999 }),
+    pendingRecord('新', 300),
+    makeRecord({ kind: 'user_profile', text: '被拒', status: 'invalid', observedAt: 999 }),
+    pendingRecord('中', 200),
+    makeRecord({ kind: 'semantic', text: '归档', status: 'archived', observedAt: 999 }),
+  ]
+  assert.deepEqual(listPending(records).map((record) => record.text), ['新', '中', '老'])
+  assert.deepEqual(records.map((record) => record.text), ['老', '生效', '新', '被拒', '中', '归档'], '不原地改入参')
+  assert.deepEqual(listPending([]), [])
+})
+
+test('pendingQueueFull：count >= 上限即满；<=0 不设上限；NaN/非有限回落默认 50（契约 §2.1/§6）', () => {
+  assert.equal(pendingQueueFull(49, cfg), false)
+  assert.equal(pendingQueueFull(50, cfg), true, '刚好到上限即满')
+  assert.equal(pendingQueueFull(51, cfg), true)
+  assert.equal(pendingQueueFull(3, { ...cfg, pendingMax: 3 }), true)
+
+  assert.equal(pendingQueueFull(10_000, { ...cfg, pendingMax: 0 }), false, '0 = 不设上限')
+  assert.equal(pendingQueueFull(10_000, { ...cfg, pendingMax: -1 }), false, '负数 = 不设上限')
+  assert.equal(pendingQueueFull(10_000, { ...cfg, pendingMax: Number.NaN }), true, 'NaN 回落 50')
+  assert.equal(pendingQueueFull(49, { ...cfg, pendingMax: Number.NaN }), false)
+  assert.equal(
+    pendingQueueFull(10_000, { ...cfg, pendingMax: Number.POSITIVE_INFINITY }),
+    true,
+    'Infinity 属非有限 → 回落默认 50（不是无限队列）',
+  )
+  assert.equal(pendingQueueFull(50, { ...cfg, pendingMax: Number.POSITIVE_INFINITY }), true)
+  assert.equal(
+    pendingQueueFull(10_000, { ...cfg, pendingMax: undefined as unknown as number }),
+    true,
+    '缺失回落默认',
+  )
+})
+
+test('formatPendingQueue：空队列给出「没有待确认的写入」而不是空白（契约 §6）', () => {
+  const text = formatPendingQueue([], cfg)
+  assert.match(text, /没有待确认的写入/u)
+  assert.notEqual(text.trim(), '')
+  // 非 pending 记录不算待确认：队列仍报空
+  assert.match(
+    formatPendingQueue([makeRecord({ kind: 'user_profile', text: '已生效' })], cfg),
+    /没有待确认的写入/u,
+  )
+})
+
+test('formatPendingQueue：逐行带 id/kind(facet)/origin/时间/refs/正文预览，从新到旧', () => {
+  const selfRecord = makeRecord({
+    id: 'm_self_0001',
+    kind: 'agent_self',
+    facet: 'persona',
+    text: '我倾向先给结论。',
+    origin: 'model_proposed',
+    status: 'pending',
+    observedAt: Date.UTC(2026, 9, 3, 7, 40),
+    refs: [{ sessionId: 'ses-84a547da', from: 120, to: 180, via: 'tool' }],
+  })
+  const factRecord = makeRecord({
+    id: 'm_fact_0002',
+    kind: 'semantic',
+    text: '构建用 pnpm。',
+    origin: 'model_proposed',
+    status: 'pending',
+    observedAt: Date.UTC(2026, 9, 3, 6, 0),
+  })
+  const rows = formatPendingQueue([factRecord, selfRecord], cfg)
+    .split('\n')
+    .filter((line) => line.startsWith('  - '))
+  assert.equal(rows.length, 2)
+
+  const selfRow = rows[0]!
+  assert.ok(selfRow.startsWith('  - m_self_0001 '), '行首是 id 前缀（供 approve 直接取用）')
+  assert.ok(selfRow.includes('agent_self/persona'), 'agent_self 带 facet')
+  assert.ok(selfRow.includes('model_proposed'), 'origin')
+  assert.match(selfRow, /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/u, '时间')
+  assert.ok(selfRow.includes('ses-84a547da#120-180'), 'refs 走 formatRefs')
+  assert.ok(selfRow.includes('我倾向先给结论。'), '正文预览')
+
+  const factRow = rows[1]!
+  assert.ok(factRow.includes('m_fact_0002'), '新记录在前（observedAt 从新到旧）')
+  assert.ok(factRow.includes('semantic'))
+  assert.ok(!factRow.includes('semantic/'), '非 agent_self 不带 facet')
+  assert.ok(!factRow.includes('引用 '), '无引用时不给空引用段')
+})
+
+test('formatPendingQueue：正文预览压成单行（换行不得伪造出独立行）', () => {
+  const record = makeRecord({
+    kind: 'user_profile',
+    text: '第一行\n第二行',
+    origin: 'model_proposed',
+    status: 'pending',
+    observedAt: 1_700_000_000_000,
+  })
+  const lines = formatPendingQueue([record], cfg).split('\n')
+  assert.equal(lines.length, 3, '块头 + 1 条 + 尾行提示')
+  assert.match(lines[1]!, /第一行 第二行/u)
+})
+
+test('formatPendingQueue：上限如实显示（<=0 显示不限）', () => {
+  const record = pendingRecord('待确认。', 1)
+  assert.match(formatPendingQueue([record], cfg), /上限 50/u)
+  assert.match(formatPendingQueue([record], { ...cfg, pendingMax: 0 }), /上限 不限/u)
+})
+
+test('pending 不进注入/召回路径：listActive/recallRecords/renderContextBlock/renderSelfBlock 只认 active', () => {
+  const pendingFact = makeRecord({
+    kind: 'user_profile',
+    text: '未批准的模型猜想。',
+    origin: 'model_proposed',
+    status: 'pending',
+    observedAt: 5,
+  })
+  const pendingSelf = makeRecord({
+    kind: 'agent_self',
+    facet: 'work',
+    text: '未批准的自画像猜想。',
+    origin: 'model_proposed',
+    status: 'pending',
+    observedAt: 5,
+    confidence: 0.99,
+  })
+  assert.deepEqual(listActive([pendingFact, pendingSelf]), [])
+  assert.equal(recallRecords([pendingFact], { query: '未批准的模型猜想' }).length, 0)
+  assert.ok(!renderContextBlock([pendingFact], cfg, null).text.includes('未批准的模型猜想'))
+  assert.ok(!renderSelfBlock([pendingSelf], cfg).text.includes('未批准的自画像猜想'))
 })

@@ -1,5 +1,5 @@
-import type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryRef, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet } from './types.js';
-export type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryRef, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet, } from './types.js';
+import type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryRef, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet, WritePolicy } from './types.js';
+export type { CaptureCandidate, MakeRecordInput, MemoryConfig, MemoryKind, MemoryOrigin, MemoryRecord, MemoryRef, MemoryScope, RecallHit, RecallOptions, RenderedBlock, ScopeLevel, SelfFacet, WritePolicy, } from './types.js';
 /** `makeRecord` 的入参：`MakeRecordInput` 再加 `sessionId`（types.ts 目前缺这个字段）。 */
 export interface MakeRecordInputWithSession extends MakeRecordInput {
     sessionId?: string;
@@ -541,4 +541,28 @@ export declare function formatRefs(refs: readonly MemoryRef[] | undefined, optio
 }): string;
 /** 机器可读的引用串（写进工具输出/预览）：`sessionId#from-to`，多条用 `;` 分隔。 */
 export declare function refsToString(refs: readonly MemoryRef[] | undefined): string;
+/**
+ * 容错解析策略：`'auto' | 'ask' | 'off'` 原样返回，其余一律回落 `'auto'`。
+ * 容忍大小写与空白（与 `normalizeFacet` 同口径：用户手写配置 `"Ask"` 不该被当成非法而静默放宽）。
+ */
+export declare function normalizeWritePolicy(value: unknown): WritePolicy;
+/** 模型来源写入的处置。 */
+export type ModelWriteDecision = 'apply' | 'queue' | 'reject';
+/**
+ * 模型来源写入的处置（纯函数、确定性）：
+ * `'auto'` → `'apply'`、`'ask'` → `'queue'`、`'off'` → `'reject'`；非法策略按 `'auto'`。
+ * **非 `model_proposed` 来源永远 `'apply'`** —— 门控不认识策略，也不认识用户自己说的话。
+ */
+export declare function decideModelWrite(policy: unknown, origin: MemoryOrigin): ModelWriteDecision;
+/** 待确认记录：`status === 'pending'`，按 `observedAt` **从新到旧**（同刻保持入参顺序，不改入参）。 */
+export declare function listPending(records: Iterable<MemoryRecord>): MemoryRecord[];
+/** 队列是否已满：`count >= 上限`；上限 `<= 0` 表示不设上限（永不判满）。 */
+export declare function pendingQueueFull(count: number, cfg: MemoryConfig): boolean;
+/**
+ * `/memory pending` 的渲染：空队列必须给出「没有待确认的写入」而不是空白。
+ *
+ * 每条一行：id（供 `/memory approve <id 前缀>` 直接取用）· kind（`agent_self` 带 facet）·
+ * origin · 时间 · 引用（`formatRefs`）· 正文预览（过 `clampText` 压成单行）。
+ */
+export declare function formatPendingQueue(records: Iterable<MemoryRecord>, cfg: MemoryConfig): string;
 //# sourceMappingURL=lib.d.ts.map

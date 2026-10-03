@@ -103,6 +103,11 @@ interface HarnessOptions {
   sessionQuery?: unknown
   /** true 时领域打开失败（验证 `/sleep --apply` 在没有可写领域时中止）。 */
   failOpen?: boolean
+  /**
+   * M10：领域打开前预置的盘上数据 —— 模拟「上一个进程留下的库」。
+   * 启动新实例时走的就是 `openDomain` 的加载分支，因此可以断言 pending 会随普通记录一起被加载。
+   */
+  seedDomainRows?: Map<string, Json>
 }
 
 interface Harness {
@@ -134,7 +139,7 @@ interface Harness {
 
 /** 假领域：把「落盘」变成可观测、可注入故障的内存表。 */
 function makeFakeDomain(options: HarnessOptions): { domain: Json; control: DomainControl } {
-  const rows = new Map<string, Json>()
+  const rows = new Map<string, Json>(options.seedDomainRows ?? [])
   const puts: Array<{ key: string; value: Json }> = []
   const deletes: string[] = []
   const pending: Array<() => void> = []
@@ -2261,6 +2266,532 @@ test('host#52 refs：用户命令路径附着单点引用（self set 与 pin 都
     { sessionId: 'session-1', from: 30, via: 'command' },
   ])
   assert.match((await harness.runCommand('stats')).text, /引用：已附着 2 次/u)
+})
+
+// ================================================================ M10 写入审批门（writePolicy）
+// 契约：docs/write-policy.md 第 4/5/6 节。宿主侧三件事：`writeMemory` 的三分流、
+// pending 记录**绝不进任何注入路径**、以及「只有用户命令能把 pending 变成 active」。
+// 这里对读取路径一律做**真实渲染断言**（不是查 `list()`）：只读白名单漏一条，
+// 未批准的模型猜想就会进系统提示 —— 那是本功能最严重的失效模式。
+
+/** 一次返回结构化结果的 `memory_write` 工具调用（M10 要读 ok/pending/id）。 */
+const writeTool = async (harness: Harness, args: Json): Promise<Json> =>
+  JSON.parse(String(await harness.tool('memory_write').execute(args))) as Json
+
+/**
+ * 一次带会话上下文的 `memory_write` 工具调用。
+ *
+ * 为什么要带 `exec`：常驻块（context 通道）按 workspace 过滤，而 `semantic` 这类 kind 的默认
+ * scope 是 `workspace`，其 key 由 cwd 的 hash 决定。不带 cwd 时 key 是 `'*'`，只有「没有 cwd 的
+ * 装配上下文」才会渲染它 —— 带一个明确 cwd 才能写出「本条会话真的能看到」的那种条目。
+ */
+const writeToolInWorkspace = async (harness: Harness, args: Json, cwd = WORKSPACE_CWD): Promise<Json> =>
+  JSON.parse(String(await harness.tool('memory_write').execute(args, {
+    agent: { session: { id: 'session-1', seq: 5, header: { cwd } } },
+  }))) as Json
+
+/**
+ * 常驻块（R1：section + context 两条注入通道）的真实渲染文本。
+ *
+ * `context` 通道按 workspace 过滤：只收 profile 级与「当前 workspace」级的条目，
+ * 匹配用的 key 是 cwd 的 hash（`workspaceKeyOf`）。这里把**两种装配上下文都渲染一遍**
+ * （无 cwd / 与 `writeToolInWorkspace` 相同的 cwd），只要任一路径把 pending 放进来就算泄漏 ——
+ * 断言因此不会因为「查询的 workspace 恰好不匹配」而变成假阳性。
+ */
+const WORKSPACE_CWD = 'C:\\work\\demo'
+const residentText = (harness: Harness): string =>
+  [
+    harness.sections[0]!.text(),
+    harness.contexts[0]!.text({ agent: { session: { header: { cwd: null } } } }),
+    harness.contexts[0]!.text({ agent: { session: { header: { cwd: WORKSPACE_CWD } } } }),
+  ].map(String).join('\n')
+
+/** 本插件追加进 decision 的 runtime-context 正文（R2 + 反思/初次设定提示）。 */
+const appendedText = (appended: Json[]): string =>
+  appended.map((message) => (message.content as Json[]).map((block) => String(block.text)).join('')).join('\n')
+
+/** 库里的全部记录（含 pending / invalid / archived）——用 `service.list()` 是因为它不过滤状态。 */
+const allRows = (harness: Harness): Json[] => rowsOf(harness)
+
+// ---------------------------------------------------------------- 53. ask：工具写入落成 pending
+
+test('host#53 ask 模式：工具写入落成 pending 且 ok:true，此刻不执行自画像收敛', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const result = await writeTool(harness, { kind: 'semantic', text: '构建流程统一用 pnpm，产物输出到 dist 目录' })
+  assert.equal(result.ok, true, '入队不是失败：模型要能区分「已提议」与「被拒绝」')
+  assert.equal(result.pending, true, '必须明确回报 pending:true')
+  assert.ok(typeof result.id === 'string' && (result.id as string).length > 0, '要给出 id 供 /memory approve 使用')
+  assert.equal(result.text, '构建流程统一用 pnpm，产物输出到 dist 目录')
+  assert.match(String(result.notice), /\/memory approve/u, '必须告诉模型/用户怎么让它生效')
+  assert.match(String(result.notice), /模型无法自我批准/u)
+  assert.equal(result.status, undefined, 'pending 不是 created/merged：没有生效')
+
+  // 落盘了（重启后还在），但状态是 pending、不进 active 集合
+  const rows = allRows(harness)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]!.status, 'pending')
+  assert.ok(harness.domain.puts.some((put) => put.key === result.id), 'pending 记录照常落盘')
+  assert.equal(harness.memory().recall({ query: '构建流程 pnpm dist' }).length, 0, '待确认不进召回')
+
+  // agent_self：入队时**不**跑收敛（收敛推迟到批准时）
+  const selfWrite = await writeTool(harness, { kind: 'agent_self', facet: 'work', subject: 'style', text: '我在动手改代码前会先跑通最小验证路径。' })
+  assert.equal(selfWrite.pending, true)
+  assert.equal(selfWrite.portrait, undefined, '入队时不得产出收敛决策')
+  const self = harness.reportState().self as Json
+  assert.equal(Number(self.added), 0, '入队不计入 add')
+  assert.equal(Number(self.refined), 0)
+  assert.equal(Number(self.superseded), 0)
+  assert.equal(Number(self.skipped), 0, '入队也不计 skip：收敛根本没发生')
+})
+
+// ---------------------------------------------------------------- 54. 关键安全测试：pending 不进常驻块与 R2
+
+test('host#54 关键安全测试：pending 记录不出现在常驻块与 R2（真实渲染断言）', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const FACT = '未批准的模型猜想：构建流程统一改用 bun 并输出到 build 目录'
+  const PORTRAIT = '未批准的自画像猜想：我会在深夜工作时反复确认缩进宽度是否统一'
+  const queued = await writeToolInWorkspace(harness, { kind: 'semantic', text: FACT, subject: 'build.tool' })
+  const queuedSelf = await writeTool(harness, { kind: 'agent_self', facet: 'work', subject: 'style', text: PORTRAIT })
+  assert.equal(queued.pending, true)
+  assert.equal(queuedSelf.pending, true)
+
+  // 反面对照（先做）：写一条**立刻生效**的记录（origin=observed，不进队列），
+  // 证明常驻块本身渲染正常 —— 否则「看不到 pending」可能只是因为块是空的，那是假阳性。
+  const control = harness.memory().write({
+    kind: 'semantic', text: '对照记录：这个项目的构建工具链与产物目录约定', origin: 'observed', subject: 'control',
+    scope: { level: 'workspace', key: workspaceKeyOf(WORKSPACE_CWD) ?? '*' },
+  })
+  assert.equal((await control).ok, true)
+  const resident = residentText(harness)
+  assert.ok(resident.includes('对照记录'), `常驻块必须能渲染同 scope 的 active 条目：${resident}`)
+  assert.ok(!resident.includes('未批准的模型猜想'), `常驻块不得出现 pending：${resident}`)
+  assert.ok(!resident.includes('未批准的自画像猜想'), 'section 通道（自画像）同样不得出现 pending')
+
+  // R2：走真实的 pre-step，查询词与正文高度重合（最容易被召回的情形）
+  const recalled = appendedText(await stepTurn(harness, 3, '构建流程是不是改成了 bun 输出到 build 目录？'))
+  assert.ok(!recalled.includes('未批准的模型猜想'), `R2 不得出现 pending：${recalled}`)
+  assert.doesNotMatch(recalled, /bun/u, 'pending 的正文（含 bun）不得被召回')
+
+  // 项目印象重算：带标记的回合不得让 pending 混进印象
+  const agent = agentWith('C:\\work\\demo')
+  harness.roots.push(agent)
+  harness.emitSync('session/event', agent.session, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '记住：这个项目的构建统一用 pnpm 并且产物放在 dist。' }] },
+  })
+  await harness.emit('agent/turn-stopping', { agent })
+  await harness.settle()
+  assert.ok(!residentText(harness).includes('未批准的模型猜想'), '捕获刷新印象后依然不得出现 pending')
+
+  // 整合（合并/冲突/归档/摘要/固化）：pending 一律不参与
+  assert.equal((await harness.runCommand('consolidate')).kind, 'success')
+  const pendingNow = allRows(harness).filter((row) => row.status === 'pending')
+  assert.equal(pendingNow.length, 2, '整合不得改动 pending 的状态')
+  assert.ok(!residentText(harness).includes('未批准的模型猜想'), '整合之后常驻块依然干净')
+
+  // 其它只读/工具读取路径：一律看不到 pending
+  assert.doesNotMatch(String((await harness.tool('memory_list').execute({ status: 'all' }))), /未批准的模型猜想/u,
+    'memory_list --status=all 不得列出 pending')
+  assert.doesNotMatch(String((await harness.tool('memory_list').execute({ kind: 'agent_self', status: 'all' }))), /未批准的自画像猜想/u)
+  assert.doesNotMatch(String((await harness.tool('memory_recall').execute({ query: '未批准的模型猜想 bun build' }))), /未批准的模型猜想/u,
+    'memory_recall 不得召回 pending')
+  assert.doesNotMatch((await harness.runCommand('list --archived')).text, /未批准的模型猜想/u, '/memory list 不得列出 pending')
+  // search 用 `includeArchived: true`（归档仍可检索），但 pending 不在「归档」语义里 —— 必须看不见
+  const searchText = (await harness.runCommand('search 未批准的模型猜想')).text
+  assert.doesNotMatch(searchText, /未批准的模型猜想：构建流程/u, `/memory search 不得命中 pending：${searchText}`)
+  assert.doesNotMatch((await harness.runCommand('stats')).text, /未批准的模型猜想/u, 'stats 只报条数，不列正文')
+
+  // 例外：诊断路径必须能**显式看到** pending（否则「为什么没生效」无法定位）
+  const explain = String(await harness.tool('memory_explain').execute({ text: '我回答问题的风格是什么' }))
+  assert.match(explain, /未批准的自画像猜想/u, 'memory_explain 的 pending 区必须能诊断到待确认的自画像写入')
+  const pendingDiag = (JSON.parse(explain) as Json).portrait as Json
+  assert.equal((pendingDiag.pending as Json[]).length, 2, '诊断输出要列出全部 pending')
+  assert.match((await harness.runCommand('pending')).text, /未批准的模型猜想/u, '/memory pending 必须能列出')
+
+  // 反面对照：批准之后，同一条记录立刻能进常驻块（证明上面的「看不到」不是因为渲染坏了）
+  const queuedRow = allRows(harness).find((row) => String(row.text).startsWith('未批准的模型猜想'))!
+  assert.equal((await harness.runCommand(`approve ${String(queuedRow.id)}`)).kind, 'success')
+  assert.ok(residentText(harness).includes('未批准的模型猜想'), '批准后必须立刻出现在常驻块里')
+
+  // /memory pending 的正文预览压成单行（不能伪造出独立的注入行）
+  const queuedText = (await harness.runCommand('pending')).text
+  assert.match(queuedText, /\[待确认写入/u)
+  assert.match(queuedText, /上限 50/u)
+})
+
+// ---------------------------------------------------------------- 55. approve / reject
+
+test('host#55 /memory approve：置 active 且随后能注入；agent_self 在批准时才收敛', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const text = '未批准的模型猜想：构建流程统一改用 bun 并输出到 build 目录'
+  const queued = await writeToolInWorkspace(harness, { kind: 'semantic', text })
+  const prefix = String(queued.id)
+
+  // 前缀不唯一 / 找不到：都要明确报错，不得猜
+  const tooShort = await harness.runCommand('approve zzzzzzzz')
+  assert.equal(tooShort.kind, 'error')
+  assert.match(tooShort.text, /没有匹配/u)
+  assert.equal((await harness.runCommand('approve')).kind, 'error', '缺参数要走 error')
+  assert.match((await harness.runCommand('approve')).text, /用法：\/memory approve/u)
+
+  // 唯一性：同一前缀命中多条时必须报错并列出候选，而不是取第一条
+  const twin = await writeTool(harness, { kind: 'semantic', text: '第二条用于前缀歧义的待确认内容' })
+  const shared = String(queued.id).slice(0, 6)
+  assert.ok(String(twin.id).startsWith(shared), '两条同一毫秒创建的记录共享 6 字符前缀（测试前提）')
+  const ambiguous = await harness.runCommand(`approve ${shared}`)
+  assert.equal(ambiguous.kind, 'error', '前缀不唯一必须报错')
+  assert.match(ambiguous.text, /不唯一/u)
+  assert.match(ambiguous.text, /命中 2 条/u)
+  assert.match(ambiguous.text, new RegExp(shared, 'u'), '候选必须列出 id（长于前缀，便于复制）')
+  assert.equal(allRows(harness).filter((row) => row.status === 'active').length, 0, '歧义时不得改动任何记录')
+  assert.equal((await harness.runCommand(`reject-pending ${String(twin.id)}`)).kind, 'success', '清理第二条')
+
+  // 入队时给出的 id（完整）必须直接可用于 approve：这是队列唯一的取用方式
+  const approved = await harness.runCommand(`approve ${String(queued.id)}`)
+  assert.equal(approved.kind, 'success', approved.text)
+  assert.match(approved.text, /status → active/u)
+
+  const row = allRows(harness).find((entry) => entry.id === queued.id)!
+  assert.equal(row.status, 'active', '批准后必须是 active')
+  assert.equal(String(prefix).length > 6, true, '队列行给出的是完整 id（不必猜前缀长度）')
+  // R2 命中同一件事。**必须在渲染常驻块之前跑**：R2 会剔除「已经在常驻块里的条目」，
+  // 先渲染就等于把它登记进 `state.injected`，这条断言会变成自我否定的假阴性。
+  const afterApprove = appendedText(await stepTurn(harness, 3, '构建流程是不是改成了 bun 输出到 build 目录？'))
+  assert.match(afterApprove, /bun/u, `批准后 R2 召回必须命中：${afterApprove}`)
+  // 随后**能**常驻注入（R1 是稳定的：只要 active 就进块）
+  assert.ok(residentText(harness).includes('未批准的模型猜想'), '批准后常驻块应当能看到它')
+  // agent_self：入队不收敛，批准时**才**收敛（此时库状态已知）
+  const selfText = '我在动手改代码前会先跑通最小验证路径，然后再逐步扩展。'
+  const queuedSelf = await writeTool(harness, { kind: 'agent_self', facet: 'work', subject: 'style', text: selfText })
+  assert.equal((harness.reportState().self as Json).added, 0, '入队时不得收敛')
+  const selfApprove = await harness.runCommand(`approve ${String(queuedSelf.id)}`)
+  assert.equal(selfApprove.kind, 'success', selfApprove.text)
+  assert.match(selfApprove.text, /自画像已在批准时收敛/u)
+  const selfRow = allRows(harness).find((entry) => entry.id === queuedSelf.id)!
+  assert.equal(selfRow.status, 'active')
+  assert.equal(selfRow.kind, 'agent_self')
+  assert.equal(selfRow.subject, 'self.work.style', '批准时按 portraitSubjectFor 归一化 subject')
+  const self = harness.reportState().self as Json
+  assert.equal(Number(self.added), 1, '批准时收敛：库里没有同 subject 条目 → add')
+  assert.equal(Number((harness.reportState().writes as Json).approved), 2)
+
+  // 已批准的不再在队列里；重复 approve 报「不在队列」
+  assert.doesNotMatch((await harness.runCommand('pending')).text, new RegExp(String(queued.id), 'u'))
+  assert.match((await harness.runCommand(`approve ${String(queued.id)}`)).text, /没有匹配/u)
+
+  // 批准是**用户命令**：只有它能把 pending 变成 active（模型工具列表里没有任何状态改写面）
+  assert.equal(harness.tools.some((entry) => /approve|reject-pending|pending/i.test(entry.name)), false,
+    '不得给模型任何能改 pending 状态的工具')
+})
+
+test('host#56 /memory reject-pending：置 invalid（保留审计）且永不注入', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const text = '未批准的模型猜想：构建流程统一改用 bun 并输出到 build 目录'
+  const queued = await writeToolInWorkspace(harness, { kind: 'semantic', text })
+  const rejected = await harness.runCommand(`reject-pending ${String(queued.id)}`)
+  assert.equal(rejected.kind, 'success', rejected.text)
+  assert.match(rejected.text, /invalid/u)
+  assert.match(rejected.text, /保留用于审计/u)
+
+  // 保留痕迹：记录还在（不是物理删除），status=invalid
+  const row = allRows(harness).find((entry) => entry.id === queued.id)!
+  assert.ok(row, 'reject 不得物理删除')
+  assert.equal(row.status, 'invalid')
+  assert.equal(harness.domain.deletes.length, 0, 'reject 不得走删除路径')
+  assert.equal(Number((harness.reportState().writes as Json).pendingRejected), 1)
+
+  // 永不注入
+  assert.ok(!residentText(harness).includes('未批准的模型猜想'), 'invalid 记录不得进常驻块')
+  assert.deepEqual(appendedText(await stepTurn(harness, 3, '构建流程是不是改成了 bun 输出到 build 目录？')), '',
+    'invalid 记录不得被 R2 注入')
+  assert.doesNotMatch((await harness.runCommand('list --archived')).text, /未批准的模型猜想/u)
+  assert.doesNotMatch((await harness.runCommand('pending')).text, /未批准的模型猜想/u, '已拒绝的离开队列')
+
+  // 拒绝之后仍可在审计里看到它曾经存在（reject 不是删除）
+  assert.match((await harness.runCommand(`show ${String(queued.id)}`)).text, /未批准的模型猜想/u,
+    '/memory show 仍能看到被拒绝的记录（保留审计痕迹）')
+  assert.equal(harness.domain.deletes.length, 0)
+  // 同类自我观察不会再产生（指纹登记）：与上一条同 kind + 同正文 + 同 scope = 同 hash。
+  // （待确认记录的 hash 与 active 记录同口径：`recordHash` 不看 status/refs。）
+  const again = await writeToolInWorkspace(harness, { kind: 'semantic', text })
+  assert.equal(again.ok, false, `被拒绝过的同类写入不得再产生：${JSON.stringify(again)}`)
+  assert.match(String(again.error), /rejected_by_user/u)
+
+  // 另一条：找回 /memory reject 的语义边界 —— 待确认记录必须走 reject-pending
+  const second = await writeTool(harness, { kind: 'semantic', text: '第二条待确认的模型写入内容' })
+  const viaOldReject = await harness.runCommand(`reject ${String(second.id)}`)
+  assert.equal(viaOldReject.kind, 'error')
+  assert.match(viaOldReject.text, /reject-pending/u, '旧的 reject 必须指路到队列专用出口')
+  assert.equal(allRows(harness).find((entry) => entry.id === second.id)!.status, 'pending', '指路时不得改状态')
+
+  // 删除路径同样不得成为绕过审批的后门
+  const forget = JSON.parse(String(await harness.tool('memory_forget').execute({ id: second.id }))) as Json
+  assert.equal(forget.ok, false)
+  assert.equal(forget.error, 'pending_requires_decision')
+  // 状态治理命令一律不能把 pending 改掉
+  for (const command of ['restore', 'pin', 'archive']) {
+    const blocked = await harness.runCommand(`${command} ${String(second.id)}`)
+    assert.equal(blocked.kind, 'error', `/memory ${command} 不得作用于 pending`)
+    assert.match(blocked.text, /待确认写入/u)
+  }
+  assert.equal(allRows(harness).find((entry) => entry.id === second.id)!.status, 'pending')
+  assert.equal(allRows(harness).filter((row) => row.status === 'active').length, 0, '没有任何 pending 被放行')
+
+  // clear 也不抹掉待确认记录
+  const cleared = await harness.runCommand('clear --all --yes')
+  assert.equal(cleared.kind, 'success')
+  assert.match(cleared.text, /待确认/u, 'clear 要说明跳过了待确认记录')
+  assert.equal(allRows(harness).find((entry) => entry.id === second.id)!.status, 'pending')
+})
+
+// ---------------------------------------------------------------- 57. off / 队列满 / 绕过
+
+test('host#57 off 模式：拒绝且零写入（不落盘、不建记录）', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'off' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const putsBefore = harness.domain.puts.length
+  const result = await writeTool(harness, { kind: 'semantic', text: '构建流程统一用 pnpm，产物输出到 dist 目录' })
+  assert.equal(result.ok, false)
+  assert.match(String(result.error), /^rejected_write_policy:/u, '错误文案必须可结构化识别')
+  assert.equal(result.pending, undefined)
+  assert.equal(harness.domain.puts.length, putsBefore, 'off 模式零写入：领域表一次 put 都不能发生')
+  assert.equal(allRows(harness).length, 0)
+  assert.equal(Number((harness.reportState().writes as Json).rejected), 1)
+
+  // off 只挡模型来源；用户命令与规则捕获照常生效
+  const set = await harness.runCommand('self set work 我在动手改代码前会先跑通最小验证路径')
+  assert.equal(set.kind, 'success', set.text)
+  const agent = agentWith('C:\\work\\demo')
+  harness.roots.push(agent)
+  harness.emitSync('session/event', agent.session, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '记住：发布统一走 npm publish。' }] },
+  })
+  await harness.emit('agent/turn-stopping', { agent })
+  await harness.settle()
+  assert.ok(allRows(harness).some((row) => String(row.text).includes('npm publish')), 'off 不得挡住规则捕获')
+  assert.equal(allRows(harness).filter((row) => row.status === 'pending').length, 0)
+})
+
+test('host#57b 队列满：结构化错误 pending_queue_full，且零写入', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask', pendingMax: 2 } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const first = await writeTool(harness, { kind: 'semantic', text: '第一条待确认的记忆内容' })
+  const second = await writeTool(harness, { kind: 'semantic', text: '第二条待确认的记忆内容' })
+  assert.equal(first.pending, true)
+  assert.equal(second.pending, true)
+
+  const putsBefore = harness.domain.puts.length
+  const full = await writeTool(harness, { kind: 'semantic', text: '第三条待确认的记忆内容' })
+  assert.equal(full.ok, false)
+  assert.match(String(full.error), /^pending_queue_full:/u, '队列满必须是结构化错误')
+  assert.match(String(full.error), /2\/2/u, '错误文案要写清 N/上限')
+  assert.match(String(full.error), /\/memory pending/u, '要告诉用户去哪里处理')
+  assert.equal(harness.domain.puts.length, putsBefore, '队列满不得静默丢弃、也不得写盘')
+  assert.equal(allRows(harness).length, 2)
+
+  // 处理掉一条后又能入队（不是「一次满就永久卡死」）。
+  // 两次 `writeMemory` 在同一毫秒创建、共享 6 字符前缀，所以这里用**完整 id**定位
+  // （队列行给的也是完整 id），必要时轮询到这次自画像收敛判断落地。
+  const conn = async (): Promise<void> => { await new Promise((resolve) => setImmediate(resolve)) }
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await conn()
+    const settled = (await harness.runCommand(`approve ${String(first.id)}`)).kind === 'success'
+      || (await harness.runCommand(`reject-pending ${String(first.id)}`)).kind === 'success'
+    if (settled) break
+  }
+  assert.notEqual(allRows(harness).find((entry) => entry.id === first.id)!.status, 'pending', '队列里的那条必须已被处理')
+  assert.match((await harness.runCommand('stats')).text, /待确认：1 条（writePolicy=ask/u)
+  assert.equal((await writeTool(harness, { kind: 'semantic', text: '第三条待确认的记忆内容' })).pending, true, '腾出空位后必须能再入队')
+
+  // pendingMax<=0 = 不设上限（契约 §2.1：NaN/非法收紧到默认值，但显式 0 表示不限）
+  const unlimited = makeHarness({ config: { writePolicy: 'ask', pendingMax: 0 } })
+  t.after(() => unlimited.dispose())
+  await unlimited.settle()
+  for (let index = 0; index < 3; index += 1) {
+    assert.equal((await writeTool(unlimited, { kind: 'semantic', text: `不限上限的第 ${index} 条待确认内容` })).pending, true)
+  }
+  assert.match((await unlimited.runCommand('pending')).text, /上限 不限/u)
+})
+
+test('host#57c 用户命令 / 规则捕获 / 导入跳过队列；ask 不等于绕过安全闸', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 用户命令（self set）立刻生效，不进队列
+  const set = await harness.runCommand('self set persona 我在解释概念时会先给出结论再展开细节')
+  assert.equal(set.kind, 'success', set.text)
+  const setRow = allRows(harness).find((row) => row.kind === 'agent_self')!
+  assert.equal(setRow.status, 'active', '用户命令立刻生效')
+  assert.equal(String(setRow.origin), 'user_explicit')
+
+  // 规则捕获（observed / user_explicit 都属「非模型来源」）立刻生效，不进队列。
+  // 这句命中的是 `preference` 信号（origin=observed），**不是** `explicit-imperative`（user_explicit）——
+  // 因此它正好验证「规则捕获绕过队列」这一条。
+  const agent = agentWith('C:\\work\\demo')
+  harness.roots.push(agent)
+  harness.emitSync('session/event', agent.session, {
+    type: 'user/message',
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '我们项目用 pnpm 管理依赖，构建产物统一放在 dist 目录。' }] },
+  })
+  await harness.emit('agent/turn-stopping', { agent })
+  await harness.settle()
+  const captured = allRows(harness).find((row) => String(row.text).includes('pnpm'))
+  assert.ok(captured, '规则捕获必须照常写入')
+  assert.equal(captured!.status, 'active', 'observed 绕过队列')
+  assert.equal(String(captured!.origin), 'observed', '这一条正是 observed（规则捕获）')
+  assert.equal(Number((harness.reportState().writes as Json).pending), 0, '规则捕获不入队')
+
+  // 导入（用户提供的文件）同样不进队列
+  const file = join(harness.tempDir, 'import-m10.json')
+  writeFileSync(file, JSON.stringify({ items: [{ kind: 'semantic', text: '导入的这条记忆不该进待确认队列' }] }))
+  assert.equal((await harness.runCommand(`import ${file}`)).kind, 'success')
+  assert.ok(allRows(harness).some((row) => String(row.text).includes('导入的这条记忆') && row.status === 'active'))
+
+  // 队列不是绕过脱敏的后门：敏感信息在**入队前**就被拒写
+  const secret = await writeTool(harness, { kind: 'semantic', text: '这台机器的部署密钥是 sk-abcdefghijklmnop123456，请记住' })
+  assert.equal(secret.ok, false)
+  assert.match(String(secret.error), /rejected_sensitive/u)
+  assert.doesNotMatch((await harness.runCommand('pending')).text, /sk-abcdefghijklmnop123456/u)
+  // 邮箱按策略脱敏后再入队（正文里不能再出现完整邮箱）
+  const masked = await writeTool(harness, { kind: 'semantic', text: '用户邮箱是 zhangsan@example.com，请记录下来' })
+  assert.equal(masked.pending, true)
+  assert.doesNotMatch(String(masked.text), /zhangsan@example\.com/u, '入队前必须已经脱敏')
+  assert.match(String(masked.text), /\*\*\*/u)
+})
+
+test('host#57d /sleep 补录绕过队列，且计划与落盘都不碰 pending', async (t) => {
+  const { harness } = sleepHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 先放一条 pending 进库：`/sleep` 的计划与落盘都不得动它
+  const parked = await writeTool(harness, { kind: 'semantic', text: '待确认的这条不该被 /sleep 改动' })
+
+  // `/sleep --apply` 的补录来自纯函数层（`/sleep` 自己的捕获重放），origin 是 user_explicit ——
+  // 用户明确说过的话不受门控，必须**立刻生效**而不是进队列。
+  const applied = await harness.runCommand('--apply', 'sleep')
+  assert.equal(applied.kind, 'success', applied.text)
+  const added = Number(/补录 (\d+) 条/u.exec(applied.text)?.[1] ?? '0')
+  assert.ok(added >= 1, `/sleep 必须真的补录了东西：${applied.text}`)
+
+  const rows = allRows(harness)
+  const backfilled = rows.filter((row) => row.status === 'active' && (row.tags as string[] | undefined)?.includes('sleep'))
+  assert.equal(backfilled.length, added, '补录的每一条都必须直接 active（绕过队列）')
+  for (const row of backfilled) assert.notEqual(row.status, 'pending', `${String(row.text)} 不得进队列`)
+
+  // pending 原样留在队列里（计划不参与、落盘不改状态）
+  const stillPending = rows.find((row) => row.id === parked.id)!
+  assert.equal(stillPending.status, 'pending', '/sleep 不得改动待确认记录')
+  assert.match((await harness.runCommand('pending')).text, /不该被 \/sleep 改动/u)
+
+  // 计划本身也看不见 pending（预览文本里不得出现它的正文）
+  const preview = await harness.runCommand('', 'sleep')
+  assert.doesNotMatch(preview.text, /不该被 \/sleep 改动/u, '/sleep 的计划不得列出待确认记录')
+})
+
+// ---------------------------------------------------------------- 58. 默认 auto ＝ 0.5.9 行为
+
+test('host#58 默认 auto 与 0.5.9 行为等价：模型写入立刻生效、不进队列', async (t) => {
+  const harness = makeHarness() // 不传 writePolicy：走 DEFAULTS 的 'auto'
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const result = await writeToolInWorkspace(harness, { kind: 'semantic', text: '构建流程统一用 pnpm，产物输出到 dist 目录' })
+  assert.equal(result.ok, true)
+  assert.equal(result.status, 'created', '默认配置下模型写入立刻生效')
+  assert.equal(result.pending, undefined, '默认不得进队列')
+  assert.equal(result.notice, undefined)
+  const row = allRows(harness)[0]!
+  assert.equal(row.status, 'active')
+  assert.match(residentText(harness), /pnpm/u, '默认配置下立刻可注入')
+
+  // 自画像在默认配置下也照常立刻收敛（0.5.9 行为）
+  const selfWrite = await writeTool(harness, { kind: 'agent_self', facet: 'work', subject: 'style', text: '我在动手改代码前会先跑通最小验证路径。' })
+  assert.equal(selfWrite.ok, true)
+  assert.equal((selfWrite.portrait as Json).action, 'add', '默认配置下自画像立刻收敛，不推迟到批准时')
+  assert.equal(Number((harness.reportState().self as Json).added), 1)
+
+  const stats = await harness.runCommand('stats')
+  assert.match(stats.text, /待确认：0 条（writePolicy=auto/u, 'N=0 时也要显示策略值')
+  assert.match(stats.text, /累计入队 0 \/ 批准 0 \/ 拒绝 0/u)
+  assert.equal(Number((harness.reportState().writes as Json).pending), 0)
+  assert.match((await harness.runCommand('pending')).text, /没有待确认的写入/, '空队列必须给出「没有待确认的写入」而不是空白')
+
+  // 非法策略值回落 auto（与 normalizeWritePolicy 同口径），不得变成「拒绝写入」
+  const bogus = makeHarness({ config: { writePolicy: 'yolo' } })
+  t.after(() => bogus.dispose())
+  await bogus.settle()
+  assert.equal((await writeTool(bogus, { kind: 'semantic', text: '非法策略值必须回落 auto' })).status, 'created')
+  assert.match((await bogus.runCommand('stats')).text, /writePolicy=auto/u)
+})
+
+// ---------------------------------------------------------------- 59. stats / 重启存活
+
+test('host#59 stats 与重启：待确认行、结构化字段、pending 随普通记录一起加载', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // N=0 时也要显示策略值
+  const empty = await harness.runCommand('stats')
+  assert.match(empty.text, /待确认：0 条（writePolicy=ask/u)
+
+  const queued = await writeToolInWorkspace(harness, { kind: 'semantic', text: '待确认的这条记忆会在重启后仍然可见' })
+  assert.match((await harness.runCommand('stats')).text, /待确认：1 条（writePolicy=ask/u)
+
+  // memory_stats：结构化字段 + 同一份文本
+  const raw = JSON.parse(String(await harness.tool('memory_stats').execute({}))) as Json
+  assert.equal(raw.pending, 1)
+  assert.equal(raw.writePolicy, 'ask')
+  assert.equal(raw.pendingMax, 50)
+  assert.match(String(raw.text), /待确认：1 条（writePolicy=ask/u, '工具文本与 /memory stats 同步')
+  assert.equal(Number((raw.writes as Json).pending), 1, '累计入队计数要进结构化字段')
+  assert.match(String(raw.pendingPath), /模型无法自我批准/u)
+
+  // 重启存活：**新实例从同一份盘上数据加载**（openDomain 的加载分支不含状态白名单）
+  const persisted = [...harness.domain.rows.values()].filter((row) => row.status === 'pending')
+  assert.equal(persisted.length, 1, 'pending 记录必须在盘上（不是只在内存里）')
+  assert.equal(persisted[0]!.id, queued.id, '盘上的正是入队的那条')
+
+  // 预先播种「上一进程留下的」数据，再启动一个新实例：它会走 openDomain 的加载分支
+  const reborn = makeHarness({ config: { writePolicy: 'ask' }, seedDomainRows: harness.domain.rows })
+  t.after(() => reborn.dispose())
+  await reborn.settle()
+  const pendingText = (await reborn.runCommand('pending')).text
+  assert.match(pendingText, new RegExp(String(queued.id), 'u'), '重启后 /memory pending 必须仍能看到它')
+  assert.match(pendingText, /待确认的这条记忆会在重启后仍然可见/u)
+  assert.match((await reborn.runCommand('stats')).text, /待确认：1 条（writePolicy=ask/u)
+  // 重启后的注入路径依然干净，直到用户批准
+  assert.ok(!residentText(reborn).includes('待确认的这条记忆'), '重启不得让 pending 混进常驻块')
+  assert.equal((await reborn.runCommand(`approve ${String(queued.id)}`)).kind, 'success', '重启后仍可批准')
+  assert.ok(residentText(reborn).includes('待确认的这条记忆'), '批准后立刻可注入')
+
+  // 配置 Schema：两个键与契约 §2.1 的默认值逐字一致（无 schemastery 时跳过）
+  if (Config === undefined) {
+    assert.equal(Config, undefined)
+  } else {
+    const dict = (Config as { dict?: Record<string, { meta?: { default?: unknown } }> }).dict ?? {}
+    assert.equal(dict.writePolicy?.meta?.default, 'auto', 'writePolicy 默认必须是 auto（0.5.9 行为）')
+    assert.equal(dict.pendingMax?.meta?.default, 50)
+  }
 })
 
 
