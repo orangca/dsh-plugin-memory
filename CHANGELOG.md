@@ -3,6 +3,27 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.12 — 2026-10-02
+
+Immediate follow-up to 0.5.11, found by rendering the new English texts for real rather than only asserting on them.
+
+### Fixed
+
+- **The English persona section rendered as nothing at default budgets.** `charsPerToken` (2.5) is a deliberate
+  Chinese/English compromise, but English really costs ~4 characters per token, so the *same* block chrome costs
+  ~2.5x more: measured in tokens, the persona header+footer is 31 in Chinese and **67** in English against a default
+  `selfPersonaMaxTokens` of 80 — leaving 13 tokens, too little for one ordinary English row, so the whole section
+  silently vanished. English now gets an explicit `EN_BLOCK_HEADROOM = 48` added to `selfPersonaMaxTokens` and
+  `selfPortraitMaxTokens`; Chinese output is byte-for-byte unchanged because the headroom only applies to `en`.
+- `maxInjectedTokens` is deliberately **not** inflated: that cap is the user's own, and a language switch should not
+  quietly raise it. English users who want more resident rows raise it themselves (documented in both READMEs).
+
+### Added
+
+- A regression test that renders with `language: 'en'` at default budgets and asserts both the persona and work
+  sections contain their rows, plus content-room floors (≥ 25 / ≥ 40 tokens) so verbose block chrome cannot eat the
+  allowance again. Contract notes in `docs/i18n.md` §3.2.
+
 ## 0.5.11 — 2026-10-02
 
 **English for the model, Chinese for you.** The half of the plugin the model reads — the injected blocks and their

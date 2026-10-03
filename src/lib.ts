@@ -400,7 +400,14 @@ export function renderSelfBlock(records: Iterable<MemoryRecord>, cfg: MemoryConf
   const maxSelfObserved = cfg.selfPortraitMaxSelfObserved ?? 4
 
   // ---- 人格小节（在前）
-  const personaBudget = cfg.selfPersonaMaxTokens ?? DEFAULTS.selfPersonaMaxTokens
+  // M11 修：`charsPerToken` 默认 2.5 是**中英保守折中**（英文真实约 4 字/token），于是同一意思的
+  // 英文块级文案要花约 2.5 倍预算 —— 实测人格块头+页脚 zh=31 / en=67、工作三块 zh=31 / en=79 token。
+  // 默认预算下英文只剩十几 token，**一条普通英文记忆都装不下 → 整节静默为空**（0.5.11 实测）。
+  // 这里给英文一份显式余量抵消块级固定开销差异；zh 完全不受影响（默认行为与 0.5.10 逐字节相同）。
+  // 注意**不动** `maxInjectedTokens`：那是用户自己设的硬上限，不该被语言悄悄放大。
+  const languageHeadroom = normalizeLanguage(cfg.language) === 'en' ? EN_BLOCK_HEADROOM : 0
+  const workBudget = (cfg.selfPortraitMaxTokens ?? DEFAULTS.selfPortraitMaxTokens) + languageHeadroom
+  const personaBudget = (cfg.selfPersonaMaxTokens ?? DEFAULTS.selfPersonaMaxTokens) + languageHeadroom
   // 块头尾也要计入预算，否则「硬上限」会被块级固定文案突破
   const personaChrome = estimateTokens(`${texts.personaHeader}\n${texts.personaFooter}`, cfg.charsPerToken)
   const personaUser = fillWithinBudget(
@@ -427,7 +434,7 @@ export function renderSelfBlock(records: Iterable<MemoryRecord>, cfg: MemoryConf
   // 两段合计（含两个块头与页脚）不超过 selfPortraitMaxTokens。
   const confirmed = fillWithinBudget(
     userSide.slice(0, cfg.selfPortraitMaxItems),
-    Math.max(0, cfg.selfPortraitMaxTokens - estimateTokens(texts.workConfirmedHeader, cfg.charsPerToken)),
+    Math.max(0, workBudget - estimateTokens(texts.workConfirmedHeader, cfg.charsPerToken)),
     (_record, text) => `- ${text}`,
     cfg,
   )
@@ -435,7 +442,7 @@ export function renderSelfBlock(records: Iterable<MemoryRecord>, cfg: MemoryConf
     ? { lines: [] as string[], selected: [] as MemoryRecord[], used: 0 }
     : fillWithinBudget(
       selfObserved,
-      Math.max(0, cfg.selfPortraitMaxTokens
+      Math.max(0, workBudget
         - estimateTokens(`${texts.workConfirmedHeader}${texts.workObservedHeader}${texts.workObservedFooter}`, cfg.charsPerToken)
         - confirmed.used),
       (_record, text) => `- ${text}`,
@@ -2394,6 +2401,7 @@ export function formatPendingQueue(records: Iterable<MemoryRecord>, cfg: MemoryC
 // ---------------------------------------------------------------------------
 // M11：模型可见文本多语言（language）—— 契约 docs/i18n.md §3
 //
+//
 // 与上面几节一样是**纯常量 + 纯函数**：不依赖 ctx、不碰存储、不引依赖、不做 I/O。
 // 三条不可妥协（§5）：
 //  · 默认 'zh' 与 0.5.10 **逐字节等价**：缺省/非法/未设置一律回 zh；
@@ -2463,6 +2471,19 @@ const ZH_TEXTS: InjectedTexts = Object.freeze({
  * 因此 en 的块级文案在保留上述硬要求的前提下尽量紧凑。
  * `reflectNotice` / `introNotice` 是**单行**，长度不超过 zh 的 1.6 倍（英文更长，但要有上限）。
  */
+/**
+ * 英文块级固定文案的**预算余量**（token）。
+ *
+ * 为什么需要：`charsPerToken` 默认 2.5 是中文/英文的保守折中，而英文真实约 4 字/token ⇒
+ * 同一意思的英文块头+页脚要花约 2.5 倍预算（实测：人格 zh=31/en=67、工作三块 zh=31/en=79）。
+ * 默认预算下英文只剩下十几 token，一条普通英文记忆都放不下 → **整节静默为空**（0.5.11 实测复现）。
+ * 取 48 略大于实测最大差值（79-31=48），让英文的内容空间与中文大致相当。
+ *
+ * 只在 `language === 'en'` 时加到 `selfPersonaMaxTokens` / `selfPortraitMaxTokens` 上；
+ * **不动** `maxInjectedTokens`（那是用户自己设的硬上限，不该被语言悄悄放大）。
+ */
+const EN_BLOCK_HEADROOM = 48
+
 const EN_TEXTS: InjectedTexts = Object.freeze({
   factsHeader: '[Long-term memory · auto-injected]',
   factsFooter: 'The above are past records: they may be outdated or wrong. When they conflict with the current situation, check the facts first and go by facts and actual results.',

@@ -2260,3 +2260,36 @@ test('language 非法/缺失：渲染结果与 zh 逐字节相同（契约 §5�
     assert.equal(renderSelfBlock(records, broken).text, zhSelf, `language=${String(bad)} 应回落 zh`)
   }
 })
+
+test('M11 回归：英文默认预算下人格与工作两节都必须有内容空间（块级开销不得吃光预算）', () => {
+  // 0.5.11 实测到的真回归：charsPerToken=2.5 对英文过于保守，英文块头+页脚要花约 2.5 倍预算
+  // （人格 zh=31 / en=67 token），默认 selfPersonaMaxTokens=80 时英文只剩 13 token，
+  // 一条普通英文记忆都装不下 → **整个人格小节静默为空**。这里钉死「两节都要渲染出内容」。
+  const en = { ...cfg, language: 'en' as const }
+  const row = (facet: 'persona' | 'work', text: string) => makeRecord({
+    kind: 'agent_self', facet, subject: portraitSubjectFor(facet, 'style'), text,
+    origin: 'user_explicit', pinned: true, confidence: 1,
+  })
+  const rows = [
+    row('persona', 'I say what I know and flag what I do not.'),
+    row('work', 'I lead with the conclusion, then the evidence.'),
+  ]
+  const block = renderSelfBlock(rows, en)
+  assert.match(block.text, /Persona/u, '英文默认预算下人格小节必须有内容')
+  assert.match(block.text, /Work agreements/u, '英文默认预算下工作小节必须有内容')
+  assert.match(block.text, /I say what I know/, '人格条目本身也要渲染出来')
+  assert.match(block.text, /I lead with the conclusion/, '工作条目本身也要渲染出来')
+
+  // 内容空间下限：英文块级固定文案扣完后，人格 ≥ 25 token、工作 ≥ 40 token
+  const texts = localizedTexts('en')
+  const personaChrome = estimateTokens(`${texts.personaHeader}\n${texts.personaFooter}`, en.charsPerToken)
+  const workChrome = estimateTokens(
+    `${texts.workConfirmedHeader}${texts.workObservedHeader}${texts.workObservedFooter}`,
+    en.charsPerToken,
+  )
+  const personaRoom = en.selfPersonaMaxTokens + 48 - personaChrome
+  const workRoom = en.selfPortraitMaxTokens + 48 - workChrome
+  assert.ok(personaRoom >= 25, `英文人格小节内容空间 ${personaRoom} token 过小`)
+  assert.ok(workRoom >= 40, `英文工作小节内容空间 ${workRoom} token 过小`)
+  // 中文不受余量影响：同样的条目在 zh 下的渲染结果与「不加余量」一致（逐字节回归由上一例覆盖）
+})
