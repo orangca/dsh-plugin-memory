@@ -31,11 +31,28 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck (host + client + tools)
+      - name: Typecheck (host + client + tools + tests)
         run: pnpm typecheck
 
-      - name: Test
+      - name: Lint (correctness only)
+        run: pnpm lint
+
+      - name: Test (includes README zh/en consistency)
         run: pnpm test
+
+      - name: READMEs stay in sync (explicit, so the failure is named)
+        run: pnpm check:readmes
+
+      # 零运行期依赖是这个插件「GitHub 直接安装即可运行」的前提；打包清单也必须完整。
+      - name: Package is self-contained
+        run: pnpm verify:self-contained
+
+      # 覆盖率门槛：门槛按输入口径分开（见 tools/coverage-check.ts 的 THRESHOLDS_*）。
+      - name: Coverage gate
+        run: |
+          mkdir -p .tmp
+          pnpm coverage > .tmp/coverage.txt 2>&1
+          pnpm coverage:check
 
       # lib/ 是提交进仓库的构建产物（GitHub 安装不跑构建），所以必须保证它与 src/ 同步。
       - name: Build output is in sync with sources

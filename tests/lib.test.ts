@@ -8,7 +8,6 @@ import assert from 'node:assert/strict'
 import type {
   AuditAction,
   AuditEntry,
-  CaptureCandidate,
   InjectedTexts,
   Language,
   MakeRecordInput,
@@ -23,7 +22,6 @@ import type {
   ReflectInput,
   SelfFacet,
   SleepCandidate,
-  SleepPlan,
   SleepSessionInput,
   WritePolicy,
 } from '../lib/lib.js'
@@ -65,7 +63,6 @@ import {
   formatSleepPlan,
   isBranchVisible,
   isEcho,
-  isSelfPortraitEligible,
   INTRO_NOTICE,
   lexicalMatch,
   listActive,
@@ -307,7 +304,6 @@ test('pickMergeGroups：同 subject 且文本近似才合并；摘要条目不�
 })
 
 test('findConflicts：同 (subject, field) 不同 value 判为冲突；模型自评不能推翻用户侧条目', () => {
-  const scope = { level: 'profile', key: '*' }
   const user = makeRecord({ kind: 'user_profile', subject: 'editor.theme', field: 'theme', value: 'dark', text: '偏好深色主题。', origin: 'user_explicit', observedAt: 1000 })
   const model = makeRecord({ kind: 'user_profile', subject: 'editor.theme', field: 'theme', value: 'light', text: '似乎是浅色主题。', origin: 'model_proposed', observedAt: 2000 })
   const conflicts = findConflicts([user, model])

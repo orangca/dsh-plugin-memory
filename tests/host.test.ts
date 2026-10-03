@@ -1208,7 +1208,7 @@ test('host#20 反思提示：最小回合与间隔闸门（minTurn=4、everyTurn
 
 // ---------------------------------------------------------------- 21. 反思提示：dry/off/autoRecall=false
 
-test('host#21 反思提示：dry / off / autoRecall=false 时不注入且不推进计数', async (t) => {
+test('host#21 反思提示：dry / off / autoRecall=false 时不注入且不推进计数', async () => {
   const configs: Json[] = [{ recallMode: 'dry' }, { recallMode: 'off' }, { autoRecall: false }]
   for (const config of configs) {
     const harness = makeHarness({
@@ -1923,9 +1923,6 @@ const seqUserEvent = (text: string, seq: number): Json =>
 /** 一次 `memory_write` 工具调用。 */
 const writeViaTool = async (harness: Harness, text: string): Promise<Json> =>
   JSON.parse(String(await harness.tool('memory_write').execute({ kind: 'semantic', text }))) as Json
-
-/** refs 的 `via` 分布（断言用）。 */
-const viasOf = (row: Json): string[] => ((row.refs as Json[] | undefined) ?? []).map((ref) => String(ref.via))
 
 // ---------------------------------------------------------------- 39. live 区间
 
@@ -3047,7 +3044,7 @@ test('host#63 language=en：7 个工具描述与参数说明都是英文，且�
   }
 })
 
-test('host#64 默认 zh：7 个工具的描述与参数说明逐字不变（契约 §5）', async (t) => {
+test('host#64 默认 zh：7 个工具的描述与参数说明逐字不变（契约 §5）', async () => {
   // 与 0.5.10 的内联字面量逐字重复（故意手写，见文件头注释）
   const expected: Record<string, string> = {
     memory_write: '写入一条长期记忆（用户偏好、项目约定、结论、做法）。写入来源由插件判定，不由本参数指定。',

@@ -23,7 +23,6 @@ import type {
   DshSessionQuery,
   DshSettings,
   DshStorageDomain,
-  DshToolDefinition,
   DshTurnStoppingPayload,
   MemoryConfig,
   MemoryKind,
@@ -50,14 +49,12 @@ import {
   deriveSubject,
   detectWorkspaceMarkers,
   deriveOriginFromMessages,
-  effectiveImportance,
   estimateTokens,
   extractCandidates,
   extractSummaryText,
   facetOf,
   fillWithinBudget,
   findConflicts,
-  fnv1a,
   formatAudit,
   formatBranchSummary,
   formatRefs,
@@ -1223,7 +1220,10 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   /** 把标脏的用量落盘（整合与卸载时调用）。 */
   const flushUsage = async (): Promise<number> => {
     let flushed = 0
-    for (const id of [...state.usageDirty]) {
+    // 先取快照再遍历：循环体里有 await，重启/渲染路径可能在此期间继续往集合里加 id。
+    // 快照让本次落盘的对象是本轮开始时那批（保持原行为），末尾的 clear() 仍然清掉新标脏的 id。
+    const ids = [...state.usageDirty]
+    for (const id of ids) {
       const record = state.records.get(id)
       if (!record) continue
       await persist(record)
@@ -2526,7 +2526,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       const handle = domain
       if (handle) {
         state.meta = {
-          ...(state.meta ?? {}),
+          ...state.meta,
           schemaVersion: 1,
           collectionVersion: state.collectionVersion,
           selfIntroAsks: state.self.introAsks,
@@ -2658,7 +2658,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       }
       // 7) 元数据水位（global）
       state.meta = {
-        ...(state.meta ?? {}),
+        ...state.meta,
         schemaVersion: 1,
         collectionVersion: state.collectionVersion,
         lastConsolidatedAt: now,
@@ -2901,7 +2901,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         // 归档条目（设计稿 §4.4）只是不常驻注入，模型主动检索时应当可见
         const hits = recallRecords(
           branchVisible(state.records.values(), exec?.agent?.session?.header?.cwd),
-          { ...(args ?? {}), includeArchived: true },
+          { ...args, includeArchived: true },
         )
         markUsed(hits.map((hit) => hit.record))
         return jsonList('items', hits.map(({ record, score }) => ({
@@ -4338,7 +4338,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     state.sleep.last = snapshot
     if (domain) {
       state.meta = {
-        ...(state.meta ?? {}),
+        ...state.meta,
         schemaVersion: 1,
         collectionVersion: state.collectionVersion,
         lastSleepAt: now,

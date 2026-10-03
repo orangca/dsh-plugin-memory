@@ -3,6 +3,47 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.15 — 2026-10-03
+
+Engineering hardening. No behaviour change: the only source edits are lint findings, and the regex rewrite was
+verified equivalent over every Unicode code point.
+
+### Added
+
+- **`pnpm lint`** — oxlint (correctness rules only, `lib/` excluded). 20 findings on the first run: 12 fixed, plus one
+  narrow override for `src/client.ts`'s deliberate triple-slash reference (importing `shims.d.ts` instead would make
+  `tsc` emit a runtime `require('./shims.js')` into the client bundle — verified: removing the line breaks the
+  single-file compile with three TS2307s).
+- **`pnpm check:readmes`** — zh/en README structure check: section count and order, balanced code fences, the set of
+  backticked table keys, the settings-field count, and the set of `/memory` + `/sleep` commands. Drift names the
+  offending item and exits non-zero. It already earned its keep: the English README was missing the `/memory verify`
+  line the Chinese one had. `pnpm test` now runs it.
+- **`pnpm verify:self-contained`** — asserts `dependencies` stays empty, that no runtime bare import comes from
+  outside the allowlist (devDependencies, builtins, or the client-side injected modules), and that `npm pack`
+  contains the entries a `dsh plugin add` install needs.
+- **`pnpm coverage` + `pnpm coverage:check`** — line-coverage gate with thresholds 97/83 (lib/lib.js, lib/index.js)
+  derived from a measured 99.06%/85.55%.
+
+### Fixed
+
+- `eslint/no-control-regex`: two control-character classes rewritten as `\p{Cc}`; equivalence checked against all
+  1,114,112 code points.
+- Twelve correctness findings (unused imports and symbols, useless spreads) — the spread change in the usage-flush
+  loop keeps a named snapshot on purpose: iterating the live Set would observe ids marked dirty mid-await.
+- **The coverage report was silently measuring nothing.** Node's default test-coverage exclusion glob matches the
+  whole absolute path, and this workspace happens to sit under a directory named `test`, so `lib/**` was excluded
+  entirely and the report printed a cheerful `all files 100.00` — which meant "zero lines measured". The collect
+  command now passes an explicit exclusion, and the gate has a witnessed failure mode: running a single test file
+  reports 31.25% / 4.76% and exits 1.
+
+### Notes
+
+- The two coverage numbers are not interchangeable: Node's report maps back through sourcemaps (99.06% / 85.55%),
+  while the tool's own generated-line computation gives 100.00% / 96.76%. Thresholds are selected per input mode. The
+  first CI wiring applied the tool's numbers to the report path and failed for real — recorded in the tool, not
+  papered over.
+- CI now runs lint, check:readmes, verify:self-contained and the coverage gate on Node 22.x and 24.x.
+
 ## 0.5.14 — 2026-10-03
 
 **Write audit and injection verification: "the model can see it" ⟺ "it was recorded".** The fifth competitive

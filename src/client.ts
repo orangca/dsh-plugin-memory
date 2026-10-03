@@ -241,9 +241,6 @@ const en = {
 
 // ---------------------------------------------------------------- 字段定义
 
-/** 控件种类：number/text 走原语，boolean/enum 走原生控件。 */
-type FieldKind = 'text' | 'number' | 'boolean' | 'enum'
-
 interface BaseField {
   name: string
   group: string
@@ -560,7 +557,6 @@ const ROW_CONFIG_KEY = `${BUNDLE_NAME}#${ROW_ID}`
  * @param ctx - 浏览器插件上下文。
  */
 export function apply(ctx: ClientContext): void {
-  const t = ctx.locale.bind(DICT)
   ctx.effect(() => ctx.locale.register(DICT, { zh, en }), 'dsh-memory: dictionaries')
   const card = new MemoryCardController(ctx.configForms.get(NS))
   ctx.effect(() => () => {

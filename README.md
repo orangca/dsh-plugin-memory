@@ -493,10 +493,15 @@ Written in TypeScript, built with `tsc`, managed with pnpm. The dev tools are Ty
 default) strips types natively, so `node tools/<name>.ts` runs them without a build step.
 
 ```sh
-pnpm install                                      # devDependencies: typescript, @types/node, schemastery types
+pnpm install                                      # devDependencies: typescript, @types/node, schemastery types, oxlint
 pnpm build                                        # src/*.ts -> lib/*.js (+ the client half's lazy-CJS wrapper)
-pnpm test                                         # builds, then runs the unit tests on the built output
-pnpm typecheck                                    # host half, client half and tools — no emit
+pnpm test                                         # builds, runs the unit tests on the built output, then checks the READMEs agree
+pnpm typecheck                                    # host half, client half, tools and tests — no emit
+pnpm lint                                         # oxlint (correctness rules only)
+pnpm check:readmes                                # README zh/en consistency on its own (names the drifting item)
+pnpm verify:self-contained                        # assert zero runtime deps + a complete package (what `dsh plugin add` needs)
+pnpm coverage                                     # collect coverage (the node_modules exclusion must be explicit, or lib/ is dropped)
+pnpm coverage:check                               # enforce the gate (thresholds differ per input mode, see tools/coverage-check.ts)
 node tools/eval-recall.ts                         # offline recall eval over real session logs
 node tools/bench.ts                               # hot-path benchmark (per-turn recall, per-step render, consolidation)
 node tools/deploy-dev.ts                          # mount lib/ as a new dev revision (run pnpm build first)

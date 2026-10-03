@@ -128,3 +128,173 @@ test('session-log：listSessionLogs 递归发现、minBytes 过滤、按修改�
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// README 结构一致性（tools/check-readmes.ts）
+//
+// 整段追加在文件末尾：既有用例一行都没动。ESM 的 import 声明会提升，写在后面同样生效。
+
+import { checkReadmes } from '../tools/check-readmes.ts'
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+/** 定向破坏一对 README 的开关（全关 = 结构一致）。 */
+interface PairOptions {
+  /** zh 里把两个带锚点的小节顺序颠倒。 */
+  swapZhSections?: boolean
+  /** 从 zh 的表格里删掉这个键所在的行。 */
+  dropZhKey?: string
+  /** 从 zh 的命令块里删掉以它开头的行。 */
+  dropZhCommand?: string
+  /** 删掉 zh 顶部的 English 互链。 */
+  dropZhLink?: boolean
+  /** 从 en 里删掉一个代码围栏标记（凑成奇数）。 */
+  breakEnFence?: boolean
+}
+
+/** 造一对「结构一致」的最小 README；每个校验项都留了可定向破坏的锚点。 */
+function makeReadmePair(options: PairOptions = {}): { en: string; zh: string } {
+  let en = [
+    '# dsh-plugin-memory',
+    '',
+    '[中文说明](README.zh.md) | English',
+    '',
+    'Intro.',
+    '',
+    '## `alpha`',
+    '',
+    'Body. The settings form has **3 fields**.',
+    '',
+    '## `beta`',
+    '',
+    'More text.',
+    '',
+    '| Field | Default | Meaning |',
+    '|---|---|---|',
+    '| `recallTopK` | `8` | cap |',
+    '| `auditMax` | `50` | ring size |',
+    '',
+    '```',
+    '/memory list [--archived]   list memories',
+    '/memory stats               runtime numbers',
+    '/sleep [--apply]            idle review',
+    '```',
+    '',
+  ].join('\n')
+  let zh = [
+    '# dsh-plugin-memory',
+    '',
+    '中文 | [English](README.md)',
+    '',
+    '说明。',
+    '',
+    '## `alpha`',
+    '',
+    '正文。表单里有 **3 个字段**。',
+    '',
+    '## `beta`',
+    '',
+    '更多文字。',
+    '',
+    '| 字段 | 默认 | 含义 |',
+    '|---|---|---|',
+    '| `recallTopK` | `8` | 上限 |',
+    '| `auditMax` | `50` | 审计环容量 |',
+    '',
+    '```',
+    '/memory list [--archived]   列出记忆',
+    '/memory stats               运行时可观测',
+    '/sleep [--apply]            空闲梳理',
+    '```',
+    '',
+  ].join('\n')
+  if (options.swapZhSections === true) {
+    zh = zh.replace('## `alpha`', '@@swap@@').replace('## `beta`', '## `alpha`').replace('@@swap@@', '## `beta`')
+  }
+  if (options.dropZhKey !== undefined) {
+    zh = zh.split('\n').filter((line) => !line.startsWith('| `' + options.dropZhKey + '` |')).join('\n')
+  }
+  if (options.dropZhCommand !== undefined) {
+    zh = zh.split('\n').filter((line) => !line.startsWith(options.dropZhCommand + ' ') && line !== options.dropZhCommand).join('\n')
+  }
+  if (options.dropZhLink === true) {
+    zh = zh.replace('[English](README.md)', 'English')
+  }
+  if (options.breakEnFence === true) {
+    const lines = en.split('\n')
+    lines.splice(lines.lastIndexOf('```'), 1)
+    en = lines.join('\n')
+  }
+  return { en, zh }
+}
+
+/** 把造好的一对 README 写进临时目录，跑一次校验，然后清掉临时目录。 */
+function checkPair(options: PairOptions = {}): { ok: boolean; problems: string[] } {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-check-readmes-'))
+  try {
+    const pair = makeReadmePair(options)
+    writeFileSync(join(dir, 'README.md'), pair.en, 'utf8')
+    writeFileSync(join(dir, 'README.zh.md'), pair.zh, 'utf8')
+    return checkReadmes(dir)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+test('check-readmes：结构一致的一对 README 判定为 ok', () => {
+  const result = checkPair()
+  assert.deepEqual(result.problems, [], `一致的一对不该有问题：${result.problems.join(' / ')}`)
+  assert.equal(result.ok, true)
+})
+
+test('check-readmes：小节顺序颠倒 → 不 ok，并指出是小节顺序', () => {
+  const result = checkPair({ swapZhSections: true })
+  assert.equal(result.ok, false)
+  assert.ok(
+    result.problems.some((problem) => problem.includes('小节顺序不一致')),
+    `应报告小节顺序问题：${result.problems.join(' / ')}`,
+  )
+})
+
+test('check-readmes：配置表缺一个键 → 不 ok，并点名缺的键', () => {
+  const result = checkPair({ dropZhKey: 'auditMax' })
+  assert.equal(result.ok, false)
+  assert.ok(
+    result.problems.some((problem) => problem.includes('表格键集合不一致') && problem.includes('auditMax')),
+    `应点名缺的表格键：${result.problems.join(' / ')}`,
+  )
+})
+
+test('check-readmes：命令行缺一条 → 不 ok，并点名缺的命令', () => {
+  const result = checkPair({ dropZhCommand: '/memory stats' })
+  assert.equal(result.ok, false)
+  assert.ok(
+    result.problems.some((problem) => problem.includes('命令行清单不一致') && problem.includes('/memory stats')),
+    `应点名缺的命令：${result.problems.join(' / ')}`,
+  )
+})
+
+test('check-readmes：代码围栏奇数 → 不 ok', () => {
+  const result = checkPair({ breakEnFence: true })
+  assert.equal(result.ok, false)
+  assert.ok(
+    result.problems.some((problem) => problem.includes('代码围栏不成对')),
+    `应报告围栏不成对：${result.problems.join(' / ')}`,
+  )
+})
+
+test('check-readmes：顶部互链缺失 → 不 ok', () => {
+  const result = checkPair({ dropZhLink: true })
+  assert.equal(result.ok, false)
+  assert.ok(
+    result.problems.some((problem) => problem.includes('顶部互链缺失') && problem.includes('README.zh.md')),
+    `应报告互链缺失：${result.problems.join(' / ')}`,
+  )
+})
+
+test('check-readmes：真实仓库的两份 README 结构一致（回归闸门）', () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const result = checkReadmes(repoRoot)
+  assert.deepEqual(result.problems, [], `真实 README 不该有结构差异：${result.problems.join(' / ')}`)
+  assert.equal(result.ok, true)
+})

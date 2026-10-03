@@ -442,10 +442,15 @@ TypeScript 编写、`tsc` 构建、pnpm 管理。开发工具也是 TypeScript �
 所以 `node tools/<name>.ts` 直接可跑，工具链不需要构建步骤。
 
 ```sh
-pnpm install                                      # 只装开发依赖：typescript、@types/node、schemastery 类型
+pnpm install                                      # 只装开发依赖：typescript、@types/node、schemastery 类型、oxlint
 pnpm build                                        # src/*.ts → lib/*.js（并给客户端半边套上 lazy-CJS 包装）
-pnpm test                                         # 先构建，再对构建产物跑单测
-pnpm typecheck                                    # 宿主半边、客户端半边、工具，分别检查，不产出文件
+pnpm test                                         # 先构建，再对构建产物跑单测，最后校验两份 README 结构一致
+pnpm typecheck                                    # 宿主半边、客户端半边、工具、测试，分别检查，不产出文件
+pnpm lint                                         # oxlint（只开 correctness 类规则）
+pnpm check:readmes                                # 单独跑 README 中英一致性校验（漂移时点名是哪一项）
+pnpm verify:self-contained                        # 断言零运行期依赖 + 打包清单完整（GitHub 直接安装的前提）
+pnpm coverage                                     # 跑覆盖率取数（必须显式排除 node_modules，否则 lib/ 会被整体排除）
+pnpm coverage:check                               # 按门槛判定（门槛按口径分开，见 tools/coverage-check.ts）
 node tools/eval-recall.ts                         # 离线召回评测（读真实会话日志）
 node tools/bench.ts                               # 热路径基准（每回合召回、每 step 渲染、整合）
 node tools/deploy-dev.ts                          # 把 lib/ 挂成新的开发修订版（需先 pnpm build）
