@@ -2908,6 +2908,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           id: record.id, kind: record.kind, scope: record.scope, origin: record.origin,
           text: record.text, pinned: record.pinned, score: Number(score.toFixed(3)),
           observedAt: new Date(record.observedAt).toISOString(),
+          // M9 收尾：模型召回时也要能直接看到出处（`/memory verify <id>` 可回到原文核对）。
+          // 无引用时给空串而不是省略字段 —— 工具输出形状保持稳定，模型不必处理两种形状。
+          refs: refsToString(refsOf(record)),
         })))
       },
     },
@@ -2939,6 +2942,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         return jsonList('items', rows.map((record) => ({
           id: record.id, kind: record.kind, status: record.status, origin: record.origin,
           scope: record.scope, pinned: record.pinned, importance: record.importance, text: record.text,
+          // M9 收尾：列表也给出处（与 memory_recall 同口径：无引用＝空串，形状稳定）。
+          refs: refsToString(refsOf(record)),
         })))
       },
     },

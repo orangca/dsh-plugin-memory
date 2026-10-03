@@ -367,8 +367,8 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 | 工具 | 用途 |
 |---|---|
 | `memory_write` | 结构化写入（`kind` + `text`，可选 `subject` / `field` / `value` / `scopeLevel`；`kind='agent_self'` 时可选 `facet: 'persona' \| 'work'`；另有可选 `branch`：`true` = 当前 git 分支、字符串 = 指定分支、缺省 = 不打标签（跨分支成立））。**写入来源由插件判定，模型不能自称「用户要求的」** |
-| `memory_recall` | 按查询 / 类型 / 作用域 / 标签检索 |
-| `memory_list` | 按确定性顺序列出 |
+| `memory_recall` | 按查询 / 类型 / 作用域 / 标签检索；每条命中都带 `refs`（会话 + 事件区间），模型可据此引用或复核出处 |
+| `memory_list` | 按确定性顺序列出（同样带 `refs` 字段） |
 | `memory_forget` | 按 id 删除；按 query 删除需 `confirm: true`（预览阈值更严） |
 | `memory_maintain` | 手动触发整合（合并 / 失效 / 归档 / 摘要） |
 | `memory_stats` | 运行时可观测：条数、写入 / 拒绝计数、注入行数、渲染耗时 |

@@ -414,8 +414,8 @@ whole Config through the settings service and persists it into the profile patch
 | Tool | Purpose |
 |---|---|
 | `memory_write` | Structured write (`kind` + `text`, optional `subject` / `field` / `value` / `scopeLevel`; with `kind='agent_self'` also an optional `facet: 'persona' \| 'work'`; and an optional `branch`: `true` = the current git branch, a string = that branch, omitted = no tag, which applies on every branch). **The origin is decided by the plugin — the model cannot claim "the user asked for this"** |
-| `memory_recall` | Search by query / kind / scope / tag |
-| `memory_list` | List in deterministic order |
+| `memory_recall` | Search by query / kind / scope / tag; each hit carries `refs` (session + event range), so the model can cite or re-check where a memory came from |
+| `memory_list` | List in deterministic order (same `refs` field) |
 | `memory_forget` | Delete by id; deleting by query needs `confirm: true` (stricter preview threshold) |
 | `memory_maintain` | Trigger consolidation manually (merge / invalidate / archive / summarize) |
 | `memory_stats` | Runtime observability: row counts, write/reject counters, injected lines, render time |

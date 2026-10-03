@@ -1976,6 +1976,35 @@ test('host#40 refs：memory_write 工具附着单点引用（via=tool，省略 t
   assert.deepEqual((payload.record as Json).refs, row.refs)
 })
 
+// ---------------------------------------------------------------- 40b. 工具输出带出处（M9 收尾）
+
+test('host#40b 工具输出带出处：memory_recall / memory_list 都让模型直接看到来源；无引用给空串', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  emitSeqEvent(harness, refsSession(), seqUserEvent('这句话只是用来推进 seq 的。', 42))
+  await writeViaTool(harness, '构建产物统一放在 dist 目录下')
+
+  const recalled = JSON.parse(String(await harness.tool('memory_recall').execute({ query: '构建产物 dist' }))) as Json
+  const recallItem = (recalled.items as Json[])[0]!
+  assert.equal(recallItem.refs, 'session-1#42', 'memory_recall 必须给出机器可读的引用串（模型据此可自查出处）')
+
+  const listed = JSON.parse(String(await harness.tool('memory_list').execute({ limit: 10 }))) as Json
+  const listItem = (listed.items as Json[]).find((item) => item.id === recallItem.id)!
+  assert.equal(listItem.refs, 'session-1#42', 'memory_list 与 memory_recall 同口径')
+
+  // 无引用（没见过带 seq 的事件 → 宿主不编造区间）也要有稳定形状：空串，而不是缺字段
+  const bare = makeHarness()
+  t.after(() => bare.dispose())
+  await bare.settle()
+  await writeViaTool(bare, '没有 seq 事件时写入的条目')
+  const bareRecall = JSON.parse(String(await bare.tool('memory_recall').execute({ query: '没有 seq 事件' }))) as Json
+  assert.equal((bareRecall.items as Json[])[0]!.refs, '', '无引用必须是空串（形状稳定，模型不必处理两种形状）')
+  const bareList = JSON.parse(String(await bare.tool('memory_list').execute({ limit: 10 }))) as Json
+  assert.equal((bareList.items as Json[])[0]!.refs, '', 'memory_list 同口径')
+})
+
 // ---------------------------------------------------------------- 41. 合并并入引用
 
 test('host#41 refs：重复提及（hash 合并）时新引用并入既有条目，旧引用保留', async (t) => {

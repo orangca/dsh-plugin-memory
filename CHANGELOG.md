@@ -3,6 +3,25 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.16 — 2026-10-03
+
+The last item from the competitor-survey queue: 0.5.9 gave every memory a verifiable source, 0.5.14 let the *user*
+check it (`/memory verify`), and this lets the **model** see it where it actually reads — recall and list output.
+
+### Added
+
+- `memory_recall` and `memory_list` items now carry a machine-readable `refs` field (`sessionId#from-to`, several
+  joined with `;`). Records written before 0.5.9, or without an observable sequence range, get `''` rather than a
+  missing key: the tool output keeps one shape, so the model never has to handle two, and the host still refuses to
+  invent a range it never saw.
+- README tool tables (both languages) say so.
+
+### Notes
+
+- Deliberately no change to the seven tool *descriptions*: those are model-visible text pinned byte-for-byte by the
+  M11 contract tests, and the field is self-describing in the output. Changing them would be its own acknowledged
+  release, not a silent rider on this one.
+
 ## 0.5.15 — 2026-10-03
 
 Engineering hardening. No behaviour change: the only source edits are lint findings, and the regex rewrite was
