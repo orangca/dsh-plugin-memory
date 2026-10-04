@@ -622,6 +622,10 @@ Three development notes that cost real debugging time and are worth knowing:
   `dsh-client-ui-primitives` does not even export the settings API. Type against the empirically verified subset in
   `src/types.ts` / `src/shims.d.ts` instead of importing mismatched types.
 
+A one-page **delivery overview** — capabilities with the version each landed in, the architecture diagram, the
+protocol summary, the engineering gates, the quality evidence and the known limitations — is in
+[`docs/delivery.md`](docs/delivery.md).
+
 See [`docs/dsh-mechanisms.md`](docs/dsh-mechanisms.md) for the DSH seams, slot semantics and environment facts this
 plugin is built on — written for plugin authors, with no environment-specific details.
 

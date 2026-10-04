@@ -552,6 +552,9 @@ node tools/scan-asar.ts settingsNumberField       # 定位某个符号在 app.as
 - **npm 上的 `@deepseek-ai/*` 包比你正在运行的 DSH 旧**——发布版 `dsh-client-ui-primitives` 甚至不导出 settings API。
   因此按 `src/types.ts` / `src/shims.d.ts` 里**实测验证过的子集**打类型，而不是导入不匹配的发布版类型。
 
+面向第一次接手的人的一页**交付总览**（能力清单与各自落地版本、架构一页图、协议面摘要、六道工程门禁、
+质量证据、已知限制、发布历史）见 [`docs/delivery.md`](docs/delivery.md)。
+
 本插件依赖的 DSH 接缝、插槽语义与环境事实，见 [`docs/dsh-mechanisms.md`](docs/dsh-mechanisms.md)
 （面向插件作者，不含任何环境特定信息）。
 

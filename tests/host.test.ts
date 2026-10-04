@@ -6832,3 +6832,456 @@ test('host#149 变异测试补盲：预算显式写成 null（＝未设置）时
 //       · 只剩 `rejected_sensitive` —— 摘要正文取自已经通过同一套扫描入库的条目，要靠跨条目的
 //         `；` 拼接恰好拼出一个敏感模式才可能命中，那是人为构造而非真实调用路径。
 //     换句话说这是一处**等价变异**（在可达输入上不可观察），故不补。
+
+// ---------------------------------------------------------------- 第四轮：memory_explain 与 tags/field/value 的变异补盲（M35）
+//
+// 本轮把破坏集中在两个靶区：
+//   · `memory_explain` 的**完整分支** —— `apply:false`（诊断）与 `apply:true`（真写）、
+//     `portrait` / `branch` / `matching` 三个诊断块的内容与形状、`skipped` 的分类与计数、
+//     候选被敏感扫描/回声/配额/去重挡下后的行为、`trustToolWrites` 与 `deriveOriginFromMessages`
+//     的影响、以及写入后的 `persisted` / `refs` / `pending` 是否与 `memory_write` 同口径；
+//   · `tags` / `field` / `value` 的端到端口径 —— 写入入库、检索打分、合并分组、冲突槽位、
+//     导入保留/降级、`memory_explain` 诊断与列表输出的可见性。
+//
+// 方法同上一轮：在 `os.tmpdir()` 的仓库副本里改 `src` 一处 → `tsc` 重建 → 跑**全量**测试 → 改回。
+// 本轮共试 **52 处**：**2 处**被 tsc 当场拦下（build-error，绕不过类型）、**23 处**被既有测试杀死、
+// **27 处**全量仍绿（存活）。27 处存活**全部**补成下面 13 条用例，并逐条在副本里双向实测
+// （变异版红 / 未变异版绿）。括号里是变异编号（A–E 为批次）。
+//
+//   #150 A3/A4/A5/D3/D4/E4  matching 诊断块：候选窗口、每候选 top-3、命中明细字段口径
+//   #151 A7/C11             skipped 的分类与计数（no-signal / duplicate-in-turn / over-turn-quota）
+//   #152 A15                trustToolWrites 的显式例外在 explain --apply 上同样成立
+//   #153 A12/A13/D1         explain --apply 的 persisted / refs / 未落盘提示与 memory_write 同口径
+//   #154 B1/B2/B3/E3        explain --apply 的落库字段来自候选与 cwd（含 sessionId）
+//   #155 B5/B6/B7           memory_write 工具的 tags/field/value 端到端（入库 + 检索 + 指纹幂等）
+//   #156 B11                回声闸只针对模型来源：用户真说过的复述照常入库
+//   #157 A10/D5             portrait 诊断区只收自画像，totals.skipped 如实
+//   #158 A6                 候选视图的 facet 只加在 agent_self 上（缺省 work）
+//   #159 C7                 合并分组：没有 subject 的条目不参与
+//   #160 C8                 合并分组：field 不参与分组键
+//   #161 C5                 冲突槽位：field 参与槽位键
+//   #162 C6                 冲突槽位：value 缺失的条目不参与
+//
+// 上面这 27 处存活变异的确切改法（`index` = `src/index.ts`，`lib` = `src/lib.ts`；"→" 左边是原文）：
+//   A3  index  candidateViews.slice(0, 3)                      → slice(0, 1)
+//   A4  index  recallRecords(..., { cfg, query: probe, limit: 3 }) → limit: 1
+//   A5  index  passesMatchThreshold: detail.passes             → true
+//   A6  index  if (candidate.kind === 'agent_self') view.facet → kind !== 'agent_self'
+//   A7  index  诊断分支返回的 { skipped, matching, ... }        → skipped: {}
+//   A10 index  portrait 的 .filter(kind === 'agent_self')      → .filter(() => true)
+//   A12 index  written 的 persisted: result.persisted          → true
+//   A13 index  const unpersistedCount = written.filter(...)    → 0
+//   A15 index  writeOrigin 的 cfg.trustToolWrites 例外         → 摘掉
+//   B1  index  explain apply 的 tags: candidate.tags           → []
+//   B2  index  候选的 confidence / importance                  → 0.6 / 0.5
+//   B3  index  explain apply 的 scope.key                      → '*'
+//   B5  index  memory_write 的 tags: Array.isArray(...) ? ...  → []
+//   B6  index  memory_write 的 field: args.field ?? null       → null
+//   B7  index  memory_write 的 value: args.value ?? null       → null
+//   B11 index  回声闸的 origin === 'model_proposed' &&         → 摘掉
+//   C5  lib    findConflicts 的槽位键 `...|${record.subject}|${record.field}` → 去掉 |field
+//   C6  lib    if (!record.subject || record.field == null || record.value == null) → 去掉 value 判定
+//   C7  lib    pickMergeGroups 的 if (!record.subject) continue → if (!record.text) continue
+//   C8  lib    pickMergeGroups 的分组键 `${...}|${record.subject}` → 追加 |${record.field ?? ''}
+//   C11 lib    skipped['over-turn-quota'] = candidates.length - limit → 1
+//   D1  index  written 条目里的 refs: result.refs              → 丢掉该键
+//   D3  index  matchedTokens: detail.matched                   → []
+//   D4  index  matchScore: Number(detail.score.toFixed(3))     → 0
+//   D5  index  portrait.totals 的 skipped: state.self.skipped  → 0
+//   E3  index  explain apply 的 sessionId: exec?.agent?.session ? ... → 不再传
+//   E4  index  matching 的对照正文 clampText(probe, 60)         → clampText(probe, 1)
+
+test('host#150 变异测试补盲：memory_explain 的 matching 诊断块 —— 候选窗口、top-3 命中与字段口径（A3/A4/A5/D3/D4/E4）', async (t) => {
+  // `recallMinMatch` 抬到 0.99：命中照常列出来（它是 recall 门槛 0.34 的事），但每个命中的
+  // `passesMatchThreshold` 都应当是 false —— 这样「恒真」的变异版本就会当场翻面。
+  const harness = makeHarness({ config: { selfIntroEnabled: false, recallMinMatch: 0.99 } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  for (const text of [
+    '构建流程统一用 pnpm 输出到 dist 目录',
+    '构建流程统一用 pnpm 输出到 build 目录',
+    '流程统一用 pnpm 输出到 dist 目录下',
+  ]) {
+    const seeded = await harness.memory().write({ kind: 'semantic', text, origin: 'observed' })
+    assert.equal(seeded.ok, true, `前提：对照记录写入成功（${String(seeded.error)}）`)
+  }
+
+  const probe = '记住：构建流程统一用 pnpm 输出到 dist 目录'
+  const text = [probe, '就定用 sqlite 保存本地索引', '我的系统是 Windows 11 专业版'].join('\n')
+  const explain = JSON.parse(String(await harness.tool('memory_explain').execute({ text }))) as Json
+  const candidates = explain.candidates as Json[]
+  assert.equal(candidates.length, 3, '前提：三个句子各命中一个信号')
+
+  const matching = explain.matching as Json[]
+  assert.equal(matching.length, 3, `前 3 个候选都要各有一份对照（窗口不得缩水）：${JSON.stringify(matching)}`)
+  assert.equal(matching[0]!.text, candidates[0]!.text, '对照正文就是该候选正文（未超长时不截断）')
+
+  const hits = matching[0]!.hits as Json[]
+  assert.equal(hits.length, 3, `top-3 命中：库里 3 条相似记忆都要列出来：${JSON.stringify(hits)}`)
+  for (const hit of hits) {
+    assert.equal(typeof hit.id, 'string', '每条命中必须有 id')
+    assert.equal(typeof hit.score, 'number', '每条命中必须有召回分')
+    assert.ok(
+      Array.isArray(hit.matchedTokens) && (hit.matchedTokens as unknown[]).length > 0,
+      `命中明细必须给出命中的 token：${JSON.stringify(hit)}`,
+    )
+    assert.ok(
+      typeof hit.matchScore === 'number' && (hit.matchScore as number) > 0,
+      `matchScore 必须是真的相关性分（不是 0）：${JSON.stringify(hit)}`,
+    )
+    assert.equal(
+      hit.passesMatchThreshold,
+      false,
+      `recallMinMatch=0.99 时这些命中都过不了门槛，诊断必须如实写 false：${JSON.stringify(hit)}`,
+    )
+  }
+})
+
+test('host#151 变异测试补盲：memory_explain 的 skipped 分类与计数（A7/C11）', async (t) => {
+  // captureMaxPerTurn=1：3 条有信号的句子只留 1 条 ⇒ over-turn-quota 恰为 2（不是 1、也不是糊成一类）。
+  const harness = makeHarness({ config: { selfIntroEnabled: false, captureMaxPerTurn: 1 } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const line = '记住：构建流程统一用 pnpm 输出到 dist 目录'
+  const text = [
+    line,
+    line, // 逐字重复 ⇒ duplicate-in-turn
+    '就定用 sqlite 保存本地索引',
+    '我的系统是 Windows 11 专业版',
+    '随便写一句没有命中任何信号的话',
+  ].join('\n')
+  const explain = JSON.parse(String(await harness.tool('memory_explain').execute({ text }))) as Json
+
+  assert.deepEqual(
+    explain.skipped,
+    { 'duplicate-in-turn': 1, 'no-signal': 1, 'over-turn-quota': 2 },
+    `skipped 必须逐类、逐个计数（不得清空、不得糊成一类、不得恒 1）：${JSON.stringify(explain.skipped)}`,
+  )
+  const candidates = explain.candidates as Json[]
+  assert.equal(candidates.length, 1, 'captureMaxPerTurn=1 ⇒ 只留置信度最高的那条')
+  assert.equal(candidates[0]!.signal, 'explicit-imperative')
+  assert.equal(explain.total, 1, 'total 是截断前的候选总数')
+  assert.equal(explain.count, 1)
+})
+
+test('host#152 变异测试补盲：trustToolWrites=true 时 explain --apply 与 memory_write 同口径按 user_explicit 落库（A15）', async (t) => {
+  const text = '记住：默认时区是 Mars/Phobos'
+
+  // a) 显式信任工具写入：会话里没人说过这句话，来源也必须是 user_explicit（配置例外）
+  const trusted = makeHarness({ config: { trustToolWrites: true, selfIntroEnabled: false } })
+  t.after(() => trusted.dispose())
+  await trusted.settle()
+  const trustedResult = JSON.parse(String(await trusted.tool('memory_explain').execute({ text, apply: true }))) as Json
+  assert.equal(
+    (trustedResult.candidates as Json[])[0]!.writeOrigin,
+    'user_explicit',
+    '诊断里「真的会落库的来源」必须体现 trustToolWrites 的例外',
+  )
+  const trustedWritten = (trustedResult.written as Json[])[0]!
+  assert.equal(trustedWritten.ok, true, String(trustedWritten.error))
+  const trustedRow = allRows(trusted).find((row) => row.id === trustedWritten.id)!
+  assert.equal(trustedRow.origin, 'user_explicit', 'trustToolWrites=true ⇒ 工具写入的来源是 user_explicit')
+  // 同一条通道上的 memory_write 也必须一致（两处各有一份来源推导，口径不能分叉）
+  const viaWrite = await writeTool(trusted, { kind: 'user_profile', text: '另一句没有会话依据的写入探针文本' })
+  assert.equal(allRows(trusted).find((row) => row.id === viaWrite.id)!.origin, 'user_explicit')
+
+  // b) 反面对照：缺省（false）时同一句话只能是 model_proposed —— 免得上面那条被「恒真」蒙对
+  const plain = makeHarness({ config: { selfIntroEnabled: false } })
+  t.after(() => plain.dispose())
+  await plain.settle()
+  const plainResult = JSON.parse(String(await plain.tool('memory_explain').execute({ text, apply: true }))) as Json
+  const plainWritten = (plainResult.written as Json[])[0]!
+  assert.equal(plainWritten.ok, true)
+  assert.equal(
+    allRows(plain).find((row) => row.id === plainWritten.id)!.origin,
+    'model_proposed',
+    '缺省下模型自选的文本不得拿到用户侧身份',
+  )
+})
+
+test('host#153 变异测试补盲：explain --apply 的 persisted / refs / 未落盘提示与 memory_write 同口径（A12/A13/D1）', async (t) => {
+  // 盘满形态：put 恒失败，内存仍生效 —— `persisted` 是唯一能说明「重启后会不会没了」的字段。
+  const harness = makeHarness({ failPuts: true })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const text = '记住：默认时区是 Mars/Phobos'
+  const result = JSON.parse(String(await harness.tool('memory_explain').execute({ text, apply: true }))) as Json
+  const written = (result.written as Json[])[0]!
+  assert.equal(written.ok, true, '内存已生效 ⇒ ok 仍是 true（与 memory_write 相同语义）')
+  assert.equal(written.persisted, false, 'put 失败 ⇒ explain 也必须如实回报 persisted=false')
+  assert.equal(written.pending, undefined, 'auto 路径不是入队')
+  assert.ok(Array.isArray(written.refs), `refs 字段必须在（无引用时是空数组，形状与 memory_write 一致）：${JSON.stringify(written)}`)
+  assert.match(String(result.notice), /未落盘/u, `必须提示未落盘：${String(result.notice)}`)
+  assert.match(String(result.notice), /put failed/u, '提示里要带上失败原因（state.openError）')
+  assert.match(String(result.notice), /重启后不会存在/u)
+
+  // 对照：同一实例上 memory_write 也是 persisted=false、refs 是数组
+  const viaTool = await writeTool(harness, { kind: 'semantic', text: '另一条落盘失败探针：它只在内存里' })
+  assert.equal(viaTool.persisted, false, 'refs/persisted 两条路径必须同口径')
+  assert.ok(Array.isArray(viaTool.refs))
+  assert.equal(allRows(harness).length, 2, '两条都只在内存里')
+  assert.equal(harness.domain.rows.size, 0, '盘上一条都没有')
+})
+
+test('host#154 变异测试补盲：explain --apply 的落库字段来自候选与 cwd（B1/B2/B3/E3）', async (t) => {
+  const harness = makeHarness({ config: { selfIntroEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const exec = { agent: { session: { id: 'session-1', seq: 5, header: { cwd: WORKSPACE_CWD } } } }
+  const text = '记住：构建流程统一用 pnpm 输出到 dist 目录\n就定用 sqlite 保存本地索引'
+  const result = JSON.parse(String(await harness.tool('memory_explain').execute({ text, apply: true }, exec))) as Json
+  const written = result.written as Json[]
+  assert.equal(written.length, 2, `两条候选都要写：${JSON.stringify(result)}`)
+
+  const profileRow = allRows(harness).find((row) => row.id === written[0]!.id)!
+  const semanticRow = allRows(harness).find((row) => row.id === written[1]!.id)!
+  assert.equal(profileRow.kind, 'user_profile')
+  assert.equal(profileRow.confidence, 0.9, '信号表的 confidence 必须落库（不是 makeRecord 的默认 0.6）')
+  assert.equal(profileRow.importance, 0.85, '信号表的 importance 必须落库')
+  assert.deepEqual(profileRow.tags, ['explicit-imperative'], '命中信号必须作为标签落库')
+  assert.deepEqual(
+    (profileRow.reinforcement as Json).sessions,
+    ['session-1'],
+    'exec 的会话 id 必须进复现追踪（否则「跨会话复现才晋升」失去依据）',
+  )
+
+  assert.equal(semanticRow.kind, 'semantic')
+  assert.equal((semanticRow.scope as Json).level, 'workspace')
+  assert.equal(
+    (semanticRow.scope as Json).key,
+    workspaceKeyOf(WORKSPACE_CWD),
+    'workspace 级写入的 scope.key 必须由 cwd 派生（不是通配 *）',
+  )
+  assert.deepEqual(semanticRow.tags, ['decision'])
+  assert.equal(semanticRow.confidence, 0.7)
+  assert.equal(semanticRow.importance, 0.6)
+})
+
+test('host#155 变异测试补盲：memory_write 工具的 tags / field / value 端到端（B5/B6/B7）', async (t) => {
+  const harness = makeHarness({ noReport: true })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const first = await writeTool(harness, {
+    kind: 'semantic',
+    text: '订阅发布流程统一走 pnpm 通道',
+    subject: 'project.release',
+    field: 'channel',
+    value: 'pnpm',
+    tags: ['quarantine-marker'],
+  })
+  assert.equal(first.ok, true, String(first.error))
+  assert.equal(first.status, 'created')
+  const row = allRows(harness).find((entry) => entry.id === first.id)!
+  assert.equal(row.subject, 'project.release', 'subject 必须入库（合并/冲突/摘要都靠它）')
+  assert.equal(row.field, 'channel', 'field 必须入库')
+  assert.equal(row.value, 'pnpm', 'value 必须入库')
+  assert.deepEqual(row.tags, ['quarantine-marker'], 'tags 必须逐字入库')
+
+  // tags 进检索 token：正文里根本没有 quarantine 这个词，只有标签里有
+  const byTagToken = harness.memory().recall({ query: 'quarantine' })
+  assert.equal(byTagToken.length, 1, 'tags 参与检索打分：只靠标签里的 token 也要能召回')
+  assert.equal(byTagToken[0]!.record.id, first.id)
+
+  const hit = JSON.parse(String(await harness.tool('memory_recall').execute({ query: '订阅发布流程 通道', tag: 'quarantine-marker' }))) as Json
+  assert.equal((hit.items as Json[]).length, 1, 'tag 过滤必须命中带该标签的条目')
+  const miss = JSON.parse(String(await harness.tool('memory_recall').execute({ query: '订阅发布流程 通道', tag: '不存在-的标签' }))) as Json
+  assert.equal((miss.items as Json[]).length, 0, 'tag 过滤必须真的过滤')
+
+  // 可见性口径：列表只给正文与状态，tags/field/value 不在其中
+  const listed = JSON.parse(String(await harness.tool('memory_list').execute({}))) as Json
+  assert.deepEqual(
+    Object.keys((listed.items as Json[])[0]!).sort(),
+    ['id', 'importance', 'kind', 'origin', 'pinned', 'refs', 'scope', 'status', 'text'],
+    'memory_list 的字段集合稳定（tags/field/value 不在列表输出里）',
+  )
+  const listText = (await harness.runCommand('list')).text
+  assert.match(listText, /订阅发布流程统一走 pnpm 通道/u, '/memory list 照常列出正文')
+  assert.doesNotMatch(listText, /quarantine-marker/u, '/memory list 不暴露标签')
+
+  // 指纹口径：tags/value 不参与 recordHash ⇒ 同正文第二次写入必须合并（幂等），不得新建第二条
+  const again = await writeTool(harness, {
+    kind: 'semantic',
+    text: '订阅发布流程统一走 pnpm 通道',
+    subject: 'project.release',
+    field: 'channel',
+    value: 'bun',
+    tags: ['different-tag'],
+  })
+  assert.equal(again.ok, true, String(again.error))
+  assert.equal(again.status, 'merged', '同一指纹（tags/value 不参与指纹）⇒ 合并，不得新建第二条')
+  assert.equal(allRows(harness).length, 1, '库里仍只有一条')
+  assert.equal(allRows(harness)[0]!.value, 'pnpm', '合并保留既有 value（换值要走冲突/取代语义）')
+})
+
+test('host#156 变异测试补盲：回声闸只针对模型来源 —— 用户真说过的复述照常入库（B11）', async (t) => {
+  const harness = makeHarness({ config: { selfIntroEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const seedText = '记住：默认时区是 Mars/Phobos'
+  const seeded = await harness.memory().write({ kind: 'user_profile', text: seedText, origin: 'observed' })
+  assert.equal(seeded.ok, true, `前提：对照记录写入成功（${String(seeded.error)}）`)
+  assert.ok(residentText(harness).includes('Mars/Phobos'), '前提：它确实进了注入（回声检测的对照面）')
+
+  // a) 模型来源：与自己刚注入的内容高度相似 ⇒ 必须被回声闸挡下
+  const modelProbe = JSON.parse(String(await harness.tool('memory_explain').execute({ text: seedText, apply: true }))) as Json
+  const modelWritten = (modelProbe.written as Json[])[0]!
+  assert.equal(modelWritten.ok, false, '模型复述必须被回声闸挡下')
+  assert.match(String(modelWritten.error), /^rejected_echo/u)
+
+  // b) 用户真的说过同一句：来源是 user_explicit ⇒ 回声闸不得对用户侧生效
+  const said = JSON.parse(String(
+    await harness.tool('memory_explain').execute({ text: seedText, apply: true }, execWithMessages([userMessage(seedText)])),
+  )) as Json
+  const saidWritten = (said.written as Json[])[0]!
+  assert.equal(saidWritten.ok, true, `用户真说过的同一句必须能入库：${JSON.stringify(saidWritten)}`)
+  assert.doesNotMatch(String(saidWritten.error ?? ''), /rejected_echo/u, '用户侧来源与回声闸无关')
+  const row = allRows(harness).find((entry) => entry.id === saidWritten.id)!
+  assert.equal(row.origin, 'user_explicit', '这次写入的来源确实是用户侧')
+})
+
+test('host#157 变异测试补盲：portrait 诊断区只收自画像，且 totals.skipped 如实（A10/D5）', async (t) => {
+  const harness = makeHarness({ config: { selfIntroEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const plain = await harness.memory().write({ kind: 'semantic', text: '构建流程统一用 pnpm 输出到 dist 目录', origin: 'observed' })
+  assert.equal(plain.ok, true, `前提：普通记忆写入成功（${String(plain.error)}）`)
+  const selfWritten = await harness.memory().write({
+    kind: 'agent_self', facet: 'work', subject: 'style', text: '我在改动公共接口前会先问一声再动手。', origin: 'user_explicit',
+  })
+  assert.equal(selfWritten.ok, true, `前提：自画像写入成功（${String(selfWritten.error)}）`)
+  // 制造一次 portrait_skipped（too-short）：计数必须出现在诊断里（只在 report 里可见是不够的）
+  const short = await writeSelf(harness, { kind: 'agent_self', facet: 'work', text: '太短' })
+  assert.equal(short.ok, false)
+  assert.match(String(short.error), /portrait_skipped/u)
+
+  const explain = JSON.parse(String(await harness.tool('memory_explain').execute({ text: '诊断' }))) as Json
+  const portrait = explain.portrait as Json
+  const records = portrait.records as Json[]
+  assert.equal(records.some((entry) => entry.id === selfWritten.id), true, '自画像条目必须列出来')
+  assert.equal(records.some((entry) => entry.id === plain.id), false, '普通记忆不得混进 portrait.records')
+  assert.equal(records.length, 1, '只有一条自画像就只列一条')
+  assert.deepEqual(
+    portrait.totals,
+    { added: 1, refined: 0, superseded: 0, skipped: 1 },
+    `totals 必须如实反映自画像计数：${JSON.stringify(portrait.totals)}`,
+  )
+  assert.deepEqual(portrait.pending, [], '没有待确认自画像时 pending 是空数组（形状稳定）')
+})
+
+test('host#158 变异测试补盲：候选视图的 facet 只加在 agent_self 上（缺省 work）（A6）', async (t) => {
+  const harness = makeHarness({ config: { selfIntroEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const text = ['以后你要先问我再动手', '记住：构建流程统一用 pnpm 输出到 dist 目录'].join('\n')
+  const explain = JSON.parse(String(await harness.tool('memory_explain').execute({ text }))) as Json
+  const candidates = explain.candidates as Json[]
+  const selfCandidate = candidates.find((entry) => entry.signal === 'agent-self-directive')!
+  const profileCandidate = candidates.find((entry) => entry.signal === 'explicit-imperative')!
+  assert.equal(selfCandidate.kind, 'agent_self')
+  assert.equal(selfCandidate.facet, 'work', 'agent_self 候选必须带缺省 facet=work（写入时收敛要靠它）')
+  assert.equal(profileCandidate.kind, 'user_profile')
+  assert.equal('facet' in profileCandidate, false, '非 agent_self 候选不得被塞上 facet')
+  assert.equal(typeof profileCandidate.writeOrigin, 'string', '写入口径字段照常在')
+})
+
+test('host#159 变异测试补盲：合并分组不认没有 subject 的条目（C7）', async (t) => {
+  const harness = makeHarness({ config: { consolidateEnabled: false }, noReport: true })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 两条正文高度相似的条目，但**都没有 subject**（没有主题键就无从判断「同一件事」）
+  for (const text of [
+    '构建流程统一用 pnpm 并且产物输出到 dist 目录',
+    '构建流程统一用 pnpm 并且产物输出到 dist 目录下',
+  ]) {
+    const written = await harness.memory().write({ kind: 'semantic', text, origin: 'observed' })
+    assert.equal(written.ok, true, `前提：写入成功（${String(written.error)}）`)
+  }
+  assert.equal(allRows(harness).every((row) => row.subject === null), true, '前提：两条都没有 subject')
+
+  const out = await harness.runCommand('consolidate')
+  assert.match(out.text, /整合完成：合并 0，冲突失效 0，归档 0，摘要 0/u, `没有主题键就不该合并：${out.text}`)
+  assert.equal(allRows(harness).filter((row) => row.status === 'active').length, 2, '两条都必须保持 active')
+})
+
+test('host#160 变异测试补盲：合并分组键不含 field（C8）', async (t) => {
+  const harness = makeHarness({ config: { consolidateEnabled: false }, noReport: true })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 同 kind / 同 scope / 同 subject、正文高度相似，只是 field 不同 —— 仍属同一次合并
+  const first = await harness.memory().write({
+    kind: 'semantic', subject: 'merge.field.probe', field: 'alpha', value: '1',
+    text: '构建流程统一用 pnpm 并且产物输出到 dist 目录', origin: 'observed',
+  })
+  const second = await harness.memory().write({
+    kind: 'semantic', subject: 'merge.field.probe', field: 'beta', value: '2',
+    text: '构建流程统一用 pnpm 并且产物输出到 dist 目录下', origin: 'observed',
+  })
+  assert.equal(first.ok, true, `前提：第一条写入成功（${String(first.error)}）`)
+  assert.equal(second.ok, true, `前提：第二条写入成功（${String(second.error)}）`)
+
+  const out = await harness.runCommand('consolidate')
+  assert.match(out.text, /整合完成：合并 1，冲突失效 0/u, `同主题的相似条目要合并（field 不参与分组键）：${out.text}`)
+  assert.equal(allRows(harness).filter((row) => row.status === 'active').length, 1, '合并后只剩一条 active')
+  assert.equal(allRows(harness).filter((row) => row.status === 'archived').length, 1, '被吸收的那条归档（不删除）')
+})
+
+test('host#161 变异测试补盲：冲突槽位键含 field（C5）', async (t) => {
+  const harness = makeHarness({ config: { consolidateEnabled: false }, noReport: true })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 同 subject、**不同 field**（＝不同槽位），正文不相近 ⇒ 不该被判成「同槽位冲突」
+  const older = await harness.memory().write({
+    kind: 'semantic', subject: 'slot.probe', field: 'alpha', value: '1',
+    text: '较旧的槽位条目甲：构建产物输出目录约定', origin: 'observed',
+  })
+  const newer = await harness.memory().write({
+    kind: 'semantic', subject: 'slot.probe', field: 'beta', value: '2',
+    text: '较新的槽位条目乙：数据库迁移工具选型', origin: 'observed',
+  })
+  assert.equal(older.ok, true, `前提：第一条写入成功（${String(older.error)}）`)
+  assert.equal(newer.ok, true, `前提：第二条写入成功（${String(newer.error)}）`)
+  const now = Date.now()
+  allRows(harness).find((row) => row.id === older.id)!.observedAt = now - 60_000
+  allRows(harness).find((row) => row.id === newer.id)!.observedAt = now
+
+  const out = await harness.runCommand('consolidate')
+  assert.match(out.text, /整合完成：合并 0，冲突失效 0/u, `不同 field 不是同一个槽位，不得互相失效：${out.text}`)
+  assert.equal(allRows(harness).filter((row) => row.status === 'active').length, 2, '两条都必须保持 active')
+})
+
+test('host#162 变异测试补盲：冲突槽位要求 value 存在（C6）', async (t) => {
+  const harness = makeHarness({ config: { consolidateEnabled: false }, noReport: true })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 同 subject、同 field，但**两条都没有 value**：没有值就无所谓「值不同」，不该判冲突
+  const older = await harness.memory().write({
+    kind: 'semantic', subject: 'slot.novalue', field: 'mode',
+    text: '较旧的槽位条目丙：构建产物输出目录约定', origin: 'observed',
+  })
+  const newer = await harness.memory().write({
+    kind: 'semantic', subject: 'slot.novalue', field: 'mode',
+    text: '较新的槽位条目丁：数据库迁移工具选型', origin: 'observed',
+  })
+  assert.equal(older.ok, true, `前提：第一条写入成功（${String(older.error)}）`)
+  assert.equal(newer.ok, true, `前提：第二条写入成功（${String(newer.error)}）`)
+  assert.equal(allRows(harness).every((row) => row.value === null), true, '前提：两条的 value 都是 null')
+  const now = Date.now()
+  allRows(harness).find((row) => row.id === older.id)!.observedAt = now - 60_000
+  allRows(harness).find((row) => row.id === newer.id)!.observedAt = now
+
+  const out = await harness.runCommand('consolidate')
+  assert.match(out.text, /整合完成：合并 0，冲突失效 0/u, `没有 value 的条目不参与冲突判定：${out.text}`)
+  assert.equal(allRows(harness).filter((row) => row.status === 'active').length, 2, '两条都必须保持 active')
+})

@@ -40,6 +40,11 @@ jobs:
       - name: Test (includes README zh/en consistency)
         run: pnpm test
 
+      # 变异体检（抽样 8 条，约 20 秒）：在临时副本里把实现改坏，看测试是否察觉。
+      # 退出码 0 = 全部被杀死；1 = 有存活（盲区，需要补用例或在测试里登记原因）；2 = 环境问题。
+      - name: Mutation check (sampled)
+        run: pnpm mutate:ci
+
       - name: READMEs stay in sync (explicit, so the failure is named)
         run: pnpm check:readmes
 

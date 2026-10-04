@@ -3,6 +3,48 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.25 — 2026-10-04
+
+Coverage for the two areas that had none to speak of, an on-ramp document, and the mutation check moved into CI.
+No production code changed.
+
+### Added
+
+- **A delivery overview** (`docs/delivery.md`, Chinese) for whoever picks this up next: what it is, capability list
+  with the version each landed in, a one-page architecture sketch, the `ctx.memory` protocol summary including what
+  v1.1/1.2/1.3 each added, what each of the six gates checks and what its exit code means, the quality evidence
+  (test counts, three mutation rounds, the three critical audit findings as they were found), an honest known-
+  limitations list, and the release history. Both READMEs link to it.
+- **The mutation check now runs in CI** (`pnpm mutate:ci`, a sampled 8 mutations, about 20 seconds). Exit code 0 means
+  every sampled break was caught; 1 means one survived and the suite has a blind spot; 2 means the environment failed.
+- **Client-half coverage went from 3 cases to 16.** The settings form model had thirty fields, two dictionaries, a
+  draft parser and a write-back path behind three tests. 27 breaks were tried; 24 survived; all 24 are killed now,
+  including loose truthiness in the boolean `format`, a swapped checkbox write-back, an extra enum option, a renamed
+  dictionary key, an unsorted field list, a dropped projection field, a missing `dispose`, and a hint key that was
+  never capitalised.
+- **`memory_explain` and the `tags`/`field`/`value` semantics are pinned end to end.** 52 breaks tried, 27 survived,
+  all 27 killed by 13 new cases: the diagnostic blocks (`matching` window and per-candidate scores, `skipped`
+  categories and counts, `portrait`/`branch` shapes), `apply: true` landing the same fields and the same flags as
+  `memory_write`, the sensitive/echo/quota/dedupe gates, `trustToolWrites`, and the three fields' behaviour on
+  ingest, scoring, tag filtering, merge grouping, conflict slots, import and list/tool output.
+
+### Clarified, not changed
+
+- The two tool paths do not disagree about *whether* references are attached — `memory_explain --apply` attaches a
+  live turn range while `memory_write` attaches a single point, and the `via` label reflects that (`'live'` vs
+  `'tool'`). A reviewer flagged this as an inconsistency; the code and a direct probe both say references follow the
+  same rules on both paths, so the difference is in the label's meaning, which is now stated rather than changed.
+- A diagnostic shows `facet: 'work'` for `agent_self` candidates while the stored row omits the field; `facetOf()`
+  treats a missing facet as `'work'`, so the effective value is identical.
+
+### Notes
+
+- The delivery document was written against the repository rather than against the summary I handed over: it
+  recomputed the mutation totals from the changelog (313 breaks, 170 killed by existing tests, 139 survivors) and
+  used the measured 12.6-second figure instead of the rounded one it was given. Discrepancies are noted in the
+  document rather than smoothed over.
+- Suite: **498 → 524** at the time of writing (lib 243, host 172, tools 37, protocol 39, docs 15, client 16, module 2).
+
 ## 0.5.24 — 2026-10-04
 
 Four tracks at once: the mutation testing that found the last two rounds' blind spots became a standing tool, the
