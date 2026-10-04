@@ -220,12 +220,13 @@ test('protocol#2 每个方法的签名与返回结构（§3）', async (t) => {
   assert.ok(Array.isArray(service.list()), 'list() 返回数组')
   assert.equal(service.list().length, 0)
 
-  // stats()：v1.2 起是四个字段（v1.1 的三个 + writes）—— 断言随契约【新增】，既有三个一字不改。
+  // stats()：v1.2 起是四个字段（v1.1 的三个 + writes）。v1.3 §2 再追加 `embedder`，因此本清单同步为
+  // 五个键（见本节末尾「既有断言同步」说明）—— 既有四个字段的名字与语义仍一字不改。
   const stats0 = service.stats()
   assert.deepEqual(
     Object.keys(stats0).sort(),
-    ['opened', 'records', 'version', 'writes'],
-    'protocol v1.2 §2：stats() 在三个既有字段之上追加 writes（本用例的 v1.1 部分已由 #19 钉住旧字段）',
+    ['embedder', 'opened', 'records', 'version', 'writes'],
+    'protocol v1.3 §2：stats() 在既有四个字段之上追加 embedder（既有字段本身由 #19/#23 钉住）',
   )
   assert.deepEqual(stats0.writes, { persisted: 0, unpersisted: 0 }, '空库、零写入时两个计数都必须是 0（不是缺键）')
   assert.equal(stats0.records, 0)
@@ -737,13 +738,14 @@ async function buildV11Library(harness: V11Harness): Promise<V11Library> {
 
 // ---------------------------------------------------------------- 12. §1 协议版本
 
-test('protocol#12 服务面 protocolVersion === \'1.2\'（契约 §1；调用方按 1.x 判断）', async (t) => {
+test('protocol#12 服务面 protocolVersion === \'1.3\'（契约 §1；调用方按 1.x 判断）', async (t) => {
   const harness = makeV11Harness({ config: { consolidateEnabled: false } })
   t.after(() => harness.dispose())
   await harness.settle()
 
   const version = harness.service().protocolVersion
-  assert.equal(version, '1.2', "v1 之内只做加法 ⇒ 1.0 → 1.1 → 1.2（docs/protocol-v1.2-changes.md 开头；契约 §1）")
+  // v1.3 把字面量从 '1.2' 推到 '1.3'（契约 docs/embedder.md 抬头；docs/protocol-v1.md §11 亦如此声明）。
+  assert.equal(version, '1.3', "v1 之内只做加法 ⇒ 1.0 → 1.1 → 1.2 → 1.3（docs/protocol-v1.md §11）")
   assert.match(String(version), /^1\.[0-9]+$/u, "protocolVersion 必须形如 '1.x'，第三方据此判断可用面")
 })
 
@@ -1294,7 +1296,8 @@ test('protocol#23 stats().writes：落盘成功 +1 / ok:true 未落盘 +1；拒�
   const service = v12(open)
 
   const stats0 = service.stats()
-  assert.deepEqual(Object.keys(stats0).sort(), ['opened', 'records', 'version', 'writes'], '§2：在三个既有字段之上追加 writes')
+  // v1.3 §2 追加 `embedder` ⇒ 清单同步为五个键（见本节末尾「既有断言同步」说明）；既有四个仍一字不改。
+  assert.deepEqual(Object.keys(stats0).sort(), ['embedder', 'opened', 'records', 'version', 'writes'], '§2：在既有四个字段之上追加 embedder')
   assert.deepEqual(stats0.writes, { persisted: 0, unpersisted: 0 }, '零写入 ⇒ 两个计数都是 0（缺键不算通过）')
 
   await service.write({ kind: 'semantic', origin: 'observed', subject: 'v12.writes', text: V11_TEXT.mergedLead })
@@ -1386,4 +1389,588 @@ test('protocol#24 write 两条成功路径带 refs（无引用为 []）；拒绝
     assert.equal(result.ok, false, `前置条件：${label} 必须走拒绝路径`)
     assert.ok(!('refs' in result), `拒绝路径不得出现 refs 键：${label} → ${JSON.stringify(result)}`)
   }
+})
+
+// ================================================================ v1.3：契约 docs/embedder.md §2/§3/§6
+//
+// M18 的**宿主半边**：宿主通过服务面注入 `embed` 函数，插件**不自带模型、不联网**
+// （§0.1 —— 是否把记忆正文送去外部服务是宿主/用户的决定），没注入就回落词面检索（§0.2）。
+//
+// 本节同样**纯追加**。上面 24 项里只有两处随契约同步（理由逐条写在报告里，不静默改）：
+//   · #2 / #23 的 `stats()` 键清单 —— v1.3 §2 明写要追加 `embedder`；
+//   · #12 的 `protocolVersion` —— v1.3 明写要升到 `'1.3'`（`docs/protocol-v1.md` §11 同时承认该字面量）。
+// 三条纪律与上面两节相同：
+//   ① 没注册 embedder 时缺省面仍与 0.5.19 逐字节相同 —— #25/#29 各自**只跑词面**，并在末尾断言零嵌入调用；
+//   ② 语义只影响**显式** `mode`；`embedderRecallMode` 默认 `'off'`（#31 钉死注入路径不动）；
+//   ③ 失败绝不冒泡、绝不假装（§0.4/§0.5）—— 回落必须**真的**是词面结果，且诊断如实标注原因。
+//
+// 与 host.test.ts 的分工不变：那边跑功能用例，这里只钉**协议文档承诺的形状与语义**。
+
+/** v1.3 的三种检索模式（契约 §3）。 */
+type V13Mode = 'lexical' | 'semantic' | 'hybrid'
+
+/** `lastRecall()` 的形状（契约 §3，签名冻结）。 */
+interface V13RecallDiag {
+  mode: V13Mode
+  used: boolean
+  fallback: 'no-embedder' | 'embed-error' | 'timeout' | null
+  candidates: number
+  vectors: number
+}
+
+/** `stats().embedder` 的形状（契约 §2）。 */
+interface V13EmbedderStats {
+  id: string | null
+  dimensions: number | null
+  calls: number
+  errors: number
+  hits: number
+  misses: number
+  timeouts: number
+}
+
+/** 服务面 v1.3：v1.2 的成员之上追加 setEmbedder / capabilities / lastRecall，`recall` 接受 `mode`。 */
+interface V13Service {
+  protocolVersion?: unknown
+  list(options?: Json): Json[]
+  /** §2：既有四个字段之上追加 `embedder`（未注册时 id/dimensions 为 null、六个计数为 0）。 */
+  stats(): { records: number; version: number; opened: boolean; writes: { persisted: number; unpersisted: number } } & { embedder: V13EmbedderStats }
+  capabilities(): { protocolVersion: string; lexical: true; embedder: boolean; embedderId: string | null }
+  /** §2：非法入参返回 `{ ok: false, error: 'rejected_invalid: …' }`，且**不改变**当前注册状态。 */
+  setEmbedder(embedder: unknown): { ok: true; id: string | null } | { ok: false; error: string }
+  lastRecall(): V13RecallDiag | null
+  /** §3：`'semantic'` / `'hybrid'` 需要嵌入 ⇒ 异步；词面模式仍是同步数组。 */
+  recall(options?: Json): Array<{ record: Json; match: number; score: number }> | Promise<Array<{ record: Json; match: number; score: number }>>
+  write(input: Json): Promise<Json>
+  consolidate(reason?: string): Promise<void>
+}
+
+/** v1.3 的计数对：`calls` = 真的调了 embed 的次数，`hits`/`misses` = 向量缓存命中/未命中（§2）。 */
+interface V13Counts {
+  calls: number
+  errors: number
+  hits: number
+  misses: number
+  timeouts: number
+}
+
+/** `embed` 收到过的每一批文本（按调用顺序），用于「零嵌入调用」与「每次调用送了什么」两类断言。 */
+interface V13Recorder {
+  /** 每次调用当作一批记下来（批量算一次 `calls`，所以用二维数组而不是拍平）。 */
+  batches: string[][]
+  /** 拍平后的全部文本（只看「送没送、送了几段」时够用）。 */
+  sent: string[]
+  /** 调用次数（＝ batches.length）。 */
+  calls(): number
+}
+
+/**
+ * 确定性假 embedder（契约 §6）：**不联网、不加载模型**，只把文本摊成固定维度的有限数向量。
+ * 同一个字符串永远得到同一个向量（因此缓存命中是可复现的，`hits`/`misses` 才有确定性）。
+ */
+function makeV13Embedder(options: {
+  id: string
+  dimensions?: unknown
+  /** 覆盖 embed 主体，用来注入抛错 / 形状错 / 维度错 / 挂起不返回。 */
+  embed?: (texts: readonly string[], recorder: V13Recorder) => unknown
+}): { embedder: Json; recorder: V13Recorder } {
+  const batches: string[][] = []
+  const recorder: V13Recorder = {
+    batches,
+    sent: batches.flat(),
+    calls: (): number => batches.length,
+  }
+  const deterministicVector = (text: string): number[] => [
+    text.length,
+    [...text].reduce((sum, char) => sum + char.codePointAt(0)!, 0),
+    1,
+  ]
+  const embed = (texts: readonly string[]): unknown => {
+    batches.push([...texts])
+    recorder.sent = batches.flat()
+    return options.embed === undefined ? texts.map(deterministicVector) : options.embed(texts, recorder)
+  }
+  const embedder: Json = options.dimensions === undefined
+    ? { id: options.id, embed }
+    : { id: options.id, dimensions: options.dimensions, embed }
+  return { embedder, recorder }
+}
+
+/** v1.3 服务面视图：`makeV11Harness` 造出来的仍然是同一个服务对象，只是形状更宽。 */
+const v13 = (harness: V11Harness): V13Service => harness.service() as unknown as V13Service
+
+/** 复刻 `capabilities()` 的语义（只用到语义检索的套件用它做对照，省掉一个假 embedder）。 */
+const semanticOnlyService = (service: V13Service): V13Service =>
+  new Proxy(service, {
+    get: (target, key) => (key === 'capabilities'
+      ? () => ({ protocolVersion: String(target.protocolVersion), lexical: true as const, embedder: false, embedderId: null })
+      : (target as unknown as Record<string | symbol, unknown>)[key]),
+  }) as unknown as V13Service
+
+/** 嵌入计数器快照（`stats().embedder` 去掉 id/dimensions，只留六个计数）。 */
+const countsOf = (service: V13Service): V13Counts => {
+  const { calls, errors, hits, misses, timeouts } = service.stats().embedder
+  return { calls, errors, hits, misses, timeouts }
+}
+
+/** 词面召回永远是同步数组：这里同时断言「没退化成 Promise」——那是 §0.2 的一部分。 */
+const lexicalHits = (service: V13Service, options?: Json): Array<{ record: Json }> => {
+  const value = service.recall({ limit: 50, ...options })
+  assert.equal(typeof (value as Promise<unknown>).then, 'undefined', '词面召回必须是同步数组（0.5.19 的返回类型不变）')
+  return value as Array<{ record: Json }>
+}
+
+/** 一份可复现的语义探针库：两条正文**词面上毫不相干**，所以语义排序不是词面排序的巧合。 */
+const V13_TEXT = {
+  pnpm: '构建流程统一使用 pnpm 作为包管理器。',
+  unrelated: '雨天出门记得带一把折叠伞。',
+  /** 查询与第二条同文 ⇒ 词面必然命中它，而假 embedder 对「完全相同文本」给完全相同的向量。 */
+  hit: '构建流程统一使用 pnpm 作为包管理器。',
+} as const
+
+// ---------------------------------------------------------------- 25. §0.2 零嵌入调用
+
+test('protocol#25 没注册 embedder：lexical/缺省召回与 0.5.19 等价，且**零嵌入调用**（§0.2/§3）', async (t) => {
+  const harness = makeV11Harness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = v13(harness)
+
+  await service.write({ kind: 'semantic', origin: 'observed', subject: 'v13.baseline', text: V13_TEXT.pnpm })
+  await service.write({ kind: 'semantic', origin: 'observed', subject: 'v13.unrelated', text: V13_TEXT.unrelated })
+  assert.equal(service.stats().records, 2, '前置条件：库里有两条可召回的记录')
+
+  // 先拿「既有行为」的对照，再逐条敲新写法 —— 对照不是快照，而是同一次运行的词面结果。
+  const baseline = lexicalHits(service, { query: 'pnpm' })
+  const baselineIds = hitIds(baseline)
+  assert.ok(baselineIds.length > 0, `前置条件：词面召回必须命中（否则本用例是空的）：${JSON.stringify(baselineIds)}`)
+
+  for (const [label, options] of [
+    ['缺省（不传 mode）', { query: 'pnpm' }],
+    ["mode: 'lexical'", { query: 'pnpm', mode: 'lexical' }],
+    ["mode: 'query'（既有词面口径）", { query: 'pnpm', mode: 'query' }],
+    ['mode: 未知值', { query: 'pnpm', mode: 'semantic-ish' }],
+    ['mode: 非字符串', { query: 'pnpm', mode: 42 }],
+  ] as Array<[string, Json]>) {
+    const hits = lexicalHits(service, options)
+    assert.deepEqual(hitIds(hits), baselineIds, `${label} 必须与既有词面召回同结果同序（0.5.19 逐字节行为）`)
+    assert.equal(typeof service.lastRecall()?.used, 'boolean', `${label} 必须给出 lastRecall 诊断（可观测，不是静默）`)
+  }
+
+  // `'memory'` 是**既有**的词面口径（长查询按记忆侧覆盖率、minMatch 0.4），实现必须原样保留它、
+  // 不能把它当成 v1.3 的模式键：短查询下它的门槛比默认严，因此照旧可能给空结果。
+  const memoryMode = lexicalHits(service, { query: 'pnpm', mode: 'memory' })
+  assert.deepEqual(memoryMode, [], "mode:'memory' 是既有词面口径 ⇒ 短查询下按覆盖率门槛给空结果（不是回落到缺省口径）")
+  assert.notDeepEqual(hitIds(memoryMode), baselineIds, "对照：mode:'memory' 不得被当成 v1.3 的模式键而回落成缺省词面")
+
+  // 硬约束：以上路径**一次 embed 都不该发生** —— 未注册时干脆没有 embedder 可调，
+  // 但这条断言在本用例里还承担「未来的实现别把词面路径接上嵌入器」的盯防作用。
+  assert.deepEqual(countsOf(service), { calls: 0, errors: 0, hits: 0, misses: 0, timeouts: 0 }, '词面路径必须零嵌入调用（§0.2）')
+  assert.equal(service.lastRecall()?.mode, 'lexical', "缺省模式就是 'lexical'（§3）")
+  assert.equal(service.lastRecall()?.fallback, null, '词面是主路径，不是回落 ⇒ fallback 为 null')
+  assert.equal(service.lastRecall()?.used, false, '词面排序没有用到嵌入 ⇒ used:false（绝不假装）')
+  assert.equal(service.stats().embedder.id, null, '未注册 ⇒ id 为 null')
+  assert.equal(service.stats().embedder.dimensions, null, '未注册 ⇒ dimensions 为 null')
+})
+
+// ---------------------------------------------------------------- 26. §0.1 未注册时绝不外发
+
+test("protocol#26 未注册时 recall({mode:'semantic'}) 回落词面，并如实标记 fallback:'no-embedder'（§0.5）", async (t) => {
+  const harness = makeV11Harness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = v13(harness)
+
+  await service.write({ kind: 'semantic', origin: 'observed', subject: 'v13.fallback', text: V13_TEXT.pnpm })
+  await service.write({ kind: 'semantic', origin: 'observed', subject: 'v13.fallback.2', text: V13_TEXT.unrelated })
+
+  const lexical = lexicalHits(service, { query: 'pnpm' })
+  const semantic = await (service.recall({ query: 'pnpm', mode: 'semantic', limit: 50 }) as Promise<Array<{ record: Json; match: number; score: number }>>)
+  assert.ok(Array.isArray(semantic), 'semantic 模式返回数组（异步，但形状不变）')
+  // 回落必须**真的**是词面结果：同集合、同顺序、同分数 —— 不是「看起来像召回结果」就算数。
+  assert.deepEqual(hitIds(semantic), hitIds(lexical), '未注册 ⇒ 语义结果必须与词面结果逐条同序（回落是真的）')
+  for (let index = 0; index < lexical.length; index += 1) {
+    const semanticHit = semantic.find((hit) => hit.record.id === lexical[index]!.record.id)!
+    // 分数含时间衰减，两次召回的时刻不同 ⇒ 末几位必然有浮点差；用容差比，既保住「不是 0/NaN」的本意，
+    // 又不会因为毫秒级时刻差而假红。`match` 是覆盖率，不带时间项，可以精确比。
+    assert.ok(
+      Math.abs(semanticHit.score - (lexical[index] as unknown as { score: number }).score) < 1e-9,
+      `回落时分数也必须是词面分（含同样的时间衰减量级），不是 0/NaN：${semanticHit.score} vs ${(lexical[index] as unknown as { score: number }).score}`,
+    )
+    assert.equal(semanticHit.match, (lexical[index] as unknown as { match: number }).match, '回落时 match 也保持不变')
+  }
+
+  const diag = service.lastRecall()
+  assert.ok(diag, 'lastRecall() 必须非 null（本次召回刚发生过）')
+  assert.equal(diag.mode, 'semantic', '诊断必须记下调用方**请求**的模式，而不是回落后的模式')
+  assert.equal(diag.used, false, '没用到嵌入 ⇒ used:false')
+  assert.equal(diag.fallback, 'no-embedder', "§0.5 冻结的字面量：fallback === 'no-embedder'")
+  assert.equal(diag.vectors, 0, '没拿到任何向量 ⇒ vectors:0')
+
+  // §0.1 的隐私面：未注册时既没有可调用的 embed，也就没有任何正文被送出去。
+  assert.deepEqual(countsOf(service), { calls: 0, errors: 0, hits: 0, misses: 0, timeouts: 0 }, '未注册 ⇒ 零嵌入调用（插件绝不自己联网/调模型）')
+
+  // hybrid 同一条纪律：回落 + 如实标记（不是「hybrid 就默认当词面用」）。
+  await (service.recall({ query: 'pnpm', mode: 'hybrid', limit: 50 }) as Promise<unknown>)
+  assert.equal(service.lastRecall()?.mode, 'hybrid', 'hybrid 的诊断也要如实记下模式')
+  assert.equal(service.lastRecall()?.fallback, 'no-embedder', "hybrid 未注册时同样标 'no-embedder'")
+  assert.deepEqual(countsOf(service), { calls: 0, errors: 0, hits: 0, misses: 0, timeouts: 0 }, 'hybrid 回落同样零嵌入调用')
+
+  // 对照：`setEmbedder(null)` 是**幂等**的清除 —— 没注册过也能清，且不改变「未注册」这件事。
+  assert.deepEqual(service.setEmbedder(null), { ok: true, id: null }, '清除不是失败：传 null 恒为 ok:true')
+  assert.deepEqual(service.capabilities(), { protocolVersion: '1.3', lexical: true, embedder: false, embedderId: null }, '清除后仍是未注册')
+})
+
+// ---------------------------------------------------------------- 27. §2 能力探测
+
+test('protocol#27 capabilities() 形状冻结：lexical 恒 true、未注入时 embedder===false / embedderId===null（§2）', async (t) => {
+  const harness = makeV11Harness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = v13(harness)
+
+  const fresh = service.capabilities()
+  assert.deepEqual(
+    Object.keys(fresh).sort(),
+    ['embedder', 'embedderId', 'lexical', 'protocolVersion'],
+    '§2 冻结的四个键，一个不多一个不少（调用方据此决定用不用语义，不要靠猜）',
+  )
+  assert.equal(fresh.protocolVersion, '1.3', 'capabilities 里的版本必须与服务面字段同源')
+  assert.equal(service.protocolVersion, '1.3', "v1 内只做加法 ⇒ 1.0 → 1.1 → 1.2 → 1.3（docs/protocol-v1.md §11）")
+  assert.deepEqual(
+    service.capabilities(),
+    { protocolVersion: '1.3', lexical: true, embedder: false, embedderId: null },
+    '未注入时的完整形状（§6：未注入时 embedder === false）',
+  )
+  assert.equal(fresh.lexical, true, '词面检索永远可用 ⇒ lexical 恒为 true（不是布尔值的字符串）')
+  assert.equal(fresh.embedder, false, '未注入 ⇒ 明确的 false（不是 undefined / 缺键）')
+  assert.equal(fresh.embedderId, null, '未注入 ⇒ 明确的 null')
+
+  // 卸载后仍成立：能力探测读的是**当前**注册，不是启动时的快照。
+  const { embedder } = makeV13Embedder({ id: 'probe-only' })
+  assert.deepEqual(service.setEmbedder(embedder), { ok: true, id: 'probe-only' })
+  assert.deepEqual(service.capabilities(), { protocolVersion: '1.3', lexical: true, embedder: true, embedderId: 'probe-only' })
+  assert.equal(service.stats().embedder.id, 'probe-only', 'stats 与 capabilities 必须同源')
+  service.setEmbedder(null)
+  assert.deepEqual(service.capabilities(), { protocolVersion: '1.3', lexical: true, embedder: false, embedderId: null }, '清除后回到未注入形状')
+})
+
+// ---------------------------------------------------------------- 28. §2 setEmbedder 校验
+
+test('protocol#28 setEmbedder 拒绝路径返回 rejected_invalid，且**不改变**当前注册状态（§2）', async (t) => {
+  const harness = makeV11Harness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = v13(harness)
+
+  const noop = (): readonly number[][] => [[1, 2, 3]]
+  /** 非法入参表：每一条都必须被拒 —— 形状用 `unknown` 传，因为服务面本来就接受任意输入。 */
+  const invalid: Array<[string, unknown]> = [
+    ['undefined', undefined],
+    ['null 之外的假值', 0],
+    ['字符串', 'local-minilm'],
+    ['数组（对象但不是 embedder）', [{ id: 'x', embed: noop }]],
+    ['缺 id', { embed: noop }],
+    ['id 非字符串', { id: 42, embed: noop }],
+    ['id 空串', { id: '', embed: noop }],
+    ['id 全空白', { id: '   ', embed: noop }],
+    ['缺 embed', { id: 'x' }],
+    ['embed 非函数', { id: 'x', embed: 'not-a-function' }],
+    ['embed 是异步函数形状但传了非函数', { id: 'x', embed: { call: noop } }],
+    ['dimensions: 0', { id: 'x', embed: noop, dimensions: 0 }],
+    ['dimensions 负数', { id: 'x', embed: noop, dimensions: -3 }],
+    ['dimensions 非整数', { id: 'x', embed: noop, dimensions: 3.5 }],
+    ['dimensions NaN', { id: 'x', embed: noop, dimensions: Number.NaN }],
+    ['dimensions Infinity', { id: 'x', embed: noop, dimensions: Number.POSITIVE_INFINITY }],
+    ['dimensions 非数', { id: 'x', embed: noop, dimensions: '384' }],
+  ]
+
+  // a) 未注册状态下逐条拒绝：拒绝之后必须**仍然**是未注册（不能半途改状态）。
+  for (const [label, value] of invalid) {
+    const result = service.setEmbedder(value)
+    assert.equal(result.ok, false, `非法入参必须被拒：${label}`)
+    assert.match(String(result.error), /^rejected_invalid: /u, `错误形状必须是「错误码: 说明」：${label} → ${String(result.error)}`)
+    assert.deepEqual(service.capabilities(), { protocolVersion: '1.3', lexical: true, embedder: false, embedderId: null }, `被拒之后仍必须是未注册：${label}`)
+    assert.equal(service.stats().embedder.id, null, `被拒不得留下痕迹（stats.embedder.id）：${label}`)
+  }
+
+  // b) 已注册状态下逐条拒绝：必须**保住**原来那个嵌入器（这是「不改变当前注册状态」的硬含义）。
+  const { embedder } = makeV13Embedder({ id: 'kept-embedder', dimensions: 3 })
+  assert.deepEqual(service.setEmbedder(embedder), { ok: true, id: 'kept-embedder' })
+  for (const [label, value] of invalid) {
+    const result = service.setEmbedder(value)
+    assert.equal(result.ok, false, `已注册时非法入参同样必须被拒：${label}`)
+    assert.deepEqual(
+      service.capabilities(),
+      { protocolVersion: '1.3', lexical: true, embedder: true, embedderId: 'kept-embedder' },
+      `被拒之后必须保住原来那个嵌入器：${label}`,
+    )
+    assert.equal(service.stats().embedder.id, 'kept-embedder', `stats 也不得被半途改写：${label}`)
+    assert.equal(service.stats().embedder.dimensions, 3, `已注册的 dimensions 也不得被改写：${label}`)
+  }
+
+  // c) 合法入参必须被接受（否则上面那些「被拒」可能只是因为什么都注册不上）。
+  const okResult = service.setEmbedder({ id: 'accepted', embed: noop })
+  assert.deepEqual(okResult, { ok: true, id: 'accepted' }, '合法 embedder（无 dimensions）必须注册成功')
+  assert.equal(service.capabilities().embedder, true, '注册成功后 capabilities().embedder 必须为 true')
+  // dimensions 明确传 null 视作「未给」（§2 只规定「若给」，null 不是「给了个非法的数」）。
+  assert.deepEqual(service.setEmbedder({ id: 'accepted-null-dim', embed: noop, dimensions: null }), { ok: true, id: 'accepted-null-dim' }, 'dimensions:null ＝ 未给')
+  assert.equal(service.stats().embedder.dimensions, null, 'dimensions:null 注册后 stats 里是 null（不是 NaN/0）')
+  // 替换：注册新 id 必须覆盖旧的，返回值如实给出新 id。
+  assert.deepEqual(service.setEmbedder({ id: 'replaced', embed: noop, dimensions: 4 }), { ok: true, id: 'replaced' }, '允许替换')
+  assert.deepEqual(service.capabilities().embedderId, 'replaced', '替换后 capabilities 读到的必须是新的')
+
+  // d) 拒绝是**纯函数式**的：敲完全部非法入参，计数器与注册状态都不许动。
+  assert.equal(service.stats().embedder.calls, 0, '注册/拒绝都不调用 embed ⇒ calls 必须还是 0')
+})
+
+// ---------------------------------------------------------------- 29. §2/§3 注册后生效 + 计数方向
+
+test("protocol#29 注册后 semantic 生效、lexical 零调用；stats().embedder 的 calls/hits/misses 变化方向正确（§2/§3）", async (t) => {
+  const harness = makeV11Harness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = v13(harness)
+  const { embedder, recorder } = makeV13Embedder({ id: 'local-probe', dimensions: 3 })
+  assert.deepEqual(service.setEmbedder(embedder), { ok: true, id: 'local-probe' }, '前置条件：注册假 embedder')
+
+  // 能力探测先于一切调用：注册只说明「已注册」，这一刻还一次都没调过（`calls` 仍是 0）。
+  assert.deepEqual(service.capabilities(), { protocolVersion: '1.3', lexical: true, embedder: true, embedderId: 'local-probe' }, '§6：注册后 capabilities().embedder === true')
+  assert.deepEqual(countsOf(service), { calls: 0, errors: 0, hits: 0, misses: 0, timeouts: 0 }, '注册本身不调用 embed')
+
+  const first = await service.write({ kind: 'semantic', origin: 'observed', subject: 'v13.wanted', text: V13_TEXT.pnpm })
+  const second = await service.write({ kind: 'semantic', origin: 'observed', subject: 'v13.unrelated', text: V13_TEXT.unrelated })
+  assert.equal(first.status, 'created')
+  assert.equal(second.status, 'created')
+
+  // ---- 词面：注册之后也**零嵌入调用**（注册不该改变既有路径的代价） ----
+  const lexical = lexicalHits(service, { query: 'pnpm' })
+  assert.ok(hitIds(lexical).includes(String(first.id)), '词面召回仍要能命中')
+  assert.deepEqual(countsOf(service), { calls: 0, errors: 0, hits: 0, misses: 0, timeouts: 0 }, "显式 mode:'lexical' 必须零嵌入调用（§3）")
+
+  // ---- 语义第一发：查询 + 2 条候选 = 一批 3 段 ⇒ calls +1，三段全部未命中 ⇒ misses +3 ----
+  const semantic = await (service.recall({ query: V13_TEXT.hit, mode: 'semantic', limit: 50 }) as Promise<Array<{ record: Json; match: number; score: number }>>)
+  const afterFirst = countsOf(service)
+  assert.equal(afterFirst.calls, 1, '一次召回只批量调一次 embed（批量算一次 calls），不是逐条调')
+  assert.equal(afterFirst.misses, 3, '查询 + 2 条候选全部首次见到 ⇒ misses +3')
+  assert.equal(afterFirst.hits, 0, '第一次没有缓存可命中 ⇒ hits 仍是 0')
+  assert.equal(afterFirst.errors, 0, '正常路径不得计错')
+  assert.deepEqual(recorder.batches[0], [V13_TEXT.hit, V13_TEXT.pnpm, V13_TEXT.unrelated], '送出去的是「查询 + 候选池」，顺序即候选池顺序')
+  assert.deepEqual(service.lastRecall(), { mode: 'semantic', used: true, fallback: null, candidates: 2, vectors: 2 }, '语义真的用上了：used:true、无回落、两个候选都拿到向量')
+
+  // 语义排序生效：与查询**同文**的那条必须排在毫不相干的那条前面（假 embedder 对同文给同向量）。
+  assert.equal(hitIds(semantic)[0], String(first.id), '与查询同文的记录必须排在语义第一位（排序真的用了向量）')
+  assert.deepEqual(hitIds(semantic).sort(), [String(first.id), String(second.id)].sort(), '语义模式仍返回同一候选池，只是换了排序')
+  assert.ok(semantic[0]!.score > semantic[1]!.score, '语义分必须真的拉开（不是两条同为 0）')
+  assert.notDeepEqual(
+    hitIds(semantic),
+    hitIds(lexical).filter((id) => id === String(first.id) || id === String(second.id)),
+    '对照：语义排序不是词面排序的复印件（否则「生效」无从谈起）',
+  )
+
+  // ---- 语义第二发（同一个查询）：查询与两条候选都进了缓存 ⇒ 一次 embed 都不再调 ----
+  const again = await (service.recall({ query: V13_TEXT.hit, mode: 'semantic', limit: 50 }) as Promise<Array<{ record: Json }>>)
+  const afterSecond = countsOf(service)
+  assert.equal(afterSecond.calls, afterFirst.calls, '全部命中缓存 ⇒ 第二次召回不得再调 embed（calls 不动）')
+  assert.equal(afterSecond.hits, 3, '三段都命中缓存 ⇒ hits +3')
+  assert.equal(afterSecond.misses, afterFirst.misses, '全命中 ⇒ misses 不再增长')
+  assert.deepEqual(service.lastRecall(), { mode: 'semantic', used: true, fallback: null, candidates: 2, vectors: 2 }, '缓存命中同样是「用上了嵌入」')
+  assert.deepEqual(hitIds(again), hitIds(semantic), '同一查询 + 同一库 ⇒ 缓存不改变结果')
+
+  // ---- 方向性总结：缓存只让 hits 涨、calls 停；全部为单调不减 ----
+  for (const key of ['calls', 'errors', 'hits', 'misses', 'timeouts'] as const) {
+    assert.ok(afterSecond[key] >= afterFirst[key], `计数只加不减：${key}`)
+  }
+  assert.ok(afterSecond.calls > 0 && afterSecond.misses > 0 && afterSecond.hits > 0, '三个计数都必须被真实地推动过（否则断言是空的）')
+
+  // ---- 清除后回到起点：语义请求再次回落词面并如实标记 ----
+  assert.deepEqual(service.setEmbedder(null), { ok: true, id: null })
+  const afterClear = countsOf(service)
+  const cleared = await (service.recall({ query: V13_TEXT.hit, mode: 'semantic', limit: 50 }) as Promise<Array<{ record: Json }>>)
+  assert.deepEqual(hitIds(cleared), hitIds(lexical), '清除后语义回落词面（集合）')
+  assert.equal(service.lastRecall()?.fallback, 'no-embedder', '清除后必须如实标 no-embedder')
+  assert.deepEqual(countsOf(service), afterClear, '未注册时一次 embed 都不该发生（回落不是「再试一次」）')
+})
+
+// ---------------------------------------------------------------- 30. §0.4 失败绝不冒泡
+
+test('protocol#30 embedder 抛错/形状错/维度错/超时：服务面不抛、计 errors、回落词面（§0.4）', async (t) => {
+  const harness = makeV11Harness({ config: { consolidateEnabled: false, embedderTimeoutMs: 40 } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = v13(harness)
+  const write = async (subject: string, text: string): Promise<string> =>
+    String((await service.write({ kind: 'semantic', origin: 'observed', subject, text })).id)
+  const wanted = await write('v13.fault.wanted', V13_TEXT.pnpm)
+  await write('v13.fault.other', V13_TEXT.unrelated)
+
+  const lexical = lexicalHits(service, { query: 'pnpm' })
+  const expectedIds = hitIds(lexical)
+
+  /** 每个假 embedder 都注册 → 跑一次语义 → 断言「不抛 + 计 errors + 回落词面 + 诊断如实」。 */
+  const faults: Array<[string, (texts: readonly string[]) => unknown, V13RecallDiag['fallback']]> = [
+    ['同步抛错', (_texts: readonly string[]) => { throw new Error('embedder exploded (fault injection)') }, 'embed-error'],
+    ['返回 reject', (_texts) => Promise.reject(new Error('embedder rejected (fault injection)')), 'embed-error'],
+    ['形状不对：非数组', () => 'not-an-array', 'embed-error'],
+    ['形状不对：长度与输入不符', () => [[1, 2, 3]], 'embed-error'],
+    ['形状不对：向量长度不等', (texts) => texts.map((_text, index) => (index === 0 ? [1, 2, 3] : [1, 2])), 'embed-error'],
+    ['形状不对：含 NaN', (texts) => texts.map(() => [1, Number.NaN, 3]), 'embed-error'],
+    ['形状不对：含非数', (texts) => texts.map(() => [1, '2', 3]), 'embed-error'],
+    ['维度与声明不一致', (texts) => texts.map(() => [1, 2]), 'embed-error'],
+    ['永不 settle（超时）', () => new Promise(() => {}), 'timeout'],
+  ]
+
+  for (const [label, embedOverride, expectedFallback] of faults) {
+    const { embedder } = makeV13Embedder({ id: `faulty-${encodeURIComponent(label)}`, dimensions: label === '维度与声明不一致' ? 3 : undefined, embed: (texts) => embedOverride(texts) })
+    assert.deepEqual(service.setEmbedder(embedder), { ok: true, id: `faulty-${encodeURIComponent(label)}` }, `前置条件：注册故障 embedder：${label}`)
+    const before = countsOf(service)
+
+    // 关键断言：**不抛**。任何 embedding 失败都不许冒泡到回合（§0.4）。
+    let hits: Array<{ record: Json }> = []
+    await assert.doesNotReject(
+      async () => { hits = (await (service.recall({ query: 'pnpm', mode: 'semantic', limit: 50 }) as Promise<Array<{ record: Json }>>)) },
+      `嵌入失败绝不允许抛给调用方：${label}`,
+    )
+
+    assert.deepEqual(hitIds(hits), expectedIds, `失败后必须回落词面（同集合同序）：${label}`)
+    const after = countsOf(service)
+    assert.equal(after.errors, before.errors + 1, `失败必须计一次 errors：${label}`)
+    assert.equal(after.calls, before.calls + 1, `失败的那次调用照样算 calls：${label}`)
+    assert.equal(after.hits, before.hits, `失败的批次不得写缓存 ⇒ hits 不动：${label}`)
+    const diag = service.lastRecall()
+    assert.equal(diag?.used, false, `失败时绝不假装用了语义（used 必须 false）：${label}`)
+    assert.equal(diag?.fallback, expectedFallback, `诊断必须如实给出回落原因：${label}`)
+    assert.equal(diag?.vectors, 0, `失败时一个向量都没用上：${label}`)
+    if (expectedFallback === 'timeout') {
+      assert.equal(after.timeouts, before.timeouts + 1, `超时必须计 timeouts（§3）：${label}`)
+    }
+    // §0.4 的另一半：失败也不能写坏记录 —— 库里那两条一字不动。
+    assert.equal(service.stats().records, 2, `嵌入失败不得增删记录：${label}`)
+    assert.ok(service.list().some((row) => String(row.id) === wanted), `嵌入失败不得丢记忆：${label}`)
+  }
+
+  // 失败之后仍然可以正常注册一个好 embedder 并真的用上语义（故障不是终态）。
+  const good = makeV13Embedder({ id: 'recovered', dimensions: 3 })
+  assert.deepEqual(service.setEmbedder(good.embedder), { ok: true, id: 'recovered' })
+  await (service.recall({ query: V13_TEXT.hit, mode: 'semantic', limit: 50 }) as Promise<unknown>)
+  assert.deepEqual(service.lastRecall(), { mode: 'semantic', used: true, fallback: null, candidates: 2, vectors: 2 }, '换掉故障 embedder 后必须立即恢复语义（不是永久降级）')
+})
+
+// ---------------------------------------------------------------- 31. §0.3 注入路径
+
+test("protocol#31 注入路径默认不用语义：embedderRecallMode 缺省 'off' ⇒ 两条注入通道逐字节不变（§0.3）", async (t) => {
+  const dir = makeBranchDir(V11_BRANCH)
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  // 刻意**不开** `embedderRecallMode`：这是 §0.3 的缺省，也是 0.5.19 的注入路径。
+  const harness = makeV11Harness({ config: { writePolicy: 'ask', consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  harness.emit('session/event', { id: 'session-v13', header: { cwd: dir } }, { type: 'session/start', seq: 1 })
+  await buildV11Library(harness)
+  const service = v13(harness)
+  const { embedder, recorder } = makeV13Embedder({ id: 'injected-but-off', dimensions: 3 })
+
+  const selfBefore = harness.selfBlock()
+  const contextBefore = harness.contextBlock(null)
+  assert.ok(contextBefore.includes(V11_TEXT.matchedProfile), `前置条件：召回块必须非空（否则断言是空的）：${contextBefore}`)
+
+  // 注册一个**可用**的 embedder，注入路径仍然必须一个字节都不变、一次 embed 都不调。
+  assert.deepEqual(service.setEmbedder(embedder), { ok: true, id: 'injected-but-off' }, '前置条件：注册可用 embedder')
+  assert.equal(service.capabilities().embedder, true, '前置条件：能力探测确实看到它')
+  assert.equal(harness.selfBlock(), selfBefore, '注册 embedder 不得改变常驻自画像块')
+  assert.equal(harness.contextBlock(null), contextBefore, '注册 embedder 不得改变按轮召回块')
+  assert.equal(recorder.calls(), 0, "embedderRecallMode 缺省 'off' ⇒ 注入路径一次 embed 都不调（§0.3）")
+
+  // 敲一圈服务面（含语义），注入路径仍不受影响。
+  for (const [label, probe] of [
+    ['list()', () => service.list()],
+    ['stats()', () => service.stats()],
+    ['capabilities()', () => service.capabilities()],
+    ["recall({mode:'lexical'})", () => lexicalHits(service, { query: 'pnpm', mode: 'lexical' })],
+    ["recall({mode:'semantic'})", () => service.recall({ query: 'pnpm', mode: 'semantic', limit: 50 })],
+    ["recall({mode:'hybrid'})", () => service.recall({ query: 'pnpm', mode: 'hybrid', limit: 50 })],
+  ] as Array<[string, () => unknown]>) {
+    await probe()
+    assert.equal(harness.selfBlock(), selfBefore, `敲过 ${label} 之后，常驻自画像块必须逐字节不变`)
+    assert.equal(harness.contextBlock(null), contextBefore, `敲过 ${label} 之后，按轮召回块必须逐字节不变`)
+  }
+
+  // 显式打开 `embedderRecallMode: 'recall'` 才允许混合打分 —— 对照组：那时嵌入确实被调用。
+  const onHarness = makeV11Harness({ config: { writePolicy: 'ask', consolidateEnabled: false, embedderRecallMode: 'recall' } })
+  t.after(() => onHarness.dispose())
+  await onHarness.settle()
+  onHarness.emit('session/event', { id: 'session-v13-on', header: { cwd: dir } }, { type: 'session/start', seq: 1 })
+  await buildV11Library(onHarness)
+  const onService = v13(onHarness)
+  const onRecorder = makeV13Embedder({ id: 'injected-and-on', dimensions: 3 })
+  assert.deepEqual(onService.setEmbedder(onRecorder.embedder), { ok: true, id: 'injected-and-on' })
+  assert.equal(harness.contextBlock(null), contextBefore, '对照：另一个 harness 的开关不影响本 harness 的注入路径')
+  // 显式打开后，按轮召回会异步重排 —— 只要求「不再与 off 时逐字节相同」这件事**可能**发生，
+  // 不在这里重复 host.test.ts 的混合打分回归（本套件只钉协议面）。
+  assert.equal(onService.capabilities().embedderId, 'injected-and-on', '对照组：开关打开且已注册')
+})
+
+// ---------------------------------------------------------------- 32. §6 文档一致性
+
+test('protocol#32 两份协议文档 §11 已加 v1.3 的加法，且 `## ` 小节数相等（§6）', () => {
+  const en = readFileSync(new URL('../docs/protocol-v1.md', import.meta.url), 'utf8')
+  const zh = readFileSync(new URL('../docs/protocol-v1.zh.md', import.meta.url), 'utf8')
+  const headingsOf = (text: string): string[] => text.split('\n').filter((line) => line.startsWith('## '))
+
+  const enSections = headingsOf(en)
+  const zhSections = headingsOf(zh)
+  assert.equal(zhSections.length, enSections.length, `中英两份文档必须逐节对齐（## 数量）：en=${enSections.length}，zh=${zhSections.length}`)
+  assert.ok(enSections.length >= 11, `§6 要求两份文档都补上 §11：实际 en=${enSections.length}，zh=${zhSections.length}`)
+
+  for (const doc of [en, zh]) {
+    assert.ok(doc.includes('## 11.'), '§6：两份协议文档都必须有 §11（v1.3 的加法）')
+    for (const method of ['setEmbedder', 'capabilities', 'lastRecall']) {
+      assert.ok(doc.includes(method), `§11 必须点名 v1.3 的新方法/字段：${method}`)
+    }
+    assert.ok(doc.includes('stats') && doc.includes('embedder'), '§11 必须写明 stats() 追加 embedder')
+    // 隐私说明（§0.1 + §6）：插件不联网、是否外发由宿主决定 —— 这句话必须写给用户看。
+    assert.ok(
+      /不联网|no network|never calls the network|not call the network/iu.test(doc),
+      '§6：两份文档都必须写下「插件不联网」这句隐私说明',
+    )
+    assert.ok(
+      /宿主|host/iu.test(doc),
+      '§6：隐私说明必须讲清「是否把正文送去外部服务由宿主/用户决定」',
+    )
+  }
+  // 文档是公开的：不得混进任何人的机器路径（与 #11 同一纪律，新增文档同样受约束）。
+  assert.doesNotMatch(en + zh, /\b[A-Za-z]:\\/u, '文档不得出现本机绝对路径')
+})
+
+// ---------------------------------------------------------------- 33. §0.2 缺省面零成本
+
+test('protocol#33 未注册 embedder：服务面缺省操作一次嵌入调用都不发生（§0.2 逐字节相同的代价面）', async (t) => {
+  const harness = makeV11Harness({ config: { writePolicy: 'ask', consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const semanticOnly = semanticOnlyService(v13(harness))
+  await buildV11Library(harness as unknown as V11Harness)
+
+  const stats0 = harness.service().stats()
+  const { embedder } = makeV13Embedder({ id: 'cost-probe', dimensions: 3 })
+
+  // 刻意**不注册**：整轮服务面操作下来，嵌入计数器必须一动不动。
+  const before = countsOf(semanticOnly)
+  await harness.service().consolidate('protocol-v1.3-probe')
+  semanticOnly.list()
+  semanticOnly.list({ status: 'active' })
+  semanticOnly.stats()
+  semanticOnly.capabilities()
+  assert.deepEqual(countsOf(semanticOnly), before, '未注册 ⇒ 一切服务面操作零嵌入调用')
+  assert.deepEqual(before, { calls: 0, errors: 0, hits: 0, misses: 0, timeouts: 0 }, '本进程里此前也一次都没调过')
+  assert.equal(semanticOnly.lastRecall(), null, '本进程从未召回 ⇒ lastRecall() 是 null（不是「假装有一次」）')
+
+  // 注册再清除：计数器**只加不减**（清除不清零，与 stats().writes 同性质）。
+  semanticOnly.setEmbedder(embedder)
+  await (semanticOnly.recall({ query: 'pnpm', mode: 'semantic', limit: 50 }) as Promise<unknown>)
+  const afterUse = countsOf(semanticOnly)
+  assert.ok(afterUse.calls > 0, '前置条件：注册并语义召回一次，计数器必须被推动')
+  semanticOnly.setEmbedder(null)
+  assert.deepEqual(countsOf(semanticOnly), afterUse, '清除 embedder 不得清零历史计数（只加不减）')
+  assert.equal(typeof stats0.version, 'number', '既有 stats 字段不受 v1.3 影响')
 })

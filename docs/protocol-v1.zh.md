@@ -21,23 +21,29 @@
 
 要下线的方法必须在整个 v1 里照常可用，并先在本文件里标为「已废弃」。
 
-本文写的是 **v1.2**。v1.1 是 v1.0 之上的**纯加法**：`list()` 多了可选的 `status` / `branch` / `limit`，`recall()`
+本文写的是 **v1.3**。v1.1 是 v1.0 之上的**纯加法**：`list()` 多了可选的 `status` / `branch` / `limit`，`recall()`
 多了两个可选过滤，`write()` 多了 `persisted` 字段，服务面的 `protocolVersion` 从 `'1.0'` 变成 `'1.1'`（§9）。
 v1.2 则是 v1.1 之上的**又一次纯加法**：`list()` / `recall()` 的 `branch` 接受**分支数组**，`stats()` 多了 `writes`
 计数，`write()` 的每个**成功**形状多了 `refs`，服务面的 `protocolVersion` 从 `'1.1'` 变成 `'1.2'`（§10）。
 `'1.0'` / `'1.1'` 调用方依赖过的东西一样没动 —— 所有无参调用的返回值与 0.5.18 逐字节相同（§3.1、§3.3）。
+v1.3 又是 v1.2 之上的**纯加法**：宿主可以通过服务面**注入嵌入器**（`setEmbedder`），`capabilities()` /
+`lastRecall()` 是新增的只读方法，`stats()` 多了 `embedder` 诊断，`recall()` 多了可选的 `mode`（§11）。服务面的
+`protocolVersion` 从 `'1.2'` 变成 `'1.3'`。`'1.0'` / `'1.1'` / `'1.2'` 调用方依赖过的东西一样没动 —— 没注册嵌入器时
+所有调用与 0.5.19 逐字节相同，缺省 `recall({ mode: 'lexical' })` **零**嵌入调用（§3.3、§11）。
 
-今天服务对象上**有** `protocolVersion`（`'1.2'`），调用方应当先读它再决定怎么用（未知版本给可读降级，不要崩）。
-判断兼容性请用 `'1.x'` 谓词（`/^1\./u`），**不要**比字符串相等：v1.1 已经这样要求，v1.2 继续照办 —— 谁写成
-`protocolVersion === '1.1'`，谁就会把自己锁在 `'1.2'` 门外；请只比前缀 / 主次版本。§9 与 §10 的最小示例都是这么写的。
+今天服务对象上**有** `protocolVersion`（`'1.3'`），调用方应当先读它再决定怎么用（未知版本给可读降级，不要崩）。
+判断兼容性请用 `'1.x'` 谓词（`/^1\./u`），**不要**比字符串相等：v1.1 已经这样要求，v1.2 照办，v1.3 继续照办 —— 谁写成
+`protocolVersion === '1.2'`，谁就会把自己锁在 `'1.3'` 门外；请只比前缀 / 主次版本。§9、§10 与 §11 的最小示例都是这么写的。
 
 ## 2. 服务定位方式与可选性
 
 服务在 `apply()` 里**恰好注册一次**：
 
 ```ts
-ctx.provide('memory', { protocolVersion, list, stats, recall, write, consolidate })
+ctx.provide('memory', { protocolVersion, list, stats, recall, write, consolidate, setEmbedder, capabilities, lastRecall })
 ```
+
+`setEmbedder` / `capabilities` / `lastRecall` 是 v1.3 的加法（§3.6、§11）；写着 `'1.2'` 的服务面根本没有它们。
 
 定位方式：
 
@@ -65,11 +71,11 @@ const memory = ctx.get('memory')
 
 ## 3. 方法：签名 / 入参 / 返回结构 / 错误形状
 
-服务对象的签名（实现体是内部的，语义以 §3.1–§3.5 为准）：
+服务对象的签名（实现体是内部的，语义以 §3.1–§3.6 为准）：
 
 ```ts
 interface MemoryService {
-  protocolVersion: string            // '1.2'
+  protocolVersion: string            // '1.3'
   list(options?: ListOptions): MemoryRecord[]
   stats(): {
     records: number
@@ -77,10 +83,43 @@ interface MemoryService {
     opened: boolean
     /** 新增：本进程内累计的写入落盘结果（v1.2）。 */
     writes: { persisted: number; unpersisted: number }
+    /** 新增（v1.3）：嵌入器运行状况；没注册 / 没用过时 id 为 null、计数全 0。 */
+    embedder: {
+      id: string | null
+      dimensions: number | null
+      /** 嵌入调用次数（批量算一次）。 */
+      calls: number
+      /** 失败的调用次数（抛出 / reject / 形状或维度不对 / 超时）。 */
+      errors: number
+      /** 向量缓存命中 / 未命中（未命中＝真的调了 embed）。 */
+      hits: number
+      misses: number
+      /** 因超时被放弃的次数（含在 errors 里）。 */
+      timeouts: number
+    }
   }
   recall(options: RecallOptions): Array<{ record: MemoryRecord; match: number; score: number }>
   write(input: WriteMemoryInput): Promise<WriteMemoryResult>
   consolidate(reason?: string): Promise<void>
+  /** 新增（v1.3）：注册 / 替换 / 清除宿主注入的嵌入器；传 `null` 清除。插件只调用它，绝不自己联网或带模型。 */
+  setEmbedder(embedder: Embedder | null): { ok: true; id: string | null } | { ok: false; error: string }
+  /** 新增（v1.3）：能力探测 —— 调用方据此决定用不用语义，不要靠猜。 */
+  capabilities(): {
+    protocolVersion: string
+    lexical: true
+    /** 是否已注册可用的嵌入器。 */
+    embedder: boolean
+    /** 已注册的 id（未注册为 null）。 */
+    embedderId: string | null
+  }
+  /** 新增（v1.3）：上一次 `recall()` 的诊断；一次都没调用过时为 `null`。 */
+  lastRecall(): {
+    mode: 'lexical' | 'semantic' | 'hybrid'
+    used: boolean
+    fallback: 'no-embedder' | 'embed-error' | 'timeout' | null
+    candidates: number
+    vectors: number
+  } | null
 }
 ```
 
@@ -121,8 +160,8 @@ list(options?: {
 ### 3.2 `stats()`
 
 - **入参**：无。
-- **返回**：`{ records: number; version: number; opened: boolean; writes: { persisted: number; unpersisted: number } }`
-  —— 即 v1.0 的三个键，加上 v1.2 的 `writes` 计数。
+- **返回**：`{ records: number; version: number; opened: boolean; writes: { persisted: number; unpersisted: number }; embedder: { … } }`
+  —— 即 v1.0 的三个键，加上 v1.2 的 `writes` 计数与 v1.3 的 `embedder` 块（§3.6、§11）。
 
 | 字段 | 含义 |
 |---|---|
@@ -130,12 +169,13 @@ list(options?: {
 | `version` | 库版本号：每次成功的 put/delete 都 +1，可用来判断「有没有变」。**不是**存储 schema 版本 |
 | `opened` | `ctx.storageDomain.open()` 是否成功。`false` 表示写入没有落到盘上（见 §8 缺口 3） |
 | `writes`（v1.2 新增） | 本进程内累计的写入落盘结果。`persisted`：`persist()` 返回真的次数（真的落盘）；`unpersisted`：`ok: true` 但没落盘的次数（域未打开 / `put` 抛错）。计数**只加不减**，进程内累计、重启归零（与 `version` 同性质）。拒绝路径（`ok: false`）**不计入**这两个数 —— 那根本不叫写入。它与内部既有的 `state.writes` 计数器**并列存在、不复用**（既有计数器语义不同）。 |
+| `embedder`（v1.3 新增） | 嵌入器运行状况：`id` / `dimensions`（未注册时为 `null`）、`calls`（批量算一次）、`errors`（抛出 / reject / 形状或维度不对 / 超时）、`hits` / `misses`（向量缓存；未命中＝真的调了 `embed`）、`timeouts`（同样计入 `errors`）。没注册嵌入器时所有计数恒为 `0`、`id` / `dimensions` 恒为 `null`，所以统计行与 0.5.19 完全一致。注册方式与语义见 §3.6、§11。 |
 
 - **错误形状**：无。
 
 ### 3.3 `recall(options)`
 
-- **入参**：`RecallOptions`；v1.1 新增两个可选键，签名逐字冻结为：
+- **入参**：`RecallOptions`；v1.1 新增两个可选键，v1.3 新增 `mode`，签名逐字冻结为：
 
 ```ts
 interface RecallOptions {
@@ -144,6 +184,8 @@ interface RecallOptions {
   status?: 'active' | 'pending' | 'invalid' | 'archived' | 'all'
   /** 分支过滤，语义与 `list` 的 `branch` 完全一致（v1.2 起同样接受数组；**空数组 ⇒ 空结果**）。缺省 = 不过滤（今天的行为）。 */
   branch?: 'current' | string | readonly string[] | null
+  /** 新增（v1.3）：排序通道。缺省 `'lexical'` ＝ 与 0.5.19 逐字节相同，且零嵌入调用。 */
+  mode?: 'lexical' | 'semantic' | 'hybrid'
 }
 ```
 
@@ -161,6 +203,7 @@ interface RecallOptions {
 | `includeArchived` | `boolean` | `false` | 同时纳入 `archived` 记录 |
 | `status` | `'active' \| 'pending' \| 'invalid' \| 'archived' \| 'all'` | 不给 = 今天的候选集合 | 允许返回哪些 §4.3 状态。不给 = 今天的行为（`active`，外加 `includeArchived === true` 时的 `archived`）；`'all'` = active + pending + invalid + archived，排序不变；`'pending'` **是允许的** —— 这是显式的管理/审计查询（§9） |
 | `branch` | `'current' \| string \| readonly string[] \| null` | 不给 = 不过滤 | 与 `list` 的 `branch` 语义完全一致（§3.1）：`'current'` = 注入自己那套 `branchVisible` 口径，按当前 cwd 过滤；其它字符串只保留 `branchOf(record)` 等于该值的记录；**v1.2：** 数组只保留 `branchOf(record)` 落在数组里的记录（无标签不算命中），**空数组返回空结果**；`null`/不给 = 不过滤 |
+| `mode`（v1.3 新增） | `'lexical' \| 'semantic' \| 'hybrid'` | `'lexical'` | 用哪条通道给命中排序。`'lexical'` 就是今天的行为、与 0.5.19 完全一致：**根本不看 embedder，也不会产生任何嵌入调用**。`'semantic'` 只用嵌入相似度排序（词面只作为嵌入不可用时的兜底）。`'hybrid'` 用 `score = (1 - w) * lexical + w * semantic`，`w = cfg.embedderWeight`（默认 `0.5`）。没有可用嵌入器时，`'semantic'` / `'hybrid'` 返回词面结果并由 `lastRecall()` 明说原因（§3.6）—— 绝不静默 |
 
 - **返回**：`Array<{ record: MemoryRecord; match: number; score: number }>`，按 `score` 降序、再按记录确定性顺序（§4.1）
   排序，截断到 `limit`。
@@ -169,6 +212,10 @@ interface RecallOptions {
     `archived`；**只有不给 `status` 时，无论其它入参怎么组合，`pending` 与 `invalid` 都永不返回。** 显式的
     `status: 'pending' | 'invalid' | 'all'` 是唯一能取到它们的门 —— 那是审计查询，绝不是注入路径（注入路径不传 `status`）。
 - **错误形状**：任何入参形状都不抛（运行期容忍 options 缺席）。
+- **回落必须说出来，绝不藏着（v1.3）。** 没注册嵌入器时，`mode: 'semantic'` 照样返回词面结果，且
+  `lastRecall().fallback === 'no-embedder'`。嵌入器抛出 / reject / 超时 / 返回形状或维度不对时，计进
+  `stats().embedder.errors`，并由 `lastRecall()` 如实报成 `'embed-error'` / `'timeout'`（§3.6）。这类失败
+  绝不 reject 调用、绝不丢记忆、绝不让回合失败；`mode: 'lexical'` 与此完全无关，什么都不调用。
 
 ### 3.4 `write(input)`
 
@@ -244,6 +291,19 @@ type WriteMemoryResult =
 - **行为**：家庭整理式维护 —— 合并同 subject 的近似条目、把冲突条目置 `invalid`、按衰减归档、重算项目印象、生成摘要、
   落盘用量。运行中重入的调用直接跳过；领域没打开时立即返回。
 - **错误形状**：内部失败记录到 `state.consolidate.last` / 自报告里，不抛；实践中不会 reject。
+
+### 3.6 `setEmbedder(embedder)` / `capabilities()` / `lastRecall()`（v1.3 新增）
+
+- **`setEmbedder(embedder | null)`** 注册、替换，或（传 `null`）清除**宿主注入**的嵌入器。这是嵌入器进入本插件的
+  **唯一**途径：插件自己绝不调用网络、绝不自带也不运行任何模型（§11）。校验是同步且穷尽的 —— `id` 必须是非空字符串、
+  `embed` 必须是函数、`dimensions` 若给必须是 ≥1 的有限整数；不合法时返回 `{ ok: false, error: 'rejected_invalid: …' }`
+  且**不改变**当前注册状态。成功返回 `{ ok: true, id }`（清除后 `id` 为 `null`）。
+- **`capabilities()`** 是能力探测：`{ protocolVersion, lexical: true, embedder, embedderId }`。没注册之前 `embedder`
+  恒为 `false`、`embedderId` 恒为 `null`；判断「能不能用语义打分」请看它（面对 `'1.2'` 服务面时先看
+  `typeof memory.setEmbedder === 'function'`），不要靠猜、也不要只看配置 —— 配置可能开着混合模式而根本没有嵌入器。
+- **`lastRecall()`** 描述**最近一次** `recall()`：请求的 `mode`、嵌入器是否真的参与了（`used`）、回落原因
+  （`'no-embedder' | 'embed-error' | 'timeout' | null`）、参与排序的候选条数与可用向量数；一次都没调用过时为 `null`。
+  调用方靠它得知「你要了语义、拿到的是词面，原因是……」而不必读内部实现，也正是它让 §0 第 5 条（绝不假装）可以从外部核查。
 
 ## 4. 数据模型
 
@@ -400,7 +460,8 @@ export async function remember(ctx: { get(name: string): unknown }, text: string
 | 客户端半边（`dsh.client` / `lib/client.js`） | 可选 | 只负责设置页表单与预览；没有它，宿主半边的全部服务面照常工作 |
 | `@deepseek-ai/schemastery` | 可选 peer | 不可用时整个 `Config` schema 被丢弃（或退化成不带 volatile 的版本）；服务面不受影响 |
 | 运行期依赖 | **零** | `dependencies` 为空；发布包发的是 `lib/`，不是 `src/` |
-| 协议版本字段 | 有：`'1.2'` | §1、§9、§10；用 `'1.x'` 谓词（`/^1\./u`）判断，不要比字符串相等。写着 `'1.1'` 的服务面只是没有 v1.2 的新键（数组 `branch`、`stats().writes`、`write` 的 `refs`）；写着 `'1.0'` 的连 v1.1 的键也没有 |
+| 外接嵌入器（`setEmbedder`） | **可选** | 默认什么都不注入：没注册嵌入器时所有调用与 0.5.19 逐字节相同，召回路径**零**嵌入调用。插件绝不联网、绝不自带模型；是否把记忆正文发给外部服务、发去哪里、留不留日志，由宿主 / 用户决定，不是插件的决定（§3.6、§11） |
+| 协议版本字段 | 有：`'1.3'` | §1、§9、§10、§11；用 `'1.x'` 谓词（`/^1\./u`）判断，不要比字符串相等。写着 `'1.2'` 的服务面只是没有 v1.3 的新键（嵌入器注入、`capabilities()`、`lastRecall()`、`stats().embedder`、`recall` 的 `mode`）；写着 `'1.1'` 的连 v1.2 的新键（数组 `branch`、`stats().writes`、`write` 的 `refs`）也没有；`'1.0'` 的连 v1.1 的键也没有 |
 
 ## 8. 缺口与已声明行为（2026-10-03 集成时复核）
 
@@ -542,3 +603,57 @@ export async function rememberAndProve(ctx: { get(name: string): unknown }, text
 本文其余部分 —— §2 的可选性、§4 的数据模型与三条载荷约定、§5 的配置面、§6 的示例 —— 都是 v1.0 / v1.1 的内容，
 v1.2 没有改动，v1.1 的默认行为也一条没动：无参 `list()` 仍是原始视图，`stats().records` / `version` / `opened`
 含义不变。
+
+## 11. v1.3 的加法
+
+v1.3 是 v1 之内的**纯加法**：服务面的 `protocolVersion` 从 `'1.2'` 变成 `'1.3'`，0.5.19 能用的调用行为全部照旧 ——
+没注册嵌入器时无参 `list()` 逐字节不变，缺省 `recall({ mode: 'lexical' })` **零**嵌入调用。四处服务面新增：
+
+| # | 新增 | 位置 |
+|---|---|---|
+| 1 | `setEmbedder(embedder \| null)` —— 注册 / 替换 / 清除**宿主注入**的嵌入器。不合法对象被拒（`rejected_invalid: …`），且不改变当前注册状态 | §3.6 |
+| 2 | `capabilities()` —— `{ protocolVersion, lexical: true, embedder: boolean, embedderId: string \| null }`；判断能不能用语义打分的**唯一正确方式** | §3.6 |
+| 3 | `stats().embedder` —— `{ id, dimensions, calls, errors, hits, misses, timeouts }`；未注册嵌入器时全为 `0` / `null` | §3.2 |
+| 4 | `recall({ mode })` —— `'lexical'`（缺省，行为不变）/ `'semantic'` / `'hybrid'`，外加用于诊断回落与用量的 `lastRecall()` | §3.3、§3.6 |
+
+嵌入器契约本身 —— 宿主实现并注入的那个形状：
+
+```ts
+/** 宿主注入的嵌入器（协议 v1.3）。插件只调用它，不关心它背后是什么。 */
+export interface Embedder {
+  /** 非空标识，用于 stats 与诊断（例如 'local-minilm' / 'openai:text-embedding-3-small'）。 */
+  id: string
+  /** 向量维度（可选）：给了就用于快速校验，省一次全量比对。 */
+  dimensions?: number
+  /** 批量嵌入：输入 N 段文本，返回 N 个向量（长度相等、顺序一致）。 */
+  embed(texts: readonly string[]): Promise<readonly (readonly number[])[]>
+}
+```
+
+四个配置键（`MemoryConfig`，默认值见 `src/lib.ts` 的 `DEFAULTS`；它们与其它键走同样的配置入口 —— patch 行或本插件的
+配置行 —— 不改变任何既有键的含义）：
+
+| 键 | 类型 | 默认 | 含义 |
+|---|---|---|---|
+| `embedderRecallMode` | `'off' \| 'recall'` | `'off'` | 按轮召回是否使用混合打分（需已注册 embedder） |
+| `embedderWeight` | number | `0.5` | 混合模式里语义分的权重（0..1，非法回落默认） |
+| `embedderTimeoutMs` | number | `200` | 单次嵌入调用超时 |
+| `embedderCacheMax` | number | `2000` | 向量缓存条数上限（LRU；0 = 不缓存） |
+
+这次加法不许破坏的五条（冻结契约 §0，在这里原义复述、不弱化）：
+
+1. **插件绝不自己调用网络或模型。** 它只调用被注入的 `embed` 函数；是否把记忆正文送去外部服务，是**宿主/用户**
+   的决定 —— 文档必须把这句话写给用户看。
+2. **没注入 embedder 时，一切与 0.5.19 逐字节相同** —— 包括注入路径、召回排序与统计行。
+3. **谁都不默认拿到**：`embedderRecallMode` 默认 `'off'`；只有宿主显式打开、**且**确实注册了 embedder，才会用混合打分。
+4. **失败绝不冒泡**：嵌入器抛错 / reject / 超时 / 返回形状不对 / 维度不一致 ⇒ 记一次错误、**回落词面**，不抛给回合、
+   不写坏记录。任何情况下都不能因为嵌入失败而丢记忆或让回合失败。
+5. **绝不假装**：没有 embedder 时 `recall({ mode: 'semantic' })` 回落词面，并在 `lastRecall()` 里明说
+   （`fallback: 'no-embedder'`），而不是静默给出词面结果却让调用方以为用了语义。
+
+> **隐私。** 插件**自己绝不联网、绝不自带也不运行任何模型**；它只调用宿主注入的 `embed` 函数。是否把记忆正文发送给
+> 外部服务、**发去哪里**、留不留日志，**由宿主与用户决定** —— 插件不做这个决定，也不能替他们做这个决定。
+
+本文其余部分 —— §2 的可选性、§4 的数据模型与三条载荷约定、§5 的配置面、§6 的示例 —— 都是 v1.0 / v1.1 / v1.2 的
+内容，v1.3 没有改动，更早的默认行为也一条没动：无参 `list()` 仍是原始视图，`stats().records` / `version` /
+`opened` / `writes` 含义不变。

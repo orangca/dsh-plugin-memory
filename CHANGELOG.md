@@ -3,6 +3,50 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.20 — 2026-10-04
+
+**Protocol v1.3: an externally injected embedder.** The user's call was the third option — the plugin does not
+bundle a model and does not go online; a host may hand it an embedding function, and without one retrieval stays
+exactly as it was. Purely additive again (`protocolVersion` `'1.2'` → `'1.3'`).
+
+### Added
+
+- `setEmbedder(embedder | null)`: register, replace or clear an embedder. Invalid input is rejected with
+  `rejected_invalid` **without disturbing the current registration**.
+- `capabilities()` — ask instead of guess: protocol version, `lexical: true`, whether an embedder is registered and
+  its id.
+- `recall({ mode: 'lexical' | 'semantic' | 'hybrid' })`, default `'lexical'` which is byte-for-byte the old path and
+  makes **zero** embedding calls. `'hybrid'` blends `(1-w) * lexical + w * semantic` with `w = embedderWeight`.
+- `lastRecall()` — what actually happened on the last recall: mode, whether embeddings were really used, the
+  fallback reason (`no-embedder` / `embed-error` / `timeout`), candidate and vector counts.
+- `stats().embedder` — id, dimensions, calls, errors, hits, misses, timeouts. Vectors are cached per content key
+  (LRU, `embedderCacheMax`), the query and all candidates go out in **one batch call**, and every embed call is
+  bounded by `embedderTimeoutMs`.
+- `embedderRecallMode` (default `'off'`) decides whether the per-turn injection path may use hybrid scoring. Off by
+  default means the injection path is byte-for-byte 0.5.19 unless a host opts in *and* registers an embedder.
+- Config: `embedderRecallMode` `'off'`, `embedderWeight` `0.5`, `embedderTimeoutMs` `200`, `embedderCacheMax` `2000`
+  — all patch-row knobs.
+
+### Safety rules this release is built around
+
+- **The plugin never goes online and never bundles a model.** It only calls the injected `embed`. Whether memory
+  text leaves the machine, where it goes and whether it is logged is the host's and the user's decision; the plugin
+  is not in a position to make it, and the protocol and README say so in as many words.
+- **No silent pretending.** With no embedder registered, `mode: 'semantic'` falls back to lexical **and says so**
+  through `lastRecall().fallback === 'no-embedder'`.
+- **Failures never bubble.** A throwing, rejecting, malformed, dimension-mismatched or timed-out embedder is counted
+  and falls back to lexical — it cannot fail a turn or lose a memory.
+
+### Notes
+
+- One deliberate lib choice: a vector containing `NaN`/`Infinity` normalises to all zeros rather than treating the
+  bad components as zero, so `cosineSimilarity` returns `null` and the semantic leg drops out instead of scoring
+  with a nonsense direction.
+- `types.ts` gained an `Embedder` type and the three new `RecallOptions.mode` values, so third-party TypeScript
+  callers can actually write `mode: 'semantic'` (the host had been narrowing locally).
+- Integration also caught three lint findings and one gap the agents reported rather than hid; the fixes are in this
+  release, not deferred.
+
 ## 0.5.19 — 2026-10-04
 
 **Protocol v1.2** (again purely additive — `protocolVersion` `'1.1'` → `'1.2'`) plus the engineering debt that

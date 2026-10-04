@@ -8,6 +8,18 @@ export type MemoryOrigin = 'user_explicit' | 'user_correction' | 'model_proposed
  */
 export type SelfFacet = 'persona' | 'work';
 /**
+ * M18（协议 v1.3）：宿主注入的嵌入器。插件**只调用它**，不关心它背后是什么 ——
+ * 是否把记忆正文送去外部服务是宿主/用户的决定，插件自己绝不联网、绝不自带模型。
+ */
+export interface Embedder {
+    /** 非空标识，用于 stats 与诊断（例如 `'local-minilm'`）。 */
+    id: string;
+    /** 向量维度（可选）：给了就用于快速校验，省一次全量比对。 */
+    dimensions?: number;
+    /** 批量嵌入：输入 N 段文本，返回 N 个向量（长度相等、顺序一致）。 */
+    embed(texts: readonly string[]): Promise<readonly (readonly number[])[]>;
+}
+/**
  * 记录状态。`'pending'` 是 M10 写入审批门新增的：**待用户确认，绝不进任何注入路径**。
  * 严禁把它扩进「注入用的状态集合」——只有 `'active'` 才允许进上下文。
  */
@@ -124,7 +136,14 @@ export interface RecallOptions {
     scopeLevel?: ScopeLevel;
     tag?: string;
     limit?: number;
-    mode?: 'query' | 'memory';
+    /**
+     * 打分口径。
+     * - `'query'`（默认）/ `'memory'`：**词面**检索的两侧口径，语义不变（协议 v1.0 起）。
+     * - `'lexical'`（协议 v1.3）：与缺省等价，明确表示"只用词面"。
+     * - `'semantic'` / `'hybrid'`（协议 v1.3）：使用**宿主注入的 embedder**；未注册或失败时**回落词面**，
+     *   并通过 `ctx.memory.lastRecall()` 如实说明回落原因（绝不静默假装用了语义）。
+     */
+    mode?: 'query' | 'memory' | 'lexical' | 'semantic' | 'hybrid';
     minLexical?: number;
     minMatch?: number;
     minHits?: number;
@@ -217,6 +236,14 @@ export interface MemoryConfig {
      * 成功的写事件由记录本身派生，因此不为审计新增存储。`0` = 不记录。
      */
     auditMax: number;
+    /** M18（协议 v1.3）：按轮召回是否使用混合打分 —— 需已注册 embedder；默认 `'off'` ＝ 行为不变。 */
+    embedderRecallMode: 'off' | 'recall';
+    /** M18：混合模式里语义分的权重（0..1；非法回落默认）。 */
+    embedderWeight: number;
+    /** M18：单次嵌入调用超时（毫秒）；超时按失败处理并回落词面。 */
+    embedderTimeoutMs: number;
+    /** M18：向量缓存条数上限（LRU；`0` = 不缓存）。 */
+    embedderCacheMax: number;
     /** M15-B：英文轻量词形归并（build / building / builds 互相命中）。 */
     searchStemming: boolean;
     /** M15-B：中文按 bigram 切分（关掉＝按单字）。 */

@@ -171,6 +171,16 @@ export const DEFAULTS: MemoryConfig = {
   // M13：内存审计环容量（契约 docs/audit.md §2.1）—— `0` = 不记录（显式关闭）；
   // 默认 50 与 `pendingMax` 同量级：够放下一轮会话里被拒/入队的尝试，又有硬上限。
   auditMax: 50,
+  // M18（协议 v1.3）：外接嵌入器（契约 docs/embedder.md §4）—— 出厂默认**全关**：
+  //  · `embedderRecallMode: 'off'` ⇒ 按轮召回根本不看 embedder，与 0.5.19 逐字节相同；
+  //  · `embedderWeight` 0.5 ＝ 语义与词面各半（仅 hybrid，且必须显式调用）；
+  //  · `embedderTimeoutMs` 200：单次嵌入调用的硬超时，超时按失败处理并回落词面；
+  //  · `embedderCacheMax` 2000：向量缓存条数上限（LRU；`0` = 不缓存）。
+  // 插件自己绝不联网、绝不自带模型：这四个键只描述**宿主注入**的 embedder 怎么用。
+  embedderRecallMode: 'off',
+  embedderWeight: 0.5,
+  embedderTimeoutMs: 200,
+  embedderCacheMax: 2000,
   // M15-B：检索质量升级（契约 docs/semantic.md §4）—— 英文轻量词形归并 + 中文 bigram 默认开，
   // 长度归一化强度 0.3。默认值下 `tokenize` 与 0.5.16 **逐 token 相同**；变的是排序分
   // （idf 加权 + 长度归一化，契约 §3），门槛（`match` 与 `minLexical`/`minMatch`）语义不变。
@@ -3210,4 +3220,119 @@ export function formatAudit(input: AuditInput): string {
   }
 
   return lines.join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// M18（协议 v1.3）：外接嵌入器的纯函数层（契约 docs/embedder.md §5）
+//
+// 插件**不联网、不自带模型**：这一节只有确定性的向量算术与缓存键，没有 I/O、没有 async。
+// 是否把记忆正文送去外部服务是宿主/用户的决定 —— 我们只调用被注入的 `embed` 函数。
+// ⚠ 全部函数都**不抛错**：嵌入不可用（维度不等 / 含非有限数 / 零向量 / 输入非法）
+//   是正常路径，用 `null` 表达"不可用"，由调用方回落词面检索（契约 §0.4）。
+// ---------------------------------------------------------------------------
+
+/**
+ * 单位化（L2 归一化）：返回同长度的新数组，范数为 1。
+ *
+ *  · **零向量返回全 0 向量**（长度不变），调用方按 0 相似度处理 —— 不返回空数组，
+ *    空数组会被下游读成"维度为 0"而不是"方向未定义"；
+ *  · 含非有限数（`NaN` / `±Infinity`）⇒ **整条向量判为不可用**，同样返回同长度的全 0 向量：
+ *    绝不能把 `NaN` 当 0 继续算方向 —— 那会凭空造出一个"看起来合法"的语义分，
+ *    而正确的后继行为是 `cosineSimilarity(...)` 返回 `null` ⇒ 回落词面检索；
+ *  · 纯函数：不修改入参（`readonly number[]`）。
+ */
+export function normalizeVector(vector: readonly number[]): number[] {
+  const length = Array.isArray(vector) ? vector.length : 0
+  if (length === 0) return []
+  const zeros = (): number[] => Array.from({ length }, () => 0)
+  const out = zeros()
+  let sum = 0
+  for (let index = 0; index < length; index += 1) {
+    const value = vector[index]
+    // 出现非有限数 ⇒ 这条嵌入本身不可信：整条按不可用处理（见函数注释）。
+    if (typeof value !== 'number' || !Number.isFinite(value)) return zeros()
+    out[index] = value
+    sum += value * value
+  }
+  const norm = Math.sqrt(sum)
+  // 零向量（含全 0，以及范数下溢成 0 的情形）：返回同长度的全 0 向量。
+  if (!(norm > 0) || !Number.isFinite(norm)) return zeros()
+  for (let index = 0; index < length; index += 1) out[index] = out[index] / norm
+  return out
+}
+
+/**
+ * 余弦相似度（范围 `[-1, 1]`）。**不可用时返回 `null`**，绝不抛错 —— 调用方据此判
+ * "语义这条腿不可用"并回落词面检索（契约 §0.4）。
+ *
+ * 返回 `null` 的情形：维度不等、任一含非有限数（`NaN` / `±Infinity`）、任一为空向量
+ * （范数 0，方向未定义）、输入不是数组、以及极少数算不出有限值的退化情形。
+ * 容忍未归一化的输入（内部自算范数），因此 `cosineSimilarity(normalizeVector(a), b)` 与
+ * `cosineSimilarity(a, b)` 同值。
+ */
+export function cosineSimilarity(a: readonly number[], b: readonly number[]): number | null {
+  if (!Array.isArray(a) || !Array.isArray(b)) return null
+  if (a.length !== b.length) return null
+  if (a.length === 0) return null
+  let dot = 0
+  let normA = 0
+  let normB = 0
+  for (let index = 0; index < a.length; index += 1) {
+    const left = a[index]
+    const right = b[index]
+    if (typeof left !== 'number' || !Number.isFinite(left)) return null
+    if (typeof right !== 'number' || !Number.isFinite(right)) return null
+    dot += left * right
+    normA += left * left
+    normB += right * right
+  }
+  // 任一为空向量（或全部被 0 主导到范数下溢）⇒ 不可用。
+  if (!(normA > 0) || !(normB > 0)) return null
+  // 先各自开方再相乘：避免 `normA * normB` 在极小向量上下溢成 0 而算出 Infinity。
+  const value = dot / (Math.sqrt(normA) * Math.sqrt(normB))
+  if (!Number.isFinite(value)) return null
+  return Math.min(1, Math.max(-1, value))
+}
+
+/** 混合权重：只接受 `[0, 1]` 里的有限数；`NaN` / 越界 / 非数一律回落 `DEFAULTS.embedderWeight`。 */
+function blendedWeightOf(weight: unknown): number {
+  return typeof weight === 'number' && Number.isFinite(weight) && weight >= 0 && weight <= 1
+    ? weight
+    : DEFAULTS.embedderWeight
+}
+
+/**
+ * 混合打分：`(1 - w) * lexical + w * semantic`（契约 docs/embedder.md §3/§5）。
+ *
+ *  · 两个输入都 clamp 到 `0..1`（`NaN` 按 0）；
+ *  · `semantic === null`（嵌入不可用）⇒ **回落词面**：直接返回 clamp 后的 lexical，
+ *    哪怕 weight 是 1 —— 这是契约 §0.4「失败绝不冒泡」的落点；
+ *  · `weight` 非法（`NaN` / 越界 / 非数）⇒ 回落 `DEFAULTS.embedderWeight`（0.5）；
+ *  · `weight === 0` ＝ 纯词面，`weight === 1` ＝ 纯语义（两者都是合法值，不触发回落）。
+ */
+export function blendScores(lexical: number, semantic: number | null, weight: number): number {
+  const lexicalScore = clamp01(lexical)
+  if (semantic === null || semantic === undefined) return lexicalScore
+  const semanticScore = clamp01(semantic)
+  const w = blendedWeightOf(weight)
+  return clamp01((1 - w) * lexicalScore + w * semanticScore)
+}
+
+/**
+ * 向量缓存的键：记录**参与检索的文本**的内容指纹（正文 + subject + tags，口径与 `tokensOf` 一致）。
+ *
+ *  · 是纯**内容键**：`refs` / `branch` / `scope` / `kind` / `id` 都不参与 ——
+ *    它们不改变嵌入输入，因此**引用或分支变化不影响它**，缓存不会因此失效，
+ *    同一段文本在两条记录间也能共用同一个向量；
+ *  · 与 `recordHash` 的关系：同样复用既有的 `normalizeText` + `fnv1a`（**不新造哈希算法**），
+ *    但 `recordHash` 覆盖 `kind` / `scope` / `branch`（M12 起 branch 参与指纹），
+ *    拿它当向量键会让"仅分支不同"的同文本记录重复嵌入，所以这里不直接复用它；
+ *  · `emb1:` 前缀是键空间的版本位，便于将来换口径时整体失效。
+ */
+export function vectorKeyOf(record: MemoryRecord): string {
+  const tags = Array.isArray(record?.tags) ? record.tags : []
+  const text = [record?.text ?? '', record?.subject ?? '', ...tags]
+    .map((part) => normalizeText(part ?? ''))
+    .join('|')
+  return `emb1:${fnv1a(text)}`
 }

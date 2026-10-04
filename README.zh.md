@@ -5,7 +5,9 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 
 中文 | [English](README.md)
 
-- **本地**：全部数据落在 `$DSH_HOME/storages/<domainName>/`，无网络请求、无 embedding 服务。
+- **本地**：全部数据落在 `$DSH_HOME/storages/<domainName>/`，无网络请求，插件自己也不带 embedding 服务；
+  检索默认走词面，下文那个可选的「外接嵌入器」是**宿主注入**的
+  （见 [外接嵌入器（可选）](#外接嵌入器可选宿主注入默认关闭)）。
 - **自动**：回合收尾时用规则从**真实用户消息**里抽取该记的事，零额外模型调用。
 - **有预算**：每次注入有硬 token 上限，超出按优先级截断。
 - **可解释**：每条记忆带来源（会话 + seq 区间）、置信度与时间线。
@@ -34,6 +36,8 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 3. **整合**：默认每 30 分钟一次 + 启动补跑。合并重复、把矛盾条目标记为失效（可恢复）、
    按类型半衰期衰减归档、对单一主题过多的条目做规则式摘要。另有用户显式触发的跨会话梳理
    `/sleep`（见下）。
+4. **打分（可选）**：宿主可以往服务面注入一个 `embed` 函数（协议 §3.6）。它是 `recall({ mode })` 能按嵌入相似度
+   排序的前提，而且**默认关闭** —— 见 [外接嵌入器（可选）](#外接嵌入器可选宿主注入默认关闭)。
 
 ## 自画像：人格 + 工作倾向
 
@@ -235,6 +239,53 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 
 `branchAware`（默认 `true`）在设置页表单里以 `0` / `1` 表达。
 
+## 外接嵌入器（可选）：宿主注入，默认关闭
+
+插件**不自带模型、也不联网**。之所以能有语义排序，只因为宿主可以往服务面**注入一个 `embed` 函数**
+（协议 v1.3 的 `ctx.memory.setEmbedder`，契约 `docs/embedder.md`，协议 §3.6/§11）。没注入时，检索走的就是与
+0.5.19 完全相同的词面路径 —— **逐字节相同，且零嵌入调用**。
+
+怎么注册（宿主侧代码，例如另一个插件的 `apply()` 或一个小适配器）：
+
+```ts
+/** 宿主侧的嵌入器：插件只调用这个函数，绝不自己发起网络请求。 */
+const embedder = {
+  id: 'local-minilm',                                     // 非空；会出现在 stats 与诊断里
+  dimensions: 384,                                        // 可选：给了可以做快速校验
+  async embed(texts: readonly string[]): Promise<number[][]> { return await myLocalModel(texts) },
+}
+
+const memory = ctx.get('memory') as {
+  setEmbedder?: (embedder: typeof embedder | null) => { ok: boolean; id?: string | null; error?: string }
+} | undefined
+if (memory?.setEmbedder) {                                 // '1.2' 服务面没有它 —— 先探测再调用
+  const result = memory.setEmbedder(embedder)
+  if (!result.ok) console.warn('embedder 被拒：', result.error)
+}
+```
+
+注册之后会多出四个键：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `embedderRecallMode` | `'off'` | **按轮**召回是否用混合打分（需已注册嵌入器；改成 `'recall'` 才打开） |
+| `embedderWeight` | `0.5` | 混合模式里语义分的权重，`score = (1 - w) * 词面 + w * 语义`（0…1；非法回落默认） |
+| `embedderTimeoutMs` | `200` | 单次嵌入调用超时；超时按失败处理并回落词面 |
+| `embedderCacheMax` | `2000` | 向量缓存条数上限（LRU；`0` = 不缓存） |
+
+- **默认关闭，且关闭得很安静。** 这四个键都走 patch 行（属于进阶调参）；`'off'` 意味着按轮召回根本不看嵌入器，
+  所以升级后的行为与 0.5.19 完全相同。缺省的 `recall({ mode: 'lexical' })` 同样**零**嵌入调用，返回值与 0.5.19 一致。
+- **模式要显式指定。** `recall({ mode: 'semantic' })` 只用嵌入相似度排序；`'hybrid'` 按 `embedderWeight` 混合词面与语义。
+  「有没有嵌入器」用 `capabilities()` 问，用量与失败用 `stats().embedder` 看（`calls` / `errors` / `hits` / `misses` /
+  `timeouts`）—— 不要靠猜。
+- **失败就回落词面，并由 `lastRecall()` 如实说明。** 嵌入器抛错、reject、超时，或返回形状 / 维度不对时，记一次错误并
+  回落词面打分：召回不会 reject、不会丢记忆、也不会让回合失败。`lastRecall()` 会报出请求的 `mode`、嵌入器是否真的
+  参与了（`used`）、回落原因（`'no-embedder'` / `'embed-error'` / `'timeout'` / `null`）以及参与的候选条数与向量数 ——
+  你要的是语义却拿到词面时，它不会瞒着你。
+- **隐私这件事不由插件替谁决定。** 插件**自己绝不联网、绝不自带也不运行任何模型**，它只调用宿主注入的 `embed` 函数。
+  是否把记忆正文发送给外部服务、**发去哪里**、留不留日志，**由宿主与用户决定** —— 插件不做这个决定，也不能替他们做这个
+  决定。你不注入嵌入器，就什么都不会被发出去。
+
 ## `/memory audit`：写入审计与注入核对
 
 不是每一次写入都会留下一行记录：**被拒**的写入什么都不留，于是「为什么这条没进记忆」没有答案。
@@ -425,6 +476,10 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 120000、合计字符预算 `sleepMaxCharsTotal` 300000、每条用户消息前保留的 assistant 文本条数
 `sleepAssistantContext` 3（回声检测用）、最多重算几段项目印象 `sleepMaxGists` 8。
 
+外接嵌入器的四个键（`embedderRecallMode` `off`、`embedderWeight` 0.5、`embedderTimeoutMs` 200、
+`embedderCacheMax` 2000）同样只能走 patch 行，含义见
+[外接嵌入器（可选）](#外接嵌入器可选宿主注入默认关闭)。
+
 ## 数据与隐私
 
 ```
@@ -434,7 +489,9 @@ $DSH_HOME/storages/dsh_memory/
 ```
 
 - 存储根是 **home 级**：同一台机器上的所有 profile 默认共用一份记忆库——对「个人记忆」通常正是想要的。
-- 数据不出本机：无遥测、无 embedding 服务、不上传任何历史。
+- 数据不出本机：无遥测，插件自己也不带 embedding 服务；默认检索走词面，除非**你**通过 `ctx.memory.setEmbedder`
+  注入外接嵌入器 —— 那是可选的、默认关闭的，是否注入完全由宿主决定
+  （见 [外接嵌入器（可选）](#外接嵌入器可选宿主注入默认关闭)）。
 - 敏感内容在落盘前就被拒写，个人信息脱敏后写入；两种行为都有单测覆盖。
 - DSH 不会自动迁移领域版本：升级 `version` 必须同时声明 `compatibleVersions`。
 
@@ -493,7 +550,9 @@ node tools/scan-asar.ts settingsNumberField       # 定位某个符号在 app.as
 - **压缩固化取决于部署**：代码监听 `compaction/summary`；没有挂载压缩插件的 profile 不会产生该事件。
 - **跨会话全文检索通常不可用**：会话查询索引出厂是 `openAt: never`，因此本插件自建词面索引，
   历史回指只用精确读取。
-- **检索是词面匹配**：CJK bigram + 拉丁词干 + 记忆侧覆盖率；同义改写级别的召回需要向量检索，属后续工作。
+- **默认是词面检索**：CJK bigram + 拉丁词干 + 记忆侧覆盖率。向量检索是**可选项**：向服务面注入一个 `embed` 函数后，
+  按轮召回就能用混合打分（[外接嵌入器（可选）](#外接嵌入器可选宿主注入默认关闭)）。插件依旧不自带模型、自己也不联网，
+  没注入时检索就是词面。
 - **没有图形化的记忆浏览**：界面只提供配置；浏览、删除、固定记忆走上面列出的 `/memory` 命令与 7 个模型工具。
 - **两项设计显式降级**：① 自画像不与部署的 persona 文本去重；② 若部署注册了会把其它 prompt 段挤掉的
   `complete` 段，自画像段会随之消失，插件**不会**自动改走 `context()` 通道。

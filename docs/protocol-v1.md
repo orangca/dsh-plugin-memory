@@ -25,26 +25,35 @@ still advance by one patch (`0.5.16 → 0.5.17`); the protocol version and the p
 
 A method that is going away keeps working for the whole of v1 and is marked deprecated in this document first.
 
-The revision you are reading is **v1.2**. v1.1 was a **pure addition** on top of v1.0: `list()` gained optional
+The revision you are reading is **v1.3**. v1.1 was a **pure addition** on top of v1.0: `list()` gained optional
 `status` / `branch` / `limit`, `recall()` two optional filters, `write()` the `persisted` field, and the service's
 `protocolVersion` moved from `'1.0'` to `'1.1'` (§9). v1.2 is again a **pure addition**, this time on top of v1.1:
 `list()` / `recall()` accept a **branch array**, `stats()` gained the `writes` counters, every `write()` **success**
 shape gained `refs`, and the service's `protocolVersion` moved from `'1.1'` to `'1.2'` (§10). Nothing a `'1.0'` or
 `'1.1'` consumer relied on changed — every no-argument call is byte for byte what 0.5.18 returned (§3.1, §3.3).
+v1.3 is again a **pure addition**, this time on top of v1.2: the host may **inject an embedder** through the service
+surface (`setEmbedder`), `capabilities()` / `lastRecall()` are new read-only methods, `stats()` gained the
+`embedder` diagnostics, and `recall()` gained an optional `mode` (§11). The service's `protocolVersion` moved from
+`'1.2'` to `'1.3'`. Nothing a `'1.0'`, `'1.1'` or `'1.2'` consumer relied on changed — with no embedder registered
+every call is byte for byte what 0.5.19 returned, and `recall({ mode: 'lexical' })` (the default) makes **zero**
+embedding calls (§3.3, §11).
 
-Today the service object **does** carry `protocolVersion` (`'1.2'`); read it first and degrade readably on an
+Today the service object **does** carry `protocolVersion` (`'1.3'`); read it first and degrade readably on an
 unknown version rather than assuming. Decide compatibility with a `'1.x'` predicate (`/^1\./u`), **not** string
-equality: v1.1 already asked for this and v1.2 keeps it — a consumer that compared `protocolVersion === '1.1'`
-would lock itself out of `'1.2'`, so compare on the prefix / major–minor only. §9 and §10 have minimal snippets
-that do exactly that.
+equality: v1.1 already asked for this, v1.2 kept it and v1.3 still does — a consumer that compared
+`protocolVersion === '1.2'` would lock itself out of `'1.3'`, so compare on the prefix / major–minor only. §9, §10
+and §11 have minimal snippets that do exactly that.
 
 ## 2. Locating the service, and what to do when it is absent
 
 The service is registered exactly once, inside `apply()`:
 
 ```ts
-ctx.provide('memory', { protocolVersion, list, stats, recall, write, consolidate })
+ctx.provide('memory', { protocolVersion, list, stats, recall, write, consolidate, setEmbedder, capabilities, lastRecall })
 ```
+
+`setEmbedder` / `capabilities` / `lastRecall` are the v1.3 additions (§3.6, §11); a `'1.2'` service simply does not
+have them.
 
 Locate it with:
 
@@ -73,11 +82,11 @@ Rules for callers:
 
 ## 3. Methods
 
-The service object, as signatures (the bodies are internal; §3.1–§3.5 fix the semantics):
+The service object, as signatures (the bodies are internal; §3.1–§3.6 fix the semantics):
 
 ```ts
 interface MemoryService {
-  protocolVersion: string            // '1.2'
+  protocolVersion: string            // '1.3'
   list(options?: ListOptions): MemoryRecord[]
   stats(): {
     records: number
@@ -85,10 +94,43 @@ interface MemoryService {
     opened: boolean
     /** 新增：本进程内累计的写入落盘结果（v1.2）。 */
     writes: { persisted: number; unpersisted: number }
+    /** 新增（v1.3）：嵌入器运行状况；没注册 / 没用过时 id 为 null、计数全 0。 */
+    embedder: {
+      id: string | null
+      dimensions: number | null
+      /** 嵌入调用次数（批量算一次）。 */
+      calls: number
+      /** 失败的调用次数（抛出 / reject / 形状或维度不对 / 超时）。 */
+      errors: number
+      /** 向量缓存命中 / 未命中（未命中＝真的调了 embed）。 */
+      hits: number
+      misses: number
+      /** 因超时被放弃的次数（含在 errors 里）。 */
+      timeouts: number
+    }
   }
   recall(options: RecallOptions): Array<{ record: MemoryRecord; match: number; score: number }>
   write(input: WriteMemoryInput): Promise<WriteMemoryResult>
   consolidate(reason?: string): Promise<void>
+  /** 新增（v1.3）：注册 / 替换 / 清除宿主注入的嵌入器；传 `null` 清除。插件只调用它，绝不自己联网或带模型。 */
+  setEmbedder(embedder: Embedder | null): { ok: true; id: string | null } | { ok: false; error: string }
+  /** 新增（v1.3）：能力探测 —— 调用方据此决定用不用语义，不要靠猜。 */
+  capabilities(): {
+    protocolVersion: string
+    lexical: true
+    /** 是否已注册可用的嵌入器。 */
+    embedder: boolean
+    /** 已注册的 id（未注册为 null）。 */
+    embedderId: string | null
+  }
+  /** 新增（v1.3）：上一次 `recall()` 的诊断；一次都没调用过时为 `null`。 */
+  lastRecall(): {
+    mode: 'lexical' | 'semantic' | 'hybrid'
+    used: boolean
+    fallback: 'no-embedder' | 'embed-error' | 'timeout' | null
+    candidates: number
+    vectors: number
+  } | null
 }
 ```
 
@@ -131,8 +173,8 @@ list(options?: {
 ### 3.2 `stats()`
 
 - **Arguments:** none.
-- **Returns:** `{ records: number; version: number; opened: boolean; writes: { persisted: number; unpersisted: number } }`
-  — the three v1.0 keys plus the v1.2 `writes` counters.
+- **Returns:** `{ records: number; version: number; opened: boolean; writes: { persisted: number; unpersisted: number }; embedder: { … } }`
+  — the three v1.0 keys, the v1.2 `writes` counters and the v1.3 `embedder` block (§3.6, §11).
 
 | field | meaning |
 |---|---|
@@ -140,12 +182,13 @@ list(options?: {
 | `version` | collection version, incremented on every successful put/delete; use it to detect change. **Not** a storage schema version |
 | `opened` | whether `ctx.storageDomain.open()` succeeded. `false` means writes are not reaching disk (see §8 gap 3) |
 | `writes` *(new in v1.2)* | this process's running count of write-persistence outcomes. `persisted`: how often `persist()` returned true (the write really reached disk); `unpersisted`: how often the write was `ok: true` but did not reach disk (domain not open, or `put` threw). The counters only grow, they are per-process and reset on restart (the same nature as `version`). Rejections (`ok: false`) are **not** counted — they were never a write. They sit alongside the internal `state.writes` counters and do not reuse them (those have a different meaning). |
+| `embedder` *(new in v1.3)* | embedder diagnostics: `id` / `dimensions` (`null` while none is registered), `calls` (a batch counts once), `errors` (throw / reject / wrong shape or mismatched dimensions / timeout), `hits` / `misses` (the vector cache; a miss means `embed` was really called) and `timeouts` (also included in `errors`). With no embedder registered every counter stays `0` and `id` / `dimensions` are `null`, so the stats line is exactly what 0.5.19 produced. Registration and semantics: §3.6, §11. |
 
 - **Errors:** none.
 
 ### 3.3 `recall(options)`
 
-- **Arguments:** `RecallOptions`; v1.1 adds two optional keys, frozen verbatim as:
+- **Arguments:** `RecallOptions`; v1.1 adds two optional keys and v1.3 adds `mode`, frozen verbatim as:
 
 ```ts
 interface RecallOptions {
@@ -154,6 +197,8 @@ interface RecallOptions {
   status?: 'active' | 'pending' | 'invalid' | 'archived' | 'all'
   /** 分支过滤，语义与 `list` 的 `branch` 完全一致（v1.2 起同样接受数组；**空数组 ⇒ 空结果**）。缺省 = 不过滤（今天的行为）。 */
   branch?: 'current' | string | readonly string[] | null
+  /** 新增（v1.3）：排序通道。缺省 `'lexical'` ＝ 与 0.5.19 逐字节相同，且零嵌入调用。 */
+  mode?: 'lexical' | 'semantic' | 'hybrid'
 }
 ```
 
@@ -171,6 +216,7 @@ interface RecallOptions {
 | `includeArchived` | `boolean` | `false` | also consider `archived` records |
 | `status` | `'active' \| 'pending' \| 'invalid' \| 'archived' \| 'all'` | absent = today's pool | which §4.3 statuses may be returned. Absent = today's behaviour (`active`, plus `archived` when `includeArchived === true`); `'all'` = active + pending + invalid + archived, order unchanged; `'pending'` is allowed — an explicit management/audit query (§9) |
 | `branch` | `'current' \| string \| readonly string[] \| null` | unset = no filter | exactly `list`'s `branch` (§3.1): `'current'` = the injection's own `branchVisible` rule for the current cwd; any other string keeps only records whose `branchOf(record)` equals it; **v1.2:** an array keeps only the records whose `branchOf(record)` is in the array (no tag = not a hit) and an **empty array returns an empty result**; `null` / unset = no filter |
+| `mode` *(new in v1.3)* | `'lexical' \| 'semantic' \| 'hybrid'` | `'lexical'` | which channel orders the hits. `'lexical'` is today's behaviour and exactly 0.5.19: the embedder is not consulted and **zero** embedding calls are made. `'semantic'` orders by embedding similarity alone (lexical is only the fallback when embeddings are unavailable). `'hybrid'` uses `score = (1 - w) * lexical + w * semantic` with `w = cfg.embedderWeight` (default `0.5`). Without a usable embedder, `'semantic'` and `'hybrid'` return lexical results and say so through `lastRecall()` (§3.6) — never silently |
 
 - **Returns:** `Array<{ record: MemoryRecord; match: number; score: number }>`, sorted by `score` descending and
   then by the deterministic record order (§4.1), truncated to `limit`.
@@ -181,6 +227,11 @@ interface RecallOptions {
     whatever the other options say.** An explicit `status: 'pending' | 'invalid' | 'all'` is the only door that can
     return them — an audit query, never an injection path (injection passes no `status`).
 - **Errors:** none for any option shape (absent options are tolerated at runtime).
+- **Embedder fallback is reported, never hidden (v1.3).** With no embedder registered, `mode: 'semantic'` still
+  returns a lexical result, and `lastRecall().fallback === 'no-embedder'`. An embedder that throws / rejects /
+  times out / returns a wrong shape or mismatched dimensions is counted in `stats().embedder.errors` and reported
+  as `'embed-error'` / `'timeout'` through `lastRecall()` (§3.6). Such a failure never rejects the call, never
+  loses a record and never fails a turn; `mode: 'lexical'` is untouched by all of it and calls nothing.
 
 ### 3.4 `write(input)`
 
@@ -263,6 +314,24 @@ type WriteMemoryResult =
   flight are skipped; when the domain is not open it returns immediately.
 - **Errors:** internal failures are recorded (`state.consolidate.last`, the report), not thrown; the call does
   not reject in practice.
+
+### 3.6 `setEmbedder(embedder)` / `capabilities()` / `lastRecall()` (new in v1.3)
+
+- **`setEmbedder(embedder | null)`** registers, replaces or (with `null`) clears the host-injected embedder. It is
+  the **only** way an embedder reaches the plugin: the plugin itself never calls the network and never ships or
+  runs a model of its own (§11). Validation is synchronous and total — `id` must be a non-empty string, `embed` a
+  function, and `dimensions`, when given, a finite integer `>= 1`; anything else returns
+  `{ ok: false, error: 'rejected_invalid: …' }` and **leaves the current registration untouched**. Success returns
+  `{ ok: true, id }` (`id: null` after a clear).
+- **`capabilities()`** is the feature probe: `{ protocolVersion, lexical: true, embedder, embedderId }`. `embedder`
+  is `false` and `embedderId` `null` until something is registered; decide "can I use semantic scoring" from this
+  (`typeof memory.setEmbedder === 'function'` first, for a `'1.2'` service), never from a guess or from the config
+  alone — the config may ask for hybrid ranking while no embedder exists.
+- **`lastRecall()`** describes the **last** `recall()` call, or `null` when none has happened: the requested
+  `mode`, whether the embedder actually took part (`used`), the fallback reason
+  (`'no-embedder' | 'embed-error' | 'timeout' | null`), how many candidates were considered and how many vectors
+  were available. It is how a caller learns "you asked for semantic and got lexical, because …" without reading
+  internals, and it is what keeps §0 rule 5 ("never pretend") checkable from outside.
 
 ## 4. Data model
 
@@ -430,7 +499,8 @@ Call `ctx.get('memory')` inside a step / effect (where services are live) and re
 | client half (`dsh.client` / `lib/client.js`) | optional | settings form + previews only; the host half and the whole service surface work without it |
 | `@deepseek-ai/schemastery` | optional peer | when unavailable the `Config` schema is dropped (or built without `volatile`); the service surface is unchanged |
 | runtime dependencies | **none** | `dependencies` is empty; the published package ships `lib/`, not `src/` |
-| protocol version field | present: `'1.2'` | §1, §9, §10; test it with a `'1.x'` predicate (`/^1\./u`), never string equality. A `'1.1'` service simply lacks the v1.2 keys (array `branch`, `stats().writes`, `write`'s `refs`); a `'1.0'` one lacks the v1.1 keys as well |
+| external embedder (`setEmbedder`) | **optional** | nothing is injected by default: with no embedder registered every call stays byte for byte 0.5.19 and the recall path makes **zero** embedding calls. The plugin never calls the network and never ships a model; whether memory text is sent to an external service, where, and whether it is logged is the host's / user's decision, not the plugin's (§3.6, §11) |
+| protocol version field | present: `'1.3'` | §1, §9, §10, §11; test it with a `'1.x'` predicate (`/^1\./u`), never string equality. A `'1.2'` service simply lacks the v1.3 keys (embedder injection, `capabilities()`, `lastRecall()`, `stats().embedder`, `recall`'s `mode`); a `'1.1'` one lacks the v1.2 keys (array `branch`, `stats().writes`, `write`'s `refs`) as well, and a `'1.0'` one lacks the v1.1 keys too |
 
 ## 8. Known gaps (awaiting a ruling)
 
@@ -587,3 +657,66 @@ export async function rememberAndProve(ctx: { get(name: string): unknown }, text
 Everything else in this document — §2's optionality, §4's data model and the three payload rules, §5's
 configuration surface, §6's example — is v1.0 / v1.1 material and unchanged by v1.2, and no v1.1 default moved:
 `list()` with no argument is still the raw view, and `stats().records` / `version` / `opened` keep their meaning.
+
+## 11. What v1.3 adds
+
+v1.3 is a **pure addition** inside v1: the service's `protocolVersion` went `'1.2' → '1.3'`, and every call that
+worked in 0.5.19 keeps its exact behaviour — with no embedder registered a no-argument `list()` is byte for byte
+identical, and `recall({ mode: 'lexical' })`, the default, makes **zero** embedding calls. Four surface additions:
+
+| # | addition | where |
+|---|---|---|
+| 1 | `setEmbedder(embedder \| null)` — register / replace / clear the embedder the **host injects**. A bad object is rejected (`rejected_invalid: …`) without changing the current registration | §3.6 |
+| 2 | `capabilities()` — `{ protocolVersion, lexical: true, embedder: boolean, embedderId: string \| null }`; the only correct way to decide whether semantic scoring is available | §3.6 |
+| 3 | `stats().embedder` — `{ id, dimensions, calls, errors, hits, misses, timeouts }`; all zero / `null` while no embedder is registered | §3.2 |
+| 4 | `recall({ mode })` — `'lexical'` (the default, unchanged) / `'semantic'` / `'hybrid'`, plus `lastRecall()` for the fallback and usage diagnosis | §3.3, §3.6 |
+
+The embedder contract itself — the shape the host implements and injects:
+
+```ts
+/** The host-injected embedder (v1.3). The plugin only calls it; it does not care what is behind it. */
+export interface Embedder {
+  /** Non-empty identifier, for stats and diagnostics (e.g. 'local-minilm' / 'openai:text-embedding-3-small'). */
+  id: string
+  /** Vector dimension (optional): when given it is used for a fast check instead of a full compare. */
+  dimensions?: number
+  /** Batch embed: N texts in, N vectors out (same length, same order). */
+  embed(texts: readonly string[]): Promise<readonly (readonly number[])[]>
+}
+```
+
+Four configuration keys (`MemoryConfig`, defaults from `DEFAULTS` in `src/lib.ts`; they reach the plugin through
+the same config doors as every other key — patch row or plugin config row — and do not change the meaning of any
+existing key):
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `embedderRecallMode` | `'off' \| 'recall'` | `'off'` | whether per-turn recall may rank with hybrid scoring (requires a registered embedder) |
+| `embedderWeight` | number | `0.5` | semantic weight in hybrid mode (0…1; an invalid value falls back to the default) |
+| `embedderTimeoutMs` | number | `200` | timeout for one embedding call |
+| `embedderCacheMax` | number | `2000` | vector cache capacity (LRU; `0` = no cache) |
+
+The five rules this addition is not allowed to break (the frozen contract's §0, restated here without weakening):
+
+1. **The plugin never calls a network or a model itself.** It only calls the injected `embed` function; whether
+   memory text is sent to an external service is the **host's / user's** decision, and this document says so to the
+   user.
+2. **With no embedder injected, everything is byte for byte 0.5.19** — injection paths, recall ordering and the
+   stats lines included.
+3. **No one gets it by default:** `embedderRecallMode` defaults to `'off'`; hybrid scoring happens only when the
+   host explicitly turns it on **and** an embedder is really registered.
+4. **Failures never bubble:** an embedder that throws / rejects / times out / returns a wrong shape or mismatched
+   dimensions is recorded as an error and **falls back to lexical** — never thrown into the turn, never corrupting
+   a record. No embedding failure may ever lose a memory or fail a turn.
+5. **Never pretend:** `recall({ mode: 'semantic' })` without an embedder returns a lexical result and says so in
+   `lastRecall()` (`fallback: 'no-embedder'`) instead of letting the caller believe semantic scoring happened.
+
+> **Privacy.** The plugin **itself never goes online and never ships or runs a model of its own**; it only calls
+> the `embed` function the host injected. Whether memory text is sent to an external service, **where** it is sent,
+> and whether any of it is logged is **decided by the host and the user** — the plugin does not make that decision
+> and cannot make it on their behalf.
+
+Everything else in this document — §2's optionality, §4's data model and the three payload rules, §5's
+configuration surface, §6's example — is v1.0 / v1.1 / v1.2 material and unchanged by v1.3, and no earlier default
+moved: `list()` with no argument is still the raw view, and `stats().records` / `version` / `opened` / `writes`
+keep their meaning.

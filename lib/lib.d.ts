@@ -749,4 +749,47 @@ export interface AuditInput {
  * 空环必须给「本轮没有记录到被拒或入队的尝试」而不是空白；`--limit` 由宿主裁剪 `entries` 后传入。
  */
 export declare function formatAudit(input: AuditInput): string;
+/**
+ * 单位化（L2 归一化）：返回同长度的新数组，范数为 1。
+ *
+ *  · **零向量返回全 0 向量**（长度不变），调用方按 0 相似度处理 —— 不返回空数组，
+ *    空数组会被下游读成"维度为 0"而不是"方向未定义"；
+ *  · 含非有限数（`NaN` / `±Infinity`）⇒ **整条向量判为不可用**，同样返回同长度的全 0 向量：
+ *    绝不能把 `NaN` 当 0 继续算方向 —— 那会凭空造出一个"看起来合法"的语义分，
+ *    而正确的后继行为是 `cosineSimilarity(...)` 返回 `null` ⇒ 回落词面检索；
+ *  · 纯函数：不修改入参（`readonly number[]`）。
+ */
+export declare function normalizeVector(vector: readonly number[]): number[];
+/**
+ * 余弦相似度（范围 `[-1, 1]`）。**不可用时返回 `null`**，绝不抛错 —— 调用方据此判
+ * "语义这条腿不可用"并回落词面检索（契约 §0.4）。
+ *
+ * 返回 `null` 的情形：维度不等、任一含非有限数（`NaN` / `±Infinity`）、任一为空向量
+ * （范数 0，方向未定义）、输入不是数组、以及极少数算不出有限值的退化情形。
+ * 容忍未归一化的输入（内部自算范数），因此 `cosineSimilarity(normalizeVector(a), b)` 与
+ * `cosineSimilarity(a, b)` 同值。
+ */
+export declare function cosineSimilarity(a: readonly number[], b: readonly number[]): number | null;
+/**
+ * 混合打分：`(1 - w) * lexical + w * semantic`（契约 docs/embedder.md §3/§5）。
+ *
+ *  · 两个输入都 clamp 到 `0..1`（`NaN` 按 0）；
+ *  · `semantic === null`（嵌入不可用）⇒ **回落词面**：直接返回 clamp 后的 lexical，
+ *    哪怕 weight 是 1 —— 这是契约 §0.4「失败绝不冒泡」的落点；
+ *  · `weight` 非法（`NaN` / 越界 / 非数）⇒ 回落 `DEFAULTS.embedderWeight`（0.5）；
+ *  · `weight === 0` ＝ 纯词面，`weight === 1` ＝ 纯语义（两者都是合法值，不触发回落）。
+ */
+export declare function blendScores(lexical: number, semantic: number | null, weight: number): number;
+/**
+ * 向量缓存的键：记录**参与检索的文本**的内容指纹（正文 + subject + tags，口径与 `tokensOf` 一致）。
+ *
+ *  · 是纯**内容键**：`refs` / `branch` / `scope` / `kind` / `id` 都不参与 ——
+ *    它们不改变嵌入输入，因此**引用或分支变化不影响它**，缓存不会因此失效，
+ *    同一段文本在两条记录间也能共用同一个向量；
+ *  · 与 `recordHash` 的关系：同样复用既有的 `normalizeText` + `fnv1a`（**不新造哈希算法**），
+ *    但 `recordHash` 覆盖 `kind` / `scope` / `branch`（M12 起 branch 参与指纹），
+ *    拿它当向量键会让"仅分支不同"的同文本记录重复嵌入，所以这里不直接复用它；
+ *  · `emb1:` 前缀是键空间的版本位，便于将来换口径时整体失效。
+ */
+export declare function vectorKeyOf(record: MemoryRecord): string;
 //# sourceMappingURL=lib.d.ts.map

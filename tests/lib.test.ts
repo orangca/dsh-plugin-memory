@@ -38,6 +38,7 @@ import {
   WORK_OBSERVED_FOOTER,
   WORK_OBSERVED_HEADER,
   auditCounts,
+  blendScores,
   branchFromHeadContent,
   branchOf,
   buildSleepPlan,
@@ -47,6 +48,7 @@ import {
   composeGistText,
   composeSubjectSummary,
   containment,
+  cosineSimilarity,
   decideModelWrite,
   deriveOriginFromMessages,
   detectWorkspaceMarkers,
@@ -80,6 +82,7 @@ import {
   normalizeLanguage,
   normalizeRefs,
   normalizeText,
+  normalizeVector,
   normalizeWritePolicy,
   pendingQueueFull,
   pickMergeGroups,
@@ -106,6 +109,7 @@ import {
   tokenize,
   tokenizeForSearch,
   transcriptOf,
+  vectorKeyOf,
   withRef,
   workspaceKeyOf,
 } from '../lib/lib.js'
@@ -2999,5 +3003,171 @@ test('formatAudit：只读且确定——同输入两次结果一致，不改 en
   assert.equal(JSON.stringify(entries), entriesSnapshot, '不改审计事件')
   assert.equal(JSON.stringify(records), recordsSnapshot, '不改任何记录（审计只读）')
   assert.equal(cfg.auditMax, 50, '不改配置')
+})
+
+// ---------------------------------------------------------------------------
+// M18（协议 v1.3）：外接嵌入器的纯函数（契约 docs/embedder.md §5，验收 §6 的 lib 侧条目）
+// 插件**不自带模型、不联网**：这一节只验证向量算术与缓存键的确定性语义，
+// 以及"嵌入不可用 ⇒ 不抛、判 null、回落词面"这条不可妥协的路径。
+// ---------------------------------------------------------------------------
+
+test('DEFAULTS（M18/协议 v1.3）：嵌入器四项出厂默认——召回默认关闭、权重 0.5、超时 200、缓存 2000', () => {
+  // 默认 'off' 是契约 §0.3：不显式打开就绝不走混合打分（＝与 0.5.19 逐字节相同）。
+  assert.equal(DEFAULTS.embedderRecallMode, 'off')
+  assert.equal(DEFAULTS.embedderWeight, 0.5)
+  assert.equal(DEFAULTS.embedderTimeoutMs, 200)
+  assert.equal(DEFAULTS.embedderCacheMax, 2000)
+  // 类型/合法性护栏：这三个数是混合打分与缓存要直接吃的值。
+  assert.ok(Number.isFinite(DEFAULTS.embedderWeight) && DEFAULTS.embedderWeight >= 0 && DEFAULTS.embedderWeight <= 1)
+  assert.ok(Number.isFinite(DEFAULTS.embedderTimeoutMs) && DEFAULTS.embedderTimeoutMs > 0)
+  assert.ok(Number.isInteger(DEFAULTS.embedderCacheMax) && DEFAULTS.embedderCacheMax >= 0)
+})
+
+test('normalizeVector：单位化；零向量与含非有限数的向量都返回同长度全 0 向量（契约 §5）', () => {
+  assert.deepEqual(normalizeVector([3, 4]), [0.6, 0.8])
+  assert.deepEqual(normalizeVector([0, 3, 4]), [0, 0.6, 0.8])
+
+  // 零向量：返回**同长度**的全 0 向量，调用方按 0 相似度处理 —— 不能返回空数组
+  // （空数组在调用方看来是"维度 0"，而不是"方向未定义"）。
+  assert.deepEqual(normalizeVector([0, 0, 0]), [0, 0, 0])
+  assert.equal(normalizeVector([0, 0, 0]).length, 3, '零向量必须保持长度不变')
+  assert.deepEqual(normalizeVector([0]), [0])
+
+  // 空向量：原样返回空数组（长度仍不变：0）。
+  assert.deepEqual(normalizeVector([]), [])
+
+  // 非有限数 ⇒ **整条向量判为不可用**（同长度全 0）：绝不能把 NaN 当 0 继续算方向，
+  // 否则会凭空造出一个"看起来合法"的语义分。
+  assert.deepEqual(normalizeVector([Number.NaN, Number.POSITIVE_INFINITY, 3]), [0, 0, 0])
+  assert.deepEqual(normalizeVector([Number.NaN, Number.NEGATIVE_INFINITY]), [0, 0])
+  assert.deepEqual(normalizeVector([1, Number.NaN]), [0, 0], '一个 NaN 就足以让整条不可用')
+  assert.deepEqual(normalizeVector([3, Number.POSITIVE_INFINITY]), [0, 0])
+  // 归一化后的非有限向量仍是空向量 ⇒ 下游按不可用判定（回落词面），不会伪造出方向。
+  assert.equal(cosineSimilarity(normalizeVector([Number.NaN, 3]), [0, 1]), null)
+
+  // 单位长度（用 hypot 独立校核，不信任实现里的范数算法）。
+  const unit = normalizeVector([1, 2, 2])
+  assert.ok(Math.abs(Math.hypot(...unit) - 1) < 1e-12, `范数应为 1，实际 ${Math.hypot(...unit)}`)
+
+  // 纯函数：不改入参；每次返回**新数组**（调用方可能就地改，缓存不得被连带污染）。
+  const input = [1, 2, 2]
+  const snapshot = [...input]
+  const first = normalizeVector(input)
+  assert.deepEqual(input, snapshot, '不得修改入参')
+  assert.notEqual(normalizeVector(input), first, '每次返回新数组')
+  assert.deepEqual(normalizeVector(input), first, '同输入两次结果一致')
+})
+
+test('cosineSimilarity：同向/正交/反向可算；维度不等、NaN、空/零向量一律 null 且不抛（契约 §5）', () => {
+  assert.equal(cosineSimilarity([1, 0], [1, 0]), 1, '同向 ⇒ 1')
+  assert.equal(cosineSimilarity([3, 4], [6, 8]), 1, '同向（不同长度）⇒ 1')
+  assert.equal(cosineSimilarity([1, 0], [0, 1]), 0, '正交 ⇒ 0')
+  assert.equal(cosineSimilarity([1, 0], [-1, 0]), -1, '反向 ⇒ -1')
+  assert.ok(Math.abs((cosineSimilarity([1, 0], [1, 1]) as number) - Math.SQRT1_2) < 1e-12, '45° ⇒ √2/2')
+  assert.equal(cosineSimilarity([1, 0], [0, 1]), cosineSimilarity([0, 1], [1, 0]), '对称')
+
+  // 未归一化与已归一化必须同值（内部自算范数，调用方不必先 normalizeVector）。
+  assert.equal(cosineSimilarity([3, 4], [6, 8]), cosineSimilarity(normalizeVector([3, 4]), normalizeVector([6, 8])))
+  assert.equal(cosineSimilarity([3, 4], [0.6, 0.8]), cosineSimilarity(normalizeVector([3, 4]), [0.6, 0.8]))
+
+  // —— 不可用：一律 null，**绝不抛**（调用方据此回落词面检索，契约 §0.4）
+  assert.equal(cosineSimilarity([1, 0], [1, 0, 0]), null, '维度不等 ⇒ null')
+  assert.equal(cosineSimilarity([1, 0, 0], [1, 0]), null, '维度不等（另一侧更长）⇒ null')
+  assert.equal(cosineSimilarity([1, Number.NaN], [1, 0]), null, '含 NaN ⇒ null')
+  assert.equal(cosineSimilarity([1, 0], [Number.POSITIVE_INFINITY, 1]), null, '含 Infinity ⇒ null')
+  assert.equal(cosineSimilarity([0, 0], [1, 1]), null, '任一为空向量 ⇒ null（零向量没有方向）')
+  assert.equal(cosineSimilarity([0, 0], [0, 0]), null, '两个零向量 ⇒ 同样不可用')
+  assert.equal(cosineSimilarity([], []), null, '都是空向量 ⇒ null（不能读成"完全相似"）')
+  assert.equal(cosineSimilarity([], [1]), null, '一侧为空 ⇒ null')
+
+  // 运行期垃圾输入（宿主可能传错形状）：不抛，返回 null。
+  assert.equal(cosineSimilarity(null as unknown as number[], [1]), null)
+  assert.equal(cosineSimilarity([1], 'x' as unknown as number[]), null)
+})
+
+test('blendScores：权重 0/1＝纯词面/纯语义；两端 clamp；非法权重回落默认；semantic=null 回落词面（契约 §5）', () => {
+  assert.equal(blendScores(0.8, 0.2, 0), 0.8, 'w=0 ⇒ 纯词面')
+  assert.equal(blendScores(0.8, 0.2, 1), 0.2, 'w=1 ⇒ 纯语义')
+  assert.equal(blendScores(0.8, 0.2, 0.5), 0.5, 'w=0.5 ⇒ 各半')
+  assert.ok(Math.abs(blendScores(0.8, 0.2, 0.25) - 0.65) < 1e-12, 'w=0.25 ⇒ 0.65')
+
+  // 两个输入先 clamp 到 0..1（NaN 按 0，与既有 clamp01 一致）。
+  assert.equal(blendScores(2, 3, 0.5), 1)
+  assert.equal(blendScores(-1, -1, 0.5), 0)
+  assert.equal(blendScores(Number.NaN, 0.5, 0.5), 0.25, 'NaN 按 0 参与')
+  assert.equal(blendScores(1.7, null, 0), 1, '回落时也要 clamp')
+
+  // semantic 不可用（null）⇒ 回落 clamp 后的词面，**哪怕 weight=1**（契约 §0.4：失败绝不冒泡）。
+  assert.equal(blendScores(0.8, null, 1), 0.8)
+  assert.equal(blendScores(0.8, null, 0.5), 0.8)
+  assert.equal(blendScores(0.8, null, 0), 0.8)
+
+  // 非法权重（NaN / 越界 / 非数）⇒ 回落 DEFAULTS.embedderWeight（0.5）。
+  const badWeights = [Number.NaN, -0.1, 1.1, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, undefined, null] as unknown as number[]
+  for (const bad of badWeights) {
+    assert.equal(blendScores(0.8, 0.2, bad), 0.5, `非法权重 ${String(bad)} 应回落默认 ${DEFAULTS.embedderWeight}`)
+  }
+
+  // 结果恒在 0..1（下游要用它做排序与阈值比较）。
+  for (const [lexical, semantic, weight] of [[0.3, 0.9, 0.7], [1, 1, 1], [0, 0, 0], [5, -5, 0.5]] as const) {
+    const blended = blendScores(lexical, semantic, weight)
+    assert.ok(blended >= 0 && blended <= 1, `混合分必须落在 0..1，实际 ${blended}`)
+  }
+})
+
+test('vectorKeyOf：同内容同键、不同内容不同键；引用/分支变化不影响它（契约 §5）', () => {
+  const base = makeRecord({ kind: 'semantic', text: '构建脚本用 pnpm', subject: 'project.build', tags: ['build'] })
+
+  // —— 同内容 ⇒ 同键（确定性：同一条记录、以及两条独立记录，只要参与检索的文本相同就共用一个向量）
+  assert.equal(vectorKeyOf(base), vectorKeyOf(base), '同输入两次调用结果一致')
+  assert.equal(vectorKeyOf(base), vectorKeyOf({ ...base }))
+  assert.equal(
+    vectorKeyOf(base),
+    vectorKeyOf(makeRecord({ kind: 'semantic', text: '构建脚本用 pnpm', subject: 'project.build', tags: ['build'] })),
+  )
+
+  // —— 不同内容 ⇒ 不同键
+  assert.notEqual(vectorKeyOf(base), vectorKeyOf(makeRecord({ kind: 'semantic', text: '发布脚本用 pnpm', subject: 'project.build', tags: ['build'] })))
+  assert.notEqual(
+    vectorKeyOf(base),
+    vectorKeyOf(makeRecord({ kind: 'semantic', text: '构建脚本用 pnpm', subject: 'project.release', tags: ['build'] })),
+    'subject 参与检索文本 ⇒ 必须进键',
+  )
+  assert.notEqual(
+    vectorKeyOf(base),
+    vectorKeyOf(makeRecord({ kind: 'semantic', text: '构建脚本用 pnpm', subject: 'project.build', tags: ['release'] })),
+    'tags 参与检索文本 ⇒ 必须进键',
+  )
+
+  // —— 归一化口径复用既有 normalizeText（不新造算法）：大小写/全角/尾部标点不改变内容键
+  assert.equal(
+    vectorKeyOf(makeRecord({ kind: 'semantic', text: '构建脚本用 PNPM！' })),
+    vectorKeyOf(makeRecord({ kind: 'semantic', text: '构建脚本用 pnpm' })),
+  )
+  assert.equal(
+    vectorKeyOf(makeRecord({ kind: 'semantic', text: '  构建 脚本  用 pnpm。 ' })),
+    vectorKeyOf(makeRecord({ kind: 'semantic', text: '构建 脚本 用 pnpm' })),
+  )
+
+  // —— refs：不影响向量键（缓存不得因为"来源引用变了"失效）；它本来也不进 recordHash。
+  const withRefs = { ...base, refs: [{ sessionId: 'ses-1', from: 1, to: 9, via: 'tool' } as MemoryRef] }
+  assert.equal(vectorKeyOf(withRefs), vectorKeyOf(base), 'refs 不参与向量键')
+  assert.equal(recordHash(withRefs), recordHash(base), 'refs 也不参与 recordHash（M9 契约）')
+
+  // —— branch：不影响向量键（嵌入只看文本），但它**确实**参与 recordHash
+  //    ⇒ 这正是向量键不能直接复用 recordHash 的原因（M12 起 branch 进指纹）。
+  const onBranch = { ...base, branch: 'feature/x' }
+  assert.equal(vectorKeyOf(onBranch), vectorKeyOf(base), 'branch 不参与向量键')
+  assert.notEqual(recordHash(onBranch), recordHash(base), 'branch 参与 recordHash：两者口径不同')
+
+  // —— kind / scope / id 同样不改变嵌入输入，因此不进键（只有内容进键）。
+  assert.equal(vectorKeyOf({ ...base, kind: 'procedural' }), vectorKeyOf(base))
+  assert.equal(vectorKeyOf({ ...base, scope: { level: 'profile', key: 'other' } }), vectorKeyOf(base))
+  assert.equal(vectorKeyOf({ ...base, id: 'm_other' }), vectorKeyOf(base))
+
+  // —— 键是稳定字符串（可做 Map 键），且与 recordHash 的键空间不冲突。
+  assert.equal(typeof vectorKeyOf(base), 'string')
+  assert.ok(vectorKeyOf(base).length > 0)
+  assert.notEqual(vectorKeyOf(base), recordHash(base), '向量键与内容指纹是两套口径，不得混用')
 })
 

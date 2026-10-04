@@ -5,7 +5,9 @@ explainable and deletable.
 
 [中文说明](README.zh.md) | English
 
-- **Local** — all data lives under `$DSH_HOME/storages/<domainName>/`. No network calls, no embedding service.
+- **Local** — all data lives under `$DSH_HOME/storages/<domainName>/`. No network calls, and no embedding service of its own:
+  retrieval is lexical by default, and the optional external embedder described below is something **the host**
+  injects (see [External embedder (optional)](#external-embedder-host-injected-and-off-by-default)).
 - **Automatic** — at turn end a rule engine extracts what is worth remembering from *real user messages only*,
   with zero extra model calls.
 - **Budgeted** — every injection has a hard token cap; overflow is truncated by priority.
@@ -38,6 +40,9 @@ explainable and deletable.
    contradictions invalid (recoverable), decays/archives by per-kind half-life, and summarizes subjects that
    accumulate too many rows. A separate cross-session pass, `/sleep`, is triggered explicitly by the user (see
    below).
+4. **Score (optional)** — the host may inject an `embed` function into the service surface (§3.6 of the protocol).
+   That is what makes `recall({ mode })` able to rank by embedding similarity, and it is **off by default**; see
+   [External embedder (optional)](#external-embedder-host-injected-and-off-by-default).
 
 ## The self-portrait: persona + work tendencies
 
@@ -271,6 +276,59 @@ that holds only on `feat/x` should not keep steering the model after you switch 
 
 `branchAware` (default `true`) appears in the settings form as a `0` / `1` toggle.
 
+## External embedder (optional): host-injected, and off by default
+
+The plugin **does not ship a model and does not go online**. Semantic ranking is possible only because the host may
+**inject an `embed` function** into the service surface (protocol v1.3, `ctx.memory.setEmbedder`, contract
+`docs/embedder.md`, protocol §3.6/§11). With nothing injected, retrieval is the same lexical path as 0.5.19 —
+**byte for byte, and with zero embedding calls**.
+
+Registering one (host-side code, e.g. another plugin's `apply()` or a small adapter):
+
+```ts
+/** A host-side embedder: the plugin only calls this function; it never calls the network itself. */
+const embedder = {
+  id: 'local-minilm',                                     // non-empty; shown in stats and diagnostics
+  dimensions: 384,                                        // optional: enables a fast check
+  async embed(texts: readonly string[]): Promise<number[][]> { return await myLocalModel(texts) },
+}
+
+const memory = ctx.get('memory') as {
+  setEmbedder?: (embedder: typeof embedder | null) => { ok: boolean; id?: string | null; error?: string }
+} | undefined
+if (memory?.setEmbedder) {                                 // absent on a '1.2' service — feature-detect first
+  const result = memory.setEmbedder(embedder)
+  if (!result.ok) console.warn('embedder rejected:', result.error)
+}
+```
+
+What changes once one is registered:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `embedderRecallMode` | `'off'` | whether **per-turn** recall ranks with hybrid scoring (needs a registered embedder; `'recall'` turns it on) |
+| `embedderWeight` | `0.5` | semantic weight in hybrid mode, `score = (1 - w) * lexical + w * semantic` (0…1; an invalid value falls back to the default) |
+| `embedderTimeoutMs` | `200` | timeout for one embedding call; a timeout counts as a failure and falls back to lexical |
+| `embedderCacheMax` | `2000` | vector cache capacity (LRU; `0` = no cache) |
+
+- **Off by default, and quiet about it.** The four keys are all patch-row (advanced tuning); `'off'` means per-turn
+  recall never looks at the embedder, so upgrade behaviour is identical to 0.5.19. `recall({ mode: 'lexical' })`,
+  which is the default, also makes **zero** embedding calls and returns exactly what 0.5.19 returned.
+- **Explicit modes.** `recall({ mode: 'semantic' })` orders by embedding similarity; `'hybrid'` blends lexical and
+  semantic with `embedderWeight`. `capabilities()` answers "is an embedder registered" and `stats().embedder` shows
+  `calls` / `errors` / `hits` / `misses` / `timeouts` — check rather than guess.
+- **A failure falls back to lexical, and `lastRecall()` says so.** An embedder that throws, rejects, times out or
+  returns a wrong shape or mismatched dimensions is counted as an error and the call falls back to lexical scoring:
+  the recall never rejects, no memory is lost and no turn fails. `lastRecall()` reports the requested `mode`,
+  whether the embedder was actually used (`used`), the fallback reason (`'no-embedder'` / `'embed-error'` /
+  `'timeout'` / `null`) and how many candidates and vectors were involved — so you are never told "semantic" when
+  what you got was lexical.
+- **The plugin is not the one making the privacy call.** The plugin **itself never goes online and never ships or
+  runs a model of its own**; it only calls the `embed` function the host injected. Whether memory text is sent to an
+  external service, **where** it is sent, and whether any of it is logged is **decided by the host and the user** —
+  the plugin does not make that decision and cannot make it on their behalf. If you do not inject an embedder,
+  nothing is sent anywhere.
+
 ## `/memory audit`: write audit and injection verification
 
 Not every write leaves a row behind: a **rejected** write leaves nothing at all, so "why is this not in memory?" had
@@ -476,6 +534,10 @@ per-session character budget `sleepMaxCharsPerSession` 120000, total character b
 300000, assistant texts kept ahead of each user message `sleepAssistantContext` 3 (used for echo detection), and
 the maximum number of project gists recomputed `sleepMaxGists` 8.
 
+The optional external embedder's four keys (`embedderRecallMode` `off`, `embedderWeight` 0.5,
+`embedderTimeoutMs` 200, `embedderCacheMax` 2000) are also patch-row only, and are described in
+[External embedder (optional)](#external-embedder-host-injected-and-off-by-default).
+
 ## Data and privacy
 
 ```
@@ -486,7 +548,10 @@ $DSH_HOME/storages/dsh_memory/
 
 - The storage root is **home-level**: every profile on the machine shares one store by default, which is usually
   what you want for personal memory.
-- Nothing leaves the machine. There is no telemetry, no embedding service and no history upload.
+- Nothing leaves the machine. There is no telemetry, and no embedding service of its own: retrieval is lexical
+  unless **you** inject an external embedder through `ctx.memory.setEmbedder`, and that is optional, off by
+  default and entirely the host's decision to make (see
+  [External embedder (optional)](#external-embedder-host-injected-and-off-by-default)).
 - Sensitive content is rejected before it reaches a file; PII is masked. Both behaviours are covered by tests.
 - DSH does not migrate domain versions automatically: bumping `version` requires declaring `compatibleVersions`.
 
@@ -550,8 +615,10 @@ plugin is built on — written for plugin authors, with no environment-specific 
   `compaction/summary`; a profile without a mounted compaction plugin simply never produces them.
 - **Full-text session search is usually unavailable** — the session query index ships as `openAt: never`, so the
   plugin keeps its own lexical index and only uses exact reads for history back-references.
-- **Retrieval is lexical** — CJK bigrams plus Latin stemming and memory-side coverage. Paraphrase-level recall
-  needs vector retrieval and is future work.
+- **Retrieval is lexical by default** — CJK bigrams plus Latin stemming and memory-side coverage. Vector retrieval
+  is an **opt-in**: inject an `embed` function through the service surface and per-turn recall can rank with hybrid
+  scoring ([External embedder (optional)](#external-embedder-host-injected-and-off-by-default)). The plugin still
+  ships no model and calls no network itself, and with nothing injected recall stays lexical.
 - **No graphical memory browser.** The GUI exposes configuration only; browsing, deleting and pinning memories go
   through the `/memory` commands listed above and the 7 tools.
 - **Two design items are explicit degradations**: (1) the self-portrait is not de-duplicated against the

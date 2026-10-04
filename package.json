@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-memory",
-  "version": "0.5.19",
+  "version": "0.5.20",
   "type": "module",
   "packageManager": "pnpm@11.7.0",
   "description": "Personalized long-term memory for DSH (DeepSeek Harness): local-first, rule-based capture, dual-channel injection, explainable and deletable. 个性化长期记忆插件：本地优先、自动捕获、双通道注入、可解释可删除。",
