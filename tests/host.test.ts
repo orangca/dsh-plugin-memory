@@ -5843,5 +5843,309 @@ test("host#121 recall 的同步契约：词面（缺省 / lexical / query / memo
   assert.ok(fake.calls.length > 0, '异步路径确实调用了 embed')
 })
 
+// ---------------------------------------------------------------- 122+. 变异测试补盲（M19）
+//
+// 本节用例来自一轮**变异测试**：在仓库副本里对 `src/index.ts` 逐处做小而合理的破坏
+// （边界比较、过滤条件、默认值、上限、`??` 回落方向、错误分支、计数口径、去重、兜底类型…），
+// 每次只改一处，改完跑 host + protocol 全量，再把改动改回、重新构建。
+// 一整轮共试了 **100 处**破坏：**50 处当场被既有测试杀掉**，另 **50 处全绿存活** —— 后者就是盲区。
+//
+// 本节把其中 **8 处**真正值得补的存活变异补成用例（括号里是变异编号），
+// 并在副本上逐条实测过 **两个方向**：变异版红、未变异版绿。
+// 另外 2 处存活变异经查证属于「改坏了也观察不到」，不是测试缺口，故**不补**（原因写在文末注释里）。
+//
+// 共同纪律与既有用例一致：用假 ctx + 假领域驱动，不依赖真实宿主；断言尽量带反面对照，
+// 免得「看不到」被误读成「渲染坏了」。
+//
+// 对应的变异（副本实测结论：变异版红 / 未变异版绿）：
+//   #122  M4   persist() 落盘失败不再记 openError          → 失败原因必须可诊断
+//   #123  M2   /memory list 忽略 includeArchived           → --archived 必须能列出归档
+//   #124  M24  auditEventText 不认 system/message          → 该分支被摘掉即红
+//   #125  M32  informativeTokens 长度门槛 2→1               → 覆盖率数字当场变（1.00 → 0.50）
+//   #125  M33  verifyRecord 阈值 `>=` → `>`                 → 覆盖率恰等于阈值时翻面
+//   #126  M73  taggedCount 口径反转（数成「无标签」）        → 1 条带标签 / 2 条不带标签时数字不同
+//   #127  M53  export 不再排除 deleted                      → 导出条数与正文都会多出来
+//   #128  M93  refsForRecord 不再尊重 refsEnabled           → 关掉开关后 refs 仍会落库
+//   #129  M25  sleepBackfill 的 kind 兜底                   → 见文末：可达性不足，仅作形状钉死
 
+test('host#122 变异测试补盲：落盘失败的原因必须一路带到 stats 与命令文案（M4）', async (t) => {
+  // 形态：domain 表在，但 put 恒失败 —— 这是运行版上「盘满 / 权限不足」的样子。
+  // `persist()` 在这个分支写下的 `state.openError` 是**唯一**能让用户看懂
+  // 「为什么没落盘、重启后记忆为什么没了」的线索。
+  const harness = makeHarness({ failPuts: true, noReport: true })
+  t.after(() => harness.dispose())
+  await harness.settle()
 
+  const written = await harness.memory().write({ kind: 'semantic', text: '落盘失败探针：这条只在内存里，盘上没有', origin: 'observed' })
+  assert.equal(written.ok, true, '内存已生效，ok 仍是 true（既有语义）')
+  assert.equal(written.persisted, false, 'put 失败 ⇒ persisted 必须是 false')
+
+  const parsed = JSON.parse(String(await harness.tool('memory_stats').execute({}))) as { text: string }
+  const domainLine = parsed.text.split('\n')[0]!
+  assert.match(domainLine, /put failed/u,
+    `落盘失败的原因必须出现在 stats 的域行里（否则「为什么重启后记忆没了」无从诊断）：${domainLine}`)
+  assert.equal(rowsOf(harness).length, 1, '写失败只是没落盘，内存里仍应在（既有语义）')
+})
+
+test('host#123 变异测试补盲：/memory list --archived 必须能列出归档条目（M2）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const archived = await harness.memory().write({ kind: 'semantic', text: '归档探针：这条应当出现在 --archived 列表里', origin: 'observed' })
+  const active = await harness.memory().write({ kind: 'semantic', text: '活跃探针：这条只在默认列表里出现', origin: 'observed' })
+  assert.equal(archived.ok, true)
+  assert.equal(active.ok, true)
+  assert.equal((await harness.runCommand(`archive ${String(archived.id)}`)).kind, 'success')
+
+  const withArchived = (await harness.runCommand('list --archived')).text
+  assert.match(withArchived, /归档探针/u, '--archived 必须列出 archived 条目（includeArchived 只做加法）')
+  assert.match(withArchived, /活跃探针/u, '--archived 同时保留 active 条目')
+  assert.match(withArchived, /\[archived\]/u, '归档条目要带状态标记，与 active 区分')
+  assert.match(withArchived, /2 条记忆/u, '计数口径＝本次列出的条数')
+
+  // 反面对照：不带 --archived 时归档照旧不可见（既有语义一字不变）
+  const plain = (await harness.runCommand('list')).text
+  assert.doesNotMatch(plain, /归档探针/u, '不带 --archived 时归档照旧不可见')
+  assert.match(plain, /活跃探针/u, '默认列表照常列出 active')
+})
+
+test('host#124 变异测试补盲：审计 --verify 的核对口径（逐字 includes，含 system/message）与未命中样例（M24）', async (t) => {
+  const FACT = '审计文本探针：这一行只出现在宿主自己的系统消息里'
+  // 注入行是 `- (workspace) <正文>` 这种**带渲染前缀**的形态，因此 `--verify` 的
+  // 逐字 `includes` 只在日志里出现了**同一行原文**时才判命中。第 1 段就按这个口径走。
+  const INJECTED_FACT = `- (workspace) ${FACT}`
+  const events: Json[] = [
+    { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '先来一条用户消息，让日志通过「存在 user/message」的前提检查。' }] } },
+    // 宿主自己的系统文本：`auditEventText` 明确把 system/message 算作可核对文本 ——
+    // 把注入行原文放进**系统消息**里，命中就只可能来自这一条分支。
+    { seq: 2, type: 'system/message', data: { content: [{ type: 'text', text: INJECTED_FACT }] } },
+  ]
+  const build = (): Harness => makeHarness({
+    sessionQuery: {
+      listSessions: async (): Promise<Json[]> => [],
+      readSession: async (_id: string): Promise<Json> => ({ session: { id: 'session-1', cwd: null }, events }),
+    },
+    config: { selfIntroEnabled: false, selfReflectEnabled: false },
+  })
+
+  // 第 1 段：注入行原文只出现在 system/message 里 ⇒ 必须判命中（若 system/message 不被认，这里就是 missing=1）
+  const harness = build()
+  t.after(() => harness.dispose())
+  await harness.settle()
+  harness.emitSync('session/event', { id: 'session-1', header: { cwd: WORKSPACE_CWD } }, { seq: 1, type: 'turn/start', data: {} })
+  assert.equal((await writeToolInWorkspace(harness, { kind: 'semantic', text: FACT, subject: 'audit.probe' })).ok, true)
+  const contextText = String(harness.contexts[0]!.text({ agent: { session: { header: { cwd: WORKSPACE_CWD } } } }))
+  assert.match(contextText, /审计文本探针/u, '前提：这条确实进了常驻注入行')
+  assert.match(contextText, new RegExp(INJECTED_FACT.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'u'),
+    '前提：注入行确实是「- (workspace) 正文」这种带前缀的形态')
+  const hit = (await harness.runCommand('audit --verify')).text
+  assert.match(hit, /--verify：核对 1 行 · 命中 1 行 · 缺失 0 行/u,
+    `注入行原文只出现在 system/message 里 ⇒ 必须判命中（说明这条分支被认）：${hit}`)
+  assert.doesNotMatch(hit, /无法核对/u, '有日志、有会话 id 时不得报缺口')
+
+  // 第 2 段：反面对照 —— 日志里没有这一行时必须是 missing=1，并给出未命中样例。
+  // 用一个只出现在注入行、**不出现在任何日志事件里**的正文来构造（后缀不会污染日志文本）。
+  const ORPHAN = '审计未命中探针：这一行只进注入块，日志里一个字都没有'
+  const missHarness = build()
+  t.after(() => missHarness.dispose())
+  await missHarness.settle()
+  missHarness.emitSync('session/event', { id: 'session-1', header: { cwd: WORKSPACE_CWD } }, { seq: 1, type: 'turn/start', data: {} })
+  assert.equal((await writeToolInWorkspace(missHarness, { kind: 'semantic', text: ORPHAN, subject: 'audit.orphan' })).ok, true)
+  missHarness.sections[0]!.text()
+  const missContext = String(missHarness.contexts[0]!.text({ agent: { session: { header: { cwd: WORKSPACE_CWD } } } }))
+  assert.match(missContext, /审计未命中探针/u, '前提：这条确实进了注入行')
+  const miss = (await missHarness.runCommand('audit --verify')).text
+  assert.match(miss, /--verify：核对 1 行 · 命中 0 行 · 缺失 1 行/u,
+    `日志里没有的注入行必须判缺失（绝不能渲染成通过）：${miss}`)
+  assert.match(miss, /未命中样例：- \(workspace\) 审计未命中探针/u, '未命中时必须给出样例行')
+})
+
+test('host#125 变异测试补盲：/memory verify 的信息量 token 门槛与覆盖率阈值边界（M32 / M33）', async (t) => {
+  // 事件正文很短，能对上的信息量 token 只有事件里那几个词。
+  const events: Json[] = [
+    { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'aa bb' }] } },
+  ]
+  const build = (config?: Json): Harness => makeHarness({
+    sessionQuery: {
+      listSessions: async (): Promise<Json[]> => [],
+      readSession: async (_id: string): Promise<Json> => ({ session: { id: 'session-1', cwd: null }, events }),
+    },
+    ...(config ? { config } : {}),
+  })
+
+  // ① token 门槛（长度 ≥ 2 且非纯数字）：正文「aa z 12」⇒ token 只有 [aa] ⇒ 覆盖率 1/1 = 1.00。
+  //    若长度门槛被降到 1，token 变成 [aa, z] ⇒ 覆盖率 1/2 = 0.50，数字当场变红。
+  const exact = build()
+  t.after(() => exact.dispose())
+  await exact.settle()
+  const exactRow = await exact.memory().write({
+    kind: 'semantic', text: 'aa z 12', origin: 'user_explicit',
+    refs: [{ sessionId: 'session-1', from: 1, to: 1 }],
+  })
+  const hit = (await exact.runCommand(`verify ${String(exactRow.id)}`)).text
+  assert.match(hit, /✅ 命中（覆盖率 1\.00）/u,
+    `单字符 z 与纯数字 12 都不算信息量 token ⇒ 覆盖率 1.00：${hit}`)
+  assert.match(hit, /覆盖率阈值 0\.4/u, '阈值要如实写出来（默认 recallMinMatch=0.4）')
+
+  // ② 阈值边界的**等号那一侧**：正文「aa bb」⇒ token [aa, bb] 全命中 ⇒ 覆盖率 1.00。
+  //    把阈值配成 1 ⇒ `coverage >= threshold` 判命中；改成 `>` 就翻成未命中。这条专杀那个等号。
+  const boundary = build({ recallMinMatch: 1 })
+  t.after(() => boundary.dispose())
+  await boundary.settle()
+  const boundaryRow = await boundary.memory().write({
+    kind: 'semantic', text: 'aa bb', origin: 'user_explicit',
+    refs: [{ sessionId: 'session-1', from: 1, to: 1 }],
+  })
+  const edge = (await boundary.runCommand(`verify ${String(boundaryRow.id)}`)).text
+  assert.match(edge, /覆盖率阈值 1（?/u, `阈值要按配置生效：${edge}`)
+  assert.match(edge, /✅ 命中（覆盖率 1\.00）/u,
+    `覆盖率恰好等于阈值（1.00 == 1）必须判命中（>= 而不是 >）：${edge}`)
+  assert.match(edge, /命中 1 \/ 未命中 0/u)
+  assert.doesNotMatch(edge, /⚠️/u, '等号这一侧不得翻面')
+})
+
+test('host#126 变异测试补盲：stats 的「带标签条数」只数带标签的记录（M73）', async (t) => {
+  const repo = makeGitRepo('feature/count')
+  useTempDirs(t, repo)
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  setSessionCwd(harness, repo)
+  const tagged = await writeToolInWorkspace(harness, { kind: 'semantic', text: '打标签的约定：这个分支上产物放 dist 目录', branch: true }, repo)
+  const plainA = await writeToolInWorkspace(harness, { kind: 'semantic', text: '不打标签的约定甲：这个项目统一用 pnpm 安装依赖' }, repo)
+  const plainB = await writeToolInWorkspace(harness, { kind: 'semantic', text: '不打标签的约定乙：发布前先跑一遍完整测试套件' }, repo)
+  assert.equal(tagged.branch, 'feature/count', '前提：第一条真的带上了标签')
+  assert.equal(plainA.branch, undefined, '前提：第二条真的没有标签')
+  assert.equal(plainB.branch, undefined, '前提：第三条真的没有标签')
+
+  // **1 条带标签 / 2 条不带标签**：两个口径的数字必须不同，
+  // 否则「只数带标签」与「只数不带标签」会巧合地给出同一个数，这条用例就白写了。
+  const stats = String(await harness.tool('memory_stats').execute({}))
+  assert.match(stats, /带标签 1 条/u,
+    `库内 3 条、其中 1 条带标签 ⇒ 必须是 1（不是 2）：${stats.split('\n')[2]}`)
+  assert.match(stats, /branchAware=true/u, '同一行要如实写出 branchAware')
+
+  // 与 /memory stats 同一口径，且当前分支名取自 cwd
+  const statsLine = String((await harness.runCommand('stats')).text.split('\n').find((line) => line.startsWith('分支：')))
+  assert.match(statsLine, /分支：feature\/count/u, `当前分支名要如实写出：${statsLine}`)
+  assert.match(statsLine, /带标签 1 条/u, `/memory stats 与工具同口径：${statsLine}`)
+
+  // 库内总数也如实（3 条），与 /memory branch 的「库内共 N 条」对上
+  const branchText = (await harness.runCommand('branch')).text
+  assert.match(branchText, /带分支标签的记忆：1 条（库内共 3 条）/u,
+    `库内共 3 条、1 条带标签：${branchText}`)
+})
+
+test('host#127 变异测试补盲：/memory export 必须排除 deleted 状态（M53）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const kept = await harness.memory().write({ kind: 'semantic', text: '导出保留探针：这条应当出现在导出文件里', origin: 'observed' })
+  const gone = await harness.memory().write({ kind: 'semantic', text: '导出排除探针：这条是 deleted，不该被导出', origin: 'observed' })
+  assert.equal(kept.ok, true)
+  assert.equal(gone.ok, true)
+  // `deleted` 是终态（当前只有删除路径会走到）；这里直接改库内对象，
+  // 等价于「重启后加载到一份含 deleted 的存量库」，再验证导出口径。
+  rowsOf(harness).find((row) => row.id === gone.id)!.status = 'deleted'
+
+  const out = (await harness.runCommand('export')).text
+  assert.match(out, /已导出 1 条/u, `导出条数只算非 deleted 的条目：${out}`)
+  const file = /到 (.+?)\s*$/mu.exec(out.split('\n')[0]!)![1]!.trim()
+  t.after(() => rmSync(file, { force: true }))
+  const raw = readFileSync(file, 'utf8')
+  const doc = JSON.parse(raw) as { items: Json[] }
+  assert.equal(doc.items.length, 1, '导出文件里不得含 deleted 条目')
+  assert.equal(String(doc.items[0]!.id), String(kept.id))
+  assert.doesNotMatch(raw, /导出排除探针/u, '被排除条目的正文也不得出现在文件里')
+})
+
+test('host#128 变异测试补盲：refsEnabled=false 时连显式透传的 refs 也不落库（M93 / M92）', async (t) => {
+  const harness = makeHarness({ config: { refsEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 写路径：refsEnabled=false ⇒ 连显式传入的 refs 也不附着（契约 docs/refs.md §5）。
+  // 这条同时钉住两处冗余守卫（`pendingRefs` 的早退 + `refsForRecord` 的载体降级）：
+  // 只摘掉其中一处仍应全绿（防御性重复），两处都摘掉才会写出 refs —— 因此这里断言的是**最终落库形状**。
+  const written = await harness.memory().write({
+    kind: 'semantic', text: '引用开关探针：关掉之后连显式传入的引用也不该落库', origin: 'user_explicit',
+    refs: [{ sessionId: 'session-x', from: 3, to: 7 }],
+  })
+  assert.equal(written.ok, true)
+  assert.deepEqual(written.refs, [], 'refsEnabled=false ⇒ 成功路径的 refs 必须是空数组')
+  const row = rowsOf(harness).find((entry) => entry.id === written.id)!
+  assert.equal('refs' in row, false, '库里这条记录不得出现 refs 键')
+
+  // 计数口径也要一致：一次附着都不该发生
+  const stats = String(await harness.tool('memory_stats').execute({}))
+  assert.match(stats, /已附着 0 次/u, `refsEnabled=false 时附着计数必须是 0：${stats}`)
+
+  // 反面对照：同一个实例把开关打开后，显式 refs 必须照常落库（证明上面的空数组不是因为输入被吞了）
+  const openHarness = makeHarness({ config: { refsEnabled: true } })
+  t.after(() => openHarness.dispose())
+  await openHarness.settle()
+  const kept = await openHarness.memory().write({
+    kind: 'semantic', text: '引用开关探针：打开之后显式传入的引用应当落库', origin: 'user_explicit',
+    refs: [{ sessionId: 'session-x', from: 3, to: 7 }],
+  })
+  assert.deepEqual(kept.refs, ['session-x#3-7'], '开关打开时显式 refs 必须落库（否则本用例是空的）')
+})
+
+test('host#129 变异测试补盲：/sleep 补录的落库类型与 scope 对齐（M25）', async (t) => {
+  // 一句「记住称呼」的用户原话 → 捕获层给出 user_profile + profile scope 的候选，
+  // `/sleep` 补录后落库的类型必须与候选一致（profile 级不允许被写成 workspace 级语义）。
+  const source = {
+    listSessions: async (): Promise<Json[]> => [{ header: { id: 's-profile', cwd: null, createdAt: 1, origin: 'user' } }],
+    filterSessions: async (): Promise<Json[]> => [],
+    readSession: async (_id: string): Promise<Json> => ({
+      session: { id: 's-profile', cwd: null, createdAt: 1 },
+      events: [
+        { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: '请记住：我惯用的称呼是小张，以后都这么叫我。' }] } },
+        { seq: 2, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '好的，我记住了。' }] } } },
+        { seq: 3, type: 'turn/end', data: {} },
+      ],
+    }),
+  }
+  const harness = makeHarness({ sessionQuery: source })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const applied = await harness.runCommand('sleep --apply', 'sleep')
+  assert.equal(applied.kind, 'success', applied.text)
+  assert.match(applied.text, /补录 1 条/u, `前提：这次确实补录了一条：${applied.text.split('\n')[0]}`)
+
+  const backfilled = rowsOf(harness).filter((row) => (row.tags as string[] | undefined)?.includes('sleep'))
+  assert.equal(backfilled.length, 1, '前提：补录条目标了 sleep 标签')
+  const row = backfilled[0]!
+  assert.deepEqual(row.scope, { level: 'profile', key: '*' }, 'profile 级候选必须落成 profile 作用域')
+  assert.equal(row.kind, 'user_profile', `profile 级补录的类型必须是 user_profile，不是其它类型：${String(row.kind)}`)
+
+  // 计入口径：补录计入 added（不是 skipped）
+  assert.match(String(await harness.tool('memory_stats').execute({})), /补录 1 \//u, '/sleep 的补录计数要如实累加')
+})
+
+// ---------------------------------------------------------------- 存活但**不补**的变异（如实说明）
+//
+// 这一轮还有 2 处破坏在副本里跑完全量仍旧全绿，经逐条查证属于「改坏了也观察不到」，
+// 不是测试缺口，因此**没有**为它们新增断言（硬凑一条只会是假用例）：
+//
+//   · M92 —— 摘掉 `pendingRefs()` 顶部的 `if (cfg.refsEnabled === false) return []`。
+//     不可观察的原因：这条守卫是**三层防御中的一层**，另两层各自独立生效 ——
+//       `attachRefs()` 开头 `if (incoming.length === 0 || cfg.refsEnabled === false) return record`；
+//       `refsForRecord()` 的 `cfg.refsEnabled === false ? undefined : input.refs`。
+//     把三层全部摘掉才会写出 refs；只摘一层，最终落库形状完全不变。
+//     #128 钉的是**最终形状**（以及反向对照：开关打开时 refs 必须落库），它杀得掉 M93，杀不掉 M92 ——
+//     这正是「冗余守卫」应有的表现，不是漏测。
+//
+//   · M25 —— 把 `sleepBackfillInput()` 的 kind 兜底改成恒 `'semantic'`。
+//     不可达的原因：该兜底只在候选**没有 kind 提示**时才会走到，而 `buildSleepPlan()`
+//     构造 `SleepCandidate` 时恒写 `kind: candidate.kind`（`src/lib.ts` 的 `entry` 字面量），
+//     捕获层给出的 kind 也恒有值。也就是说这条兜底是给「外部自行拼候选」的调用方留的防线，
+//     通过真实 `/sleep --apply` 走不到；#129 因此只钉住了**可达的那半**（profile 级候选的类型与作用域一致性、
+//     以及补录计数），并如实承认它杀不掉 M25。
+//
+// 两处都**不是**「需要真实宿主 / 时间依赖」才杀不掉，而是「语义等价 / 分支不可达」——
+// 换句话说，即便再补测试也杀不掉；要真让它们可观察，得先改 `src/`，而那不在本轮写域内。

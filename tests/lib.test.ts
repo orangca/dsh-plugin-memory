@@ -51,6 +51,7 @@ import {
   cosineSimilarity,
   decideModelWrite,
   deriveOriginFromMessages,
+  deriveSubject,
   detectWorkspaceMarkers,
   effectiveImportance,
   estimateTokens,
@@ -58,6 +59,7 @@ import {
   extractCandidates,
   extractSummaryText,
   facetOf,
+  fillWithinBudget,
   findConflicts,
   fnv1a,
   formatAudit,
@@ -68,6 +70,7 @@ import {
   isBranchVisible,
   isEcho,
   isExcluded,
+  isSelfPortraitEligible,
   INTRO_NOTICE,
   lexicalMatch,
   listActive,
@@ -104,6 +107,7 @@ import {
   shouldReflect,
   similarity,
   sleepPlanIsEmpty,
+  splitSentences,
   stemToken,
   textsFor,
   tokenCacheSize,
@@ -3251,5 +3255,303 @@ test('vectorKeyOf：同内容同键、不同内容不同键；引用/分支变�
   assert.equal(typeof vectorKeyOf(base), 'string')
   assert.ok(vectorKeyOf(base).length > 0)
   assert.notEqual(vectorKeyOf(base), recordHash(base), '向量键与内容指纹是两套口径，不得混用')
+})
+
+// ---------------- 补盲：变异测试暴露的未覆盖边界 ----------------
+// 下面每一条都对应一个实测「改了源码仍全绿」的变异（在临时副本里对 src/lib.ts 逐个变异后跑全量）。
+// 断言一律钉住**具体值或具体边界**，不写成「不小于」这类宽松形式 —— 宽松断言杀不掉变异。
+// 覆盖的是四类容易漏测的点：边界比较（>= / >）、空值与非法的回落方向、上限与分母的封顶、
+// 缓存/指纹这类「拼接与分隔」的语义。
+
+test('workspaceKeyOf：空字符串与非法输入一律 null（空 cwd 不得算出一个工作区键）', () => {
+  // 空 cwd ＝ 「当前不在任何工作区」。此时若照样哈希，未知 cwd 的记录会共用同一个 scope.key，
+  // 于是不同项目里的记忆互相注入 —— 这是 workspace 隔离被静默拆掉的形态。
+  assert.equal(workspaceKeyOf(''), null)
+  assert.equal(workspaceKeyOf(null), null)
+  assert.equal(workspaceKeyOf(undefined), null)
+  assert.equal(workspaceKeyOf(42), null)
+  // 非空字符串（含仅空白）照常哈希，且同输入同键（确定性）。
+  assert.equal(typeof workspaceKeyOf('C:/proj/a'), 'string')
+  assert.equal(workspaceKeyOf('C:/proj/a'), workspaceKeyOf('C:/proj/a'))
+})
+
+test('tokenCacheKey：指纹为空串的记录不得共用分词缓存（空指纹必须退回内容键）', () => {
+  // 手工构造或迁移进来的记录可能没有 hash。此时缓存键要退回「正文|subject|tags」：
+  // 若仍把空指纹当有效键，两条内容完全不同的记录会共用一个键，先算出的分词被后一条读到，
+  // 召回命中率会整体错乱（而且是「有时对有时错」的形态，最难排查）。
+  clearTokenCache()
+  const left = { ...makeRecord({ kind: 'semantic', text: 'alpha beta' }), hash: '' }
+  const right = { ...makeRecord({ kind: 'semantic', text: 'gamma delta' }), hash: '' }
+  assert.equal(lexicalMatch(left, 'alpha beta'), 1)
+  assert.equal(lexicalMatch(right, 'alpha beta'), 0)
+  assert.equal(lexicalMatch(right, 'gamma delta'), 1)
+  clearTokenCache()
+})
+
+test('memoryMatch：纯数字命中不算「有信息量」的命中（默认 minHits=1 不得降为 0）', () => {
+  // 门槛的意义：纯数字与单字符 token 都不算有信息量，否则任意版本号/端口号/序号
+  // 就能让一条不相关的记忆命中（分母封顶本就宽，门槛是最后一道闸）。
+  const digits = makeRecord({ kind: 'semantic', text: '1234' })
+  assert.equal(memoryMatch(digits, '1234'), 0)
+  // 对照组：足够长的英文词照常命中。
+  const named = makeRecord({ kind: 'semantic', text: 'alpha' })
+  assert.equal(memoryMatch(named, 'alpha'), 1)
+})
+
+test('memoryMatch：单字符命中不算「有信息量」的命中（长度门槛 2 不得放宽到 1）', () => {
+  const single = makeRecord({ kind: 'semantic', text: 'a' })
+  assert.equal(memoryMatch(single, 'a'), 0)
+  // 显式写默认值 1 时口径一致；只有显式降到 0 才允许「命中即算」。
+  assert.equal(memoryMatch(single, 'a', { minHits: 1 }), 0)
+  assert.equal(memoryMatch(single, 'a', { minHits: 0 }), 1)
+})
+
+test('memoryMatch：记录里没有可检索 token 时返回 0（空记录不得靠默认分混进召回）', () => {
+  const punctuationOnly = makeRecord({ kind: 'semantic', text: '---' })
+  assert.deepEqual(tokenizeForSearch('---'), [])
+  assert.equal(memoryMatch(punctuationOnly, 'x'), 0)
+  assert.equal(lexicalMatch(punctuationOnly, 'x'), 0)
+})
+
+test('memoryMatch：分母封顶为 4（命中 3 个 / 记录 4 个 token 必须是 0.75）', () => {
+  // 分母封顶让「长记忆」不吃亏，但封顶值本身要钉住：降到 3 会让 3 个命中直接满分，
+  // 于是一条只沾上三个词的长记录与完全命中的短记录同分，排序与门槛一起失真。
+  const record = makeRecord({ kind: 'semantic', text: 'alpha beta gamma delta' })
+  assert.equal(memoryMatch(record, 'alpha beta gamma'), 0.75)
+})
+
+test('isExcluded：长度门槛是「少于 8 个字符」（恰好 8 个字符必须放行）', () => {
+  assert.equal(isExcluded('记住这个方案挺'), 'too-short') // 7 个字符
+  assert.equal(isExcluded('记住这个方案挺好'), null) // 8 个字符：不排除
+})
+
+test('splitSentences：空片段必须被丢掉（换行分隔不会产出空句子）', () => {
+  // 空句子会流进 extractCandidates 的统计与判定（既污染 skipped 计数，也可能被当成一句话处理）。
+  assert.deepEqual(splitSentences('第一句。\n\n第二句。'), ['第一句。', '第二句。'])
+  assert.deepEqual(splitSentences('\n\n'), [])
+  assert.deepEqual(splitSentences('   '), [])
+  assert.deepEqual(splitSentences(''), [])
+})
+
+test('isEcho：相似度恰好等于阈值也算回声（阈值是闭区间）', () => {
+  // Jaccard 恰好 0.5：{alpha,beta,gamma} 与 {alpha,beta,delta}，交集 2、并集 4。
+  assert.equal(similarity('alpha beta gamma', 'alpha beta delta'), 0.5)
+  assert.equal(isEcho('alpha beta gamma', ['alpha beta delta'], 0.5), true)
+  // 默认阈值 0.9 下不算回声（确认边界改动没有连带改宽默认口径）。
+  assert.equal(isEcho('alpha beta gamma', ['alpha beta delta']), false)
+})
+
+test('composeGistText：最多列 6 个标记，不足则全列（不得漏掉第 6 个）', () => {
+  const six = ['pnpm', 'electron', 'typescript', 'react', 'python', 'rust']
+  assert.equal(composeGistText(six), '这个工作区看起来涉及：pnpm、electron、typescript、react、python、rust。')
+  assert.equal(
+    composeGistText([...six, 'docker']),
+    '这个工作区看起来涉及：pnpm、electron、typescript、react、python、rust。',
+  )
+})
+
+test('effectiveImportance：模型自评的 agent_self 走 90 天半衰期（用户侧来源不衰减）', () => {
+  // 半衰期写错会让模型自评要么永久留在 system prompt 里，要么过早消失（设计稿 §4.4）。
+  const now = Date.now()
+  const observed = now - 90 * DAY
+  const modelSelf = makeRecord({ kind: 'agent_self', text: 'x', importance: 0.8, origin: 'model_proposed', observedAt: observed })
+  assert.equal(effectiveImportance(modelSelf, now), 0.4)
+  const userSelf = makeRecord({ kind: 'agent_self', text: 'x', importance: 0.8, origin: 'user_explicit', observedAt: observed })
+  assert.equal(effectiveImportance(userSelf, now), 0.8)
+})
+
+test('shouldArchive：恰好到达 archiveAfterDays 当天就要归档（>= 是闭区间）', () => {
+  const now = Date.now()
+  const atThreshold = makeRecord({ kind: 'semantic', text: 'x', importance: 0.01, observedAt: now - 30 * DAY })
+  assert.equal(shouldArchive(atThreshold, { ...cfg, archiveAfterDays: 30 }, now), true)
+  // 差一天不归档：边界两侧都要钉住。
+  const younger = makeRecord({ kind: 'semantic', text: 'x', importance: 0.01, observedAt: now - 29 * DAY })
+  assert.equal(shouldArchive(younger, { ...cfg, archiveAfterDays: 30 }, now), false)
+})
+
+test('shouldArchive：有效重要度恰好等于阈值时不归档（阈值是开区间）', () => {
+  const now = Date.now()
+  const atThreshold = makeRecord({ kind: 'semantic', text: 'x', importance: 0.15, observedAt: now })
+  assert.equal(effectiveImportance(atThreshold, now), 0.15)
+  assert.equal(shouldArchive(atThreshold, { ...cfg, archiveAfterDays: 0, archiveBelowImportance: 0.15 }, now), false)
+  // 低一点点就归档，确认阈值确实在起作用（不是整条判定被短路）。
+  const lower = makeRecord({ kind: 'semantic', text: 'x', importance: 0.14, observedAt: now })
+  assert.equal(shouldArchive(lower, { ...cfg, archiveAfterDays: 0, archiveBelowImportance: 0.15 }, now), true)
+})
+
+test('pickMergeGroups：包含度恰好等于 mergeSimilarity 时合并（>= 是闭区间）', () => {
+  const base: Omit<MakeRecordInput, 'text'> = { kind: 'semantic', subject: 'project.merge', scope: { level: 'workspace', key: 'k' } }
+  const lead = makeRecord({ ...base, text: 'alpha beta' })
+  const other = makeRecord({ ...base, text: 'alpha gamma delta epsilon' })
+  // 交集 {alpha} = 1，min(2,4) = 2 ⇒ 0.5，恰好等于阈值。
+  assert.equal(containment(lead.text, other.text), 0.5)
+  const groups = pickMergeGroups([lead, other], { ...cfg, mergeSimilarity: 0.5 })
+  assert.equal(groups.length, 1)
+  assert.equal(groups[0]!.length, 2)
+})
+
+test('deriveSubject：只取最有信息量的 2 个 token（不是 3 个）', () => {
+  // subject 是去重/合并/冲突判定的键：多取一个 token 会让「同一件事的两种说法」
+  // 落到不同 subject 上，去重与冲突判定一起失效。
+  assert.equal(deriveSubject('alpha beta gamma delta'), 'auto.alpha.delta')
+  assert.equal(deriveSubject('alpha beta gamma delta', 'p'), 'p.alpha.delta')
+  assert.equal(deriveSubject('---'), null)
+})
+
+test('composeSubjectSummary：条数恰好等于 summarizeAbove 时不产摘要（必须严格超过）', () => {
+  const records = Array.from({ length: 3 }, (_, index) => makeRecord({
+    kind: 'semantic', subject: 'project.boundary', text: `第 ${index} 条记录。`,
+  }))
+  assert.equal(composeSubjectSummary(records, { ...cfg, summarizeAbove: 3 }).length, 0)
+  // 多一条就触发；摘要本身带 summary 标签，因此不会参与后续整合（既有测试已覆盖）。
+  const more = [...records, makeRecord({ kind: 'semantic', subject: 'project.boundary', text: '第 3 条记录。' })]
+  assert.equal(composeSubjectSummary(more, { ...cfg, summarizeAbove: 3 }).length, 1)
+})
+
+test('formatAudit：带 refs 的比例要四舍五入（67% 不得被截断成 66%）', () => {
+  const records: MemoryRecord[] = [
+    { ...makeRecord({ kind: 'semantic', text: '有引用一' }), refs: [{ sessionId: 'ses-1', from: 1, to: 2 }] },
+    { ...makeRecord({ kind: 'semantic', text: '有引用二' }), refs: [{ sessionId: 'ses-2' }] },
+    makeRecord({ kind: 'semantic', text: '没引用' }),
+  ]
+  const text = formatAudit({ entries: [], records, cfg })
+  assert.match(text, /带 refs 的 2 条（占 67%）/)
+})
+
+test('vectorKeyOf：片段之间必须有分隔符（拼接不得让不同内容撞同一个键）', () => {
+  // 没有分隔符时 'abc' + 'd' 与 'ab' + 'cd' 会拼成同一个串 ⇒ 两条记录共用同一个向量，
+  // 语义分会互相污染（而且是静默的：键看起来仍然「稳定」）。
+  const left = makeRecord({ kind: 'semantic', text: 'abc', subject: 'd' })
+  const right = makeRecord({ kind: 'semantic', text: 'ab', subject: 'cd' })
+  assert.notEqual(vectorKeyOf(left), vectorKeyOf(right))
+})
+
+// ---------------- 补盲（二）：捕获配额、预算兜底、摘要与文案表 ----------------
+// 同一轮变异里第二批「改了源码仍全绿」的点，集中在计数/配额、数值兜底与文案硬要求上。
+
+test('extractCandidates：候选数恰好等于配额时不算「超出配额」（> 是严格超）', () => {
+  const exactly = extractCandidates([
+    '记住：第一条偏好是 A。',
+    '记住：第二条偏好是 B。',
+    '记住：第三条偏好是 C。',
+  ].join('\n'), { ...cfg, captureMaxPerTurn: 3 })
+  assert.equal(exactly.candidates.length, 3)
+  // 一条都没被丢：skipped 里不得出现 over-turn-quota（哪怕是 0）。
+  assert.equal(exactly.skipped['over-turn-quota'], undefined)
+})
+
+test('extractCandidates：置信度恰好等于 captureMinConfidence 时保留（阈值是闭区间）', () => {
+  // 「就定…」命中 decision 信号，置信度 0.7；门槛设成 0.7 时应当保留。
+  const atThreshold = extractCandidates('就定这个方案吧。', { ...cfg, captureMinConfidence: 0.7 })
+  assert.equal(atThreshold.candidates.length, 1)
+  // 高一点点就挡下，确认门槛确实在起作用。
+  const above = extractCandidates('就定这个方案吧。', { ...cfg, captureMinConfidence: 0.71 })
+  assert.equal(above.candidates.length, 0)
+  assert.equal(above.skipped['below-confidence'], 1)
+})
+
+test('extractCandidates：配额裁剪按置信度从高到低（排序方向不得反转）', () => {
+  const result = extractCandidates([
+    '就定这个方案吧。',
+    '记住：以后都用 pnpm。',
+  ].join('\n'), { ...cfg, captureMaxPerTurn: 1 })
+  assert.equal(result.candidates.length, 1)
+  // explicit-imperative（0.9）强于 decision（0.7）⇒ 配额只有 1 时留下的必须是「记住」那条。
+  assert.match(result.candidates[0]!.text, /pnpm/)
+})
+
+test('isSelfPortraitEligible：置信度恰好等于 selfPortraitMinConfidence 时准入（>= 是闭区间）', () => {
+  assert.equal(DEFAULTS.selfPortraitMinConfidence, 0.8)
+  const atThreshold = makeRecord({ kind: 'agent_self', text: '回答先给结论再解释。', origin: 'user_explicit', confidence: 0.8 })
+  assert.equal(isSelfPortraitEligible(atThreshold, cfg), true)
+  // 低一点点就不准入，确认门槛确实在起作用。
+  const below = makeRecord({ kind: 'agent_self', text: '回答先给结论再解释。', origin: 'user_explicit', confidence: 0.79 })
+  assert.equal(isSelfPortraitEligible(below, cfg), false)
+})
+
+test('fillWithinBudget：NaN / Infinity 预算一律按 0 处理（fail-closed，不得全量注入）', () => {
+  const records = [
+    makeRecord({ kind: 'user_profile', text: '偏好中文回答。' }),
+    makeRecord({ kind: 'user_profile', text: '偏好英文注释。' }),
+  ]
+  const render = (record: MemoryRecord, text: string): string => `- ${text}`
+  // 非有限预算若被当成合法值，`used + cost > NaN` 恒为 false ⇒ 整库条目一起进注入。
+  for (const budget of [Number.NaN, Number.POSITIVE_INFINITY]) {
+    const fill = fillWithinBudget(records, budget, render, cfg)
+    assert.deepEqual(fill.selected, [], `预算 ${String(budget)} 不得选中任何条目`)
+    assert.deepEqual(fill.lines, [])
+    assert.equal(fill.used, 0)
+  }
+  // 正常预算照常填充，确认不是把整条路径短路了。
+  assert.equal(fillWithinBudget(records, 100, render, cfg).selected.length, 2)
+})
+
+test('estimateTokens：向上取整（不足一个 token 也算一个，否则预算被系统性低估）', () => {
+  assert.equal(estimateTokens('abc', 2.5), 2) // 1.2 → 2
+  assert.equal(estimateTokens('x'.repeat(8), 2.5), 4) // 3.2 → 4
+  assert.equal(estimateTokens('', 2.5), 0)
+})
+
+test('clampText：长度恰好等于上限时不截断（<= 是闭区间）', () => {
+  // maxItemTokens=1、charsPerToken=2.5 ⇒ 上限落到下限 8 个字符。
+  assert.equal(clampText('abcdefgh', 1, 2.5), 'abcdefgh')
+  const longer = clampText('abcdefghi', 1, 2.5)
+  assert.equal(longer.length, 8)
+  assert.ok(longer.endsWith('…'))
+})
+
+test('deriveOriginFromMessages：多文本块之间必须保留分隔（不得把两块拼成新词）', () => {
+  // 两个块拼起来才是「记住」：中间没有分隔就会凭空造出一个显式祈使信号，
+  // 于是模型自己的话被当成「用户明确要求记住」而直接落库。
+  const split = [{
+    role: 'user',
+    source: { kind: 'user' },
+    content: [{ type: 'text', text: '记' }, { type: 'text', text: '住' }],
+  }]
+  assert.equal(deriveOriginFromMessages(split), 'model_proposed')
+  // 同一个块里确实写着「记住」时照常判 user_explicit。
+  assert.equal(
+    deriveOriginFromMessages([{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '记住这个' }] }]),
+    'user_explicit',
+  )
+})
+
+test('effectiveImportance：project_gist 半衰期是 30 天（衰减速度不得被改慢）', () => {
+  const now = Date.now()
+  const gist = makeRecord({ kind: 'project_gist', text: 'x', importance: 0.8, observedAt: now - 30 * DAY })
+  assert.equal(effectiveImportance(gist, now), 0.4)
+})
+
+test('composeSubjectSummary：摘要回带前 5 条原文（不能只回带 4 条）', () => {
+  // importance 递减 ⇒ compareRecords 顺序确定（id 带随机后缀，不能靠 id 兜底排序）。
+  const records = Array.from({ length: 7 }, (_, index) => makeRecord({
+    kind: 'semantic',
+    subject: 'project.preview',
+    text: `第 ${index} 条关于预览的记录。`,
+    importance: 0.9 - index * 0.1,
+  }))
+  const summaries = composeSubjectSummary(records, { ...cfg, summarizeAbove: 5 })
+  assert.equal(summaries.length, 1)
+  const text = summaries[0]!.text
+  assert.match(text, /第 0 条关于预览的记录/)
+  assert.match(text, /第 4 条关于预览的记录/) // 第 5 条（下标 4）必须在
+  assert.doesNotMatch(text, /第 5 条关于预览的记录/) // 第 6 条（下标 5）不该在
+})
+
+test('formatBranchSummary：条数相同时按分支名字典序（同分组序不得反转）', () => {
+  const records = [
+    makeRecord({ kind: 'semantic', text: 'a 分支上的约定。', branch: 'a-feat' }),
+    makeRecord({ kind: 'semantic', text: 'b 分支上的约定。', branch: 'b-main' }),
+  ]
+  const lines = formatBranchSummary(records, 'a-feat').split('\n').filter((line) => line.startsWith('  - '))
+  assert.deepEqual(lines, ['  - a-feat：1 条（当前分支）', '  - b-main：1 条'])
+})
+
+test('textsFor：en 的常驻块页脚必须保留「先核对事实」这条硬要求', () => {
+  const en = textsFor({ ...cfg, language: 'en' })
+  assert.match(en.factsFooter, /check the facts first/)
+  assert.match(en.gistFooter, /go by what is actually true/)
+  // zh 侧同样保留（默认语言下与既有常量逐字节一致）。
+  assert.match(textsFor(cfg).factsFooter, /先核对事实/)
 })
 

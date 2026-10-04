@@ -3,6 +3,56 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.22 — 2026-10-04
+
+**Test hardening driven by mutation testing.** The adversarial audit's last useful gift was the observation that a
+green suite and a correct implementation are different things. So instead of guessing which tests were missing, two
+agents did this: break the implementation in a small, plausible way, run the whole suite, and record every break that
+**nothing noticed**. Those breaks are the blind spots. Then each surviving break got a test that kills it — verified
+both ways in a scratch copy (red against the mutated build, green against the real one). No production code changed.
+
+### Numbers
+
+| Track | Breaks tried | Killed by existing tests | Survived (blind spots) | Now killed by new tests |
+|---|---|---|---|---|
+| Pure layer (`src/lib.ts`) | 64 | 31 | **30** | 30 (lib suite 176 → 206) |
+| Host (`src/index.ts`) | 100 | 50 | **50**, of which 8 were worth pinning | 8 (host suite 131 → 139) |
+
+Suite: **397 → 435**.
+
+### What the blind spots actually were
+
+- **Thresholds that are closed intervals and were only ever tested on the loose side.** Similarity exactly equal to
+  the echo threshold, containment exactly equal to `mergeSimilarity`, an age exactly at `archiveAfterDays`, a
+  confidence exactly at `selfPortraitMinConfidence`, a text exactly at the clamp length, a candidate count exactly
+  at the quota: flipping `>=` to `>` (or `<` to `<=`) changed behaviour and no test objected. Each of those now has
+  a case that sits exactly on the boundary.
+- **`memoryMatch`'s notion of an "informative" hit had no direct coverage at all** — the default `minHits`, the
+  two-character token floor and the "not purely numeric" rule could each be relaxed without a single failure. That
+  combination is what keeps version numbers and list indices from dragging unrelated memories into a recall, so it
+  is now pinned three ways.
+- **Fallback directions.** `minHits ?? 1` becoming `?? 0`, a denominator cap of 4 becoming 3, a token cache keyed by
+  an empty fingerprint, an eight-character sentence losing its length floor, an empty record scoring 1 instead of 0,
+  a NaN budget no longer failing closed.
+- **Host paths that nothing asserted end-to-end**: `/memory list --archived` actually listing archived rows (an
+  early return could be deleted unnoticed), the export path excluding `deleted` rows, the audit's verbatim-match
+  rule including `system/message`, `/memory verify`'s informative-token floor and its exact coverage threshold,
+  the tagged-branch counter counting tagged rows rather than untagged ones, and the reason for a failed persist
+  reaching the stats and the command output rather than dying in a swallowed error.
+- **Two survivors are documented as unreachable rather than papered over.** One guard is the first of three
+  independent layers enforcing the same rule, so removing it alone is unobservable; the other sits behind a
+  fallback that the real `/sleep` path cannot reach. Both are written into the test file with the evidence, because
+  "we could not kill this" is a finding, not a gap to hide.
+
+### Notes
+
+- The suites now also encode a habit worth keeping: new cases assert exact values at exact boundaries (0.75, 67%,
+  eight characters) rather than "at least" shapes, since a loose assertion is what let the mutations live.
+- One incident from the session is recorded for honesty: an agent wrote placeholder text into `src/index.ts` while
+  probing sandbox permissions and restored it with `git checkout`. The integration check confirmed `src/`, `lib/`,
+  `docs/`, `tools/` and `package.json` are untouched against HEAD, and the only modified files are the two test
+  suites.
+
 ## 0.5.21 — 2026-10-04
 
 Fixes from an **independent adversarial audit**: five agents were told to falsify the plugin rather than confirm it,
