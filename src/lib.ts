@@ -266,9 +266,25 @@ export function normalizeText(text: unknown): string {
     .toLowerCase()
 }
 
+/**
+ * 预算型数值兜底：**必须是有限正数**，否则回落 `fallback`（一律取 `DEFAULTS` 里的同一项）。
+ *
+ * 口径与 `sleepBudget` 一致，为什么这几个数必须兜：
+ *  · `charsPerToken` = `Infinity` ⇒ `estimateTokens` 恒为 0 ⇒ 硬上限失效、全量注入；
+ *    = `NaN` ⇒ `used + cost > budget` 恒为 false ⇒ `fillWithinBudget` 永不 break（同样全量注入）；
+ *    = `0` ⇒ 除法得 `Infinity` ⇒ 第一条就 break，注入被**静默关闭**（0 绝不能当合法值）。
+ *  · `maxInjectedTokens` 非有限 ⇒ 每个小节预算都变成非有限，上面两种失效同时发生。
+ *  · 负数同样落回默认，绝不出现「负预算却算出正条目」的非法中间态。
+ */
+function budgetNumber(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
+}
+
 /** 廉价 token 估算：保守折中（中文约 1.5 字/token、英文约 4 字/token）。 */
 export function estimateTokens(text: unknown, charsPerToken: number = DEFAULTS.charsPerToken): number {
-  return Math.ceil(String(text).length / charsPerToken)
+  // `charsPerToken` 走有限性 + 正数兜底（`budgetNumber`）：否则非有限值会让 token 估算
+  // 变成 0 / NaN / Infinity，注入预算随之整体失效（见 `budgetNumber` 注释）。
+  return Math.ceil(String(text).length / budgetNumber(charsPerToken, DEFAULTS.charsPerToken))
 }
 
 /**
@@ -289,8 +305,8 @@ export function clampText(text: unknown, maxTokens: number, charsPerToken: numbe
     .trim()
   // 有限性兜底：`maxItemTokens` 可能被 patch 行设成 Infinity（或 NaN），那样 `slice` 不截断，
   // 一条超长记忆会吃掉整个预算并让 `fillWithinBudget` 立刻 break，把后面的条目全挤掉。
-  const tokenBudget = Number.isFinite(maxTokens) && maxTokens > 0 ? maxTokens : DEFAULTS.maxItemTokens
-  const perToken = Number.isFinite(charsPerToken) && charsPerToken > 0 ? charsPerToken : DEFAULTS.charsPerToken
+  const tokenBudget = budgetNumber(maxTokens, DEFAULTS.maxItemTokens)
+  const perToken = budgetNumber(charsPerToken, DEFAULTS.charsPerToken)
   const maxChars = Math.max(8, Math.floor(tokenBudget * perToken))
   return flat.length <= maxChars ? flat : `${flat.slice(0, maxChars - 1)}…`
 }
@@ -392,12 +408,17 @@ export function fillWithinBudget(
 ): BudgetFill<MemoryRecord> {
   const lines: string[] = []
   const selected: MemoryRecord[] = []
+  // 预算路径上的三个数全部兜底（`budgetTokens` 由调用方算，也可能来自非法配置）：
+  // 非有限预算 ⇒ 0（fail-closed：宁可不注入，也不让 `used + cost > NaN` 恒 false 而全量注入）。
+  const budget = Number.isFinite(budgetTokens) ? Math.max(0, budgetTokens) : 0
+  const itemBudget = budgetNumber(cfg.maxItemTokens, DEFAULTS.maxItemTokens)
+  const perToken = budgetNumber(cfg.charsPerToken, DEFAULTS.charsPerToken)
   let used = 0
   for (const record of records) {
-    const text = clampText(record.text, cfg.maxItemTokens, cfg.charsPerToken)
+    const text = clampText(record.text, itemBudget, perToken)
     const line = render(record, text)
-    const cost = estimateTokens(line, cfg.charsPerToken)
-    if (used + cost > budgetTokens) break
+    const cost = estimateTokens(line, perToken)
+    if (used + cost > budget) break
     lines.push(line)
     selected.push(record)
     used += cost
@@ -449,10 +470,13 @@ export function renderSelfBlock(records: Iterable<MemoryRecord>, cfg: MemoryConf
   // 这里给英文一份显式余量抵消块级固定开销差异；zh 完全不受影响（默认行为与 0.5.10 逐字节相同）。
   // 注意**不动** `maxInjectedTokens`：那是用户自己设的硬上限，不该被语言悄悄放大。
   const languageHeadroom = normalizeLanguage(cfg.language) === 'en' ? EN_BLOCK_HEADROOM : 0
-  const workBudget = (cfg.selfPortraitMaxTokens ?? DEFAULTS.selfPortraitMaxTokens) + languageHeadroom
-  const personaBudget = (cfg.selfPersonaMaxTokens ?? DEFAULTS.selfPersonaMaxTokens) + languageHeadroom
+  // 小节预算与 charsPerToken 同样走 `budgetNumber` 兜底：非有限值会让 `fillWithinBudget`
+  // 收到非有限预算（NaN ⇒ 全量注入，Infinity ⇒ 全量注入），非法配置不得突破块级硬上限。
+  const perToken = budgetNumber(cfg.charsPerToken, DEFAULTS.charsPerToken)
+  const workBudget = budgetNumber(cfg.selfPortraitMaxTokens, DEFAULTS.selfPortraitMaxTokens) + languageHeadroom
+  const personaBudget = budgetNumber(cfg.selfPersonaMaxTokens, DEFAULTS.selfPersonaMaxTokens) + languageHeadroom
   // 块头尾也要计入预算，否则「硬上限」会被块级固定文案突破
-  const personaChrome = estimateTokens(`${texts.personaHeader}\n${texts.personaFooter}`, cfg.charsPerToken)
+  const personaChrome = estimateTokens(`${texts.personaHeader}\n${texts.personaFooter}`, perToken)
   const personaUser = fillWithinBudget(
     personaRecords.filter((record) => isUserSideOrigin(record.origin)).slice(0, maxSelfObserved),
     Math.max(0, personaBudget - personaChrome),
@@ -477,7 +501,7 @@ export function renderSelfBlock(records: Iterable<MemoryRecord>, cfg: MemoryConf
   // 两段合计（含两个块头与页脚）不超过 selfPortraitMaxTokens。
   const confirmed = fillWithinBudget(
     userSide.slice(0, cfg.selfPortraitMaxItems),
-    Math.max(0, workBudget - estimateTokens(texts.workConfirmedHeader, cfg.charsPerToken)),
+    Math.max(0, workBudget - estimateTokens(texts.workConfirmedHeader, perToken)),
     (_record, text) => `- ${text}`,
     cfg,
   )
@@ -486,7 +510,7 @@ export function renderSelfBlock(records: Iterable<MemoryRecord>, cfg: MemoryConf
     : fillWithinBudget(
       selfObserved,
       Math.max(0, workBudget
-        - estimateTokens(`${texts.workConfirmedHeader}${texts.workObservedHeader}${texts.workObservedFooter}`, cfg.charsPerToken)
+        - estimateTokens(`${texts.workConfirmedHeader}${texts.workObservedHeader}${texts.workObservedFooter}`, perToken)
         - confirmed.used),
       (_record, text) => `- ${text}`,
       cfg,
@@ -528,10 +552,21 @@ export function renderContextBlock(records: Iterable<MemoryRecord>, cfg: MemoryC
   const gistHeader = texts.gistHeader
   const gistFooter = texts.gistFooter
 
-  const gistBudget = Math.max(40, Math.floor(cfg.maxInjectedTokens * cfg.gistBudgetRatio))
-  const factsBudget = Math.max(0, cfg.maxInjectedTokens
-    - estimateTokens(`${factsHeader}\n${factsFooter}`, cfg.charsPerToken)
-    - (gists.length > 0 ? estimateTokens(`${gistHeader}\n${gistFooter}`, cfg.charsPerToken) : 0))
+  // 注入预算路径上的数值一律 `budgetNumber` 兜底（NaN/±Infinity/≤0 ⇒ `DEFAULTS` 同一项）：
+  //  · `maxInjectedTokens` 非有限 ⇒ 小节预算非有限，硬上限整体失效（NaN 让 `used + cost > budget` 恒 false）；
+  //  · `charsPerToken` 非有限/0 ⇒ 同上（`estimateTokens` 内也兜了一层，这里显式兜以免调用点读错）；
+  //  · `gistBudgetRatio` 非有限/负 ⇒ `Math.max(40, NaN)` 仍是 NaN，gist 段同样失守。
+  //    `0` 是合法值（既有语义：再由 `Math.max(40, …)` 给出 40 token 的下限），因此只挡非有限与负数。
+  const maxInjected = budgetNumber(cfg.maxInjectedTokens, DEFAULTS.maxInjectedTokens)
+  const perToken = budgetNumber(cfg.charsPerToken, DEFAULTS.charsPerToken)
+  const gistRatio = typeof cfg.gistBudgetRatio === 'number' && Number.isFinite(cfg.gistBudgetRatio) && cfg.gistBudgetRatio >= 0
+    ? cfg.gistBudgetRatio
+    : DEFAULTS.gistBudgetRatio
+
+  const gistBudget = Math.max(40, Math.floor(maxInjected * gistRatio))
+  const factsBudget = Math.max(0, maxInjected
+    - estimateTokens(`${factsHeader}\n${factsFooter}`, perToken)
+    - (gists.length > 0 ? estimateTokens(`${gistHeader}\n${gistFooter}`, perToken) : 0))
 
   const head = fillWithinBudget(
     facts,
@@ -571,9 +606,34 @@ function foldWidth(value: unknown): string {
   return String(value).normalize('NFKC')
 }
 
-/** 敏感信息扫描：返回命中的 reason，或 null。全角/兼容写法同样命中。 */
+/**
+ * 渲染等价视图：把文本折成「注入前会被渲染成什么样」的形态，**只用于判定**（不写库、不改入参）。
+ *
+ * 为什么需要（审计确认的真问题 · critical）：`clampText` 在注入前会**整体删除**零宽/格式字符，
+ * 而旧的 `scanSensitive` 只在 NFKC 视图上匹配 —— NFKC **不会**删掉零宽字符，
+ * 于是 `sk-\u200babcdefghijklmnop123456` 判定为「不敏感」、写入成功，
+ * 注入时零宽被剥掉 ⇒ **明文密钥进上下文**。判定形态必须与渲染形态一致：判定看到的就是
+ * 渲染后剩下的那些字符。
+ *
+ * 组成（三层，缺一层就留下同类绕过）：
+ *  1. NFKC 宽度折叠 —— 保留既有的「全角写法不能绕过拒写」修复（半角正则看全角会漏判）。
+ *  2. 剥离**格式字符**（`\p{Cf}`：U+200B–U+200F、U+202A–U+202E、U+2060–U+2064、U+2066–U+2069、
+ *     U+FEFF、U+00AD 软连字符等）。这里用整个 Cf 类而不是只列几段：Cf 全是不可见字符，
+ *     `clampText` 删的那几段也都在 Cf 里，漏掉任何一个（U+00AD / U+2060）都会留下同一类绕过。
+ *  3. 控制字符（`\p{Cc}`）折成**空格** —— 与 `clampText` 完全一致（也折成空格）。
+ *     为什么不折成删除：`clampText` 折的是空格，若判定层折成删除，`sk-\u0001abc…`
+ *     会被当成连续密钥而误判，而渲染里其实有个空格。
+ */
+function renderEquivalent(value: unknown): string {
+  return foldWidth(value)
+    .replace(/\p{Cf}/gu, '')
+    .replace(/\p{Cc}/gu, ' ')
+}
+
+/** 敏感信息扫描：返回命中的 reason，或 null。全角/兼容写法、零宽/格式字符拆写同样命中。 */
 export function scanSensitive(text: unknown): string | null {
-  const source = foldWidth(text)
+  // 在渲染等价视图上判定（见 `renderEquivalent`）：判定形态 = 注入时的渲染形态。
+  const source = renderEquivalent(text)
   for (const { reason, re } of SENSITIVE_PATTERNS) {
     if (re.test(source)) return reason
   }
@@ -590,18 +650,21 @@ const PII_PHONE_PROBE = /\b1[3-9]\d{9}\b/u
 /**
  * 邮箱/手机号脱敏。
  *
- * 只有当**折叠后的视图**确实命中 PII 形态时才折叠并脱敏 —— 这样普通文本一字不改
- * （不引入 NFKC 的副作用），而全角写法的 PII 也会被正确脱敏而不是原样落盘。
+ * 只有当**渲染等价视图**确实命中 PII 形态时才改写并脱敏 —— 这样普通文本一字不改
+ * （不引入 NFKC 的副作用），而全角/零宽写法的 PII 也会被正确脱敏而不是原样落盘。
  *
- * 取舍：命中 PII 的那条文本会**整体**走 NFKC（全角标点等也随之半角化）。
- * 这是有意的：宁可规范一条含 PII 的记录，也不要让它带着全角形态落盘、
- * 之后在注入前被折成可读的号码。
+ * 取舍：命中 PII 的那条文本会**整体**走 `renderEquivalent`（NFKC 宽度折叠 + 剥离格式字符 +
+ * 控制字符折平）。相比修复前（只走 NFKC），落盘内容多了后两步 —— 这是必要条件，不是副作用：
+ * 若判定用渲染等价视图、替换却仍在原文本上做，`138\u200b1234\u200b5678` 会被判定命中 PII
+ * 却匹配不到（正则跨不过零宽），照样原样落盘，随后 `clampText` 在注入前剥掉零宽 ⇒
+ * **明文号码进上下文**（与敏感扫描同一类漏洞）。因此掩码必须在**同一个视图**上做。
+ * 宁可规范一条含 PII 的记录，也不要让它带着「剥掉不可见字符即可读」的形态落盘。
  */
 export function maskPii(text: unknown): string {
   const source = String(text)
-  const folded = foldWidth(source)
-  if (!PII_EMAIL_PROBE.test(folded) && !PII_PHONE_PROBE.test(folded)) return source
-  return folded
+  const view = renderEquivalent(source)
+  if (!PII_EMAIL_PROBE.test(view) && !PII_PHONE_PROBE.test(view)) return source
+  return view
     // 邮箱：只保留首字母与域名 → a***@b.com
     .replace(PII_EMAIL_RE, '$1***$2')
     // 中国大陆手机号：保留前 3 后 4 → 138****8000

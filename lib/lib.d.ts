@@ -133,17 +133,20 @@ export declare function renderSelfBlock(records: Iterable<MemoryRecord>, cfg: Me
 /** 召回块（context 通道）：用户画像/事实 + 当前 workspace 的项目模糊印象。
  *  常驻注入只收 profile 级与「当前 workspace」级；session 级属于临时上下文，永不常驻。 */
 export declare function renderContextBlock(records: Iterable<MemoryRecord>, cfg: MemoryConfig, workspaceKey: string | null): RenderedBlock;
-/** 敏感信息扫描：返回命中的 reason，或 null。全角/兼容写法同样命中。 */
+/** 敏感信息扫描：返回命中的 reason，或 null。全角/兼容写法、零宽/格式字符拆写同样命中。 */
 export declare function scanSensitive(text: unknown): string | null;
 /**
  * 邮箱/手机号脱敏。
  *
- * 只有当**折叠后的视图**确实命中 PII 形态时才折叠并脱敏 —— 这样普通文本一字不改
- * （不引入 NFKC 的副作用），而全角写法的 PII 也会被正确脱敏而不是原样落盘。
+ * 只有当**渲染等价视图**确实命中 PII 形态时才改写并脱敏 —— 这样普通文本一字不改
+ * （不引入 NFKC 的副作用），而全角/零宽写法的 PII 也会被正确脱敏而不是原样落盘。
  *
- * 取舍：命中 PII 的那条文本会**整体**走 NFKC（全角标点等也随之半角化）。
- * 这是有意的：宁可规范一条含 PII 的记录，也不要让它带着全角形态落盘、
- * 之后在注入前被折成可读的号码。
+ * 取舍：命中 PII 的那条文本会**整体**走 `renderEquivalent`（NFKC 宽度折叠 + 剥离格式字符 +
+ * 控制字符折平）。相比修复前（只走 NFKC），落盘内容多了后两步 —— 这是必要条件，不是副作用：
+ * 若判定用渲染等价视图、替换却仍在原文本上做，`138\u200b1234\u200b5678` 会被判定命中 PII
+ * 却匹配不到（正则跨不过零宽），照样原样落盘，随后 `clampText` 在注入前剥掉零宽 ⇒
+ * **明文号码进上下文**（与敏感扫描同一类漏洞）。因此掩码必须在**同一个视图**上做。
+ * 宁可规范一条含 PII 的记录，也不要让它带着「剥掉不可见字符即可读」的形态落盘。
  */
 export declare function maskPii(text: unknown): string;
 /**

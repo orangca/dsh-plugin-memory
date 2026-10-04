@@ -3,6 +3,74 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.21 — 2026-10-04
+
+Fixes from an **independent adversarial audit**: five agents were told to falsify the plugin rather than confirm it,
+each from a different angle (contract-vs-reality, break-it probes, release surface and privacy, a documentation-only
+consumer, and mutation testing of the suite itself). They found real holes. This release closes them.
+
+### Security
+
+- **`memory_explain({ apply: true })` bypassed the write-policy gate and forged provenance.** With `writePolicy:
+  'off'` a `memory_write` was correctly refused, yet applying the same text through `memory_explain` wrote it with
+  `origin: 'user_explicit'` — and the text reached the context. The cause was letting the model-controlled capture
+  signal choose the origin. Both tool paths now derive the origin the same way (`deriveOriginFromMessages`, with the
+  explicit `trustToolWrites` override), so refusal, PII masking, echo rejection, the pending queue and `persisted`
+  behave identically on both.
+- **Zero-width characters defeated the secret scan while the injector stripped them.** `scanSensitive` accepted
+  `sk-\u200babcdef…` (an obfuscated key), and because `clampText` removes zero-width and bidi characters before
+  injection, the plugin itself restored the **plaintext** key into the system prompt. Judgement now runs on a
+  render-equivalent normalisation (NFKC plus zero-width/format stripping), so what is judged is what is shown. The
+  earlier full-width-hardening fix still holds.
+- **`maskPii` was quadratic on long character runs**: one 200 KB `memory_write` blocked the single-threaded host for
+  **12.6 seconds**. The pathological backtracking is gone.
+
+### Fixed
+
+- Governance commands (`approve`, `pin`, `archive`, `confirm`, `refresh`, `reject-pending`) silently reported
+  success when `persist()` failed — after a restart the change was gone while the text had claimed it took effect.
+  They now check the result and answer with an honest error ("not on disk; it will revert after a restart").
+- `ask` mode queued duplicates by fingerprint, so approving both produced **two active rows with the same hash**,
+  contradicting the protocol's own rule. Queueing and approval now deduplicate the same way the default path does:
+  an existing active row is reported as already present, an existing pending row is not queued twice, and approval
+  merges instead of creating a second row.
+- Non-finite `maxInjectedTokens` / `charsPerToken` (NaN, Infinity, 0, negatives) disabled the injection budget
+  entirely — 60 of 60 rows injected, or nothing at all. They now fall back to their defaults like the existing
+  per-item guard.
+- `setEmbedder`, `capabilities()` and `stats()` threw when a host object exposed a throwing accessor for `id` or
+  `dimensions`, violating the frozen contract. External properties are read defensively; unreadable ones count as
+  invalid (registration state untouched).
+- `recall({ mode: 'semantic' | 'hybrid' })` returned a Promise even with no embedder registered, contradicting the
+  frozen synchronous signature. It is asynchronous only when embeddings are actually used; the lexical path and the
+  no-embedder fallback are synchronous again.
+- The release-privacy gate missed forward-slash drive paths, POSIX home paths written without a trailing slash,
+  `file://` URLs that embed a drive path, UNC paths, `~` shorthand and the Windows user-profile environment
+  variable — and scanned for **no credential shapes at all**. It now covers those and detects common key shapes (the
+  usual provider prefixes, PEM private-key headers, JWTs) with counter-examples pinned so the patterns stay narrow. Because its username and
+  `$DSH_HOME` needles are host-local, the check now **says so** and reports a skip instead of "clean" when identity
+  judging is unavailable — which is exactly the situation in CI, the only automated gate.
+
+### Documentation
+
+- `SECURITY.md` claimed "no embedding service" while protocol v1.3 hands record text to a host-injected embedder.
+  It now states that the plugin itself never makes network calls, and that injecting a remote embedder sends memory
+  text off the machine — the host's and the user's decision, with its consequences spelled out.
+- The protocol documents gained what a stranger actually needs: how to load the host half and which `ctx` seams are
+  required (`effect`, `inject`, `on`, `systemPrompt`, `tools.register`, `commands.register`, `provide`), the required
+  shape of the `storageDomain` handle (a plausible-looking wrong one silently yields healthy-looking writes that
+  never persist), how to unload, the `refs` string grammar, and a corrected `mode` table (the key carries two
+  vocabularies, and the documented table's values were silently ignored). `version` semantics, the `/memory confirm`
+  claim and the missing `lastRecall()` entry were corrected against the implementation — 0.5.18's §11 said four
+  surface additions when there were five.
+
+### Notes
+
+- One audit finding was **rejected as a false positive**: a claim that the CHANGELOG described a drive-letter fix
+  "that exists in no document". The CHANGELOG describes an implementation decision in
+  `tools/verify-self-contained.ts`, which does contain that lookbehind — the claim was about the wrong artifact.
+- Mutation testing of the suite is reported alongside the fixes; the blind spots it exposed are listed in the
+  integration notes rather than silently dropped.
+
 ## 0.5.20 — 2026-10-04
 
 **Protocol v1.3: an externally injected embedder.** The user's call was the third option — the plugin does not

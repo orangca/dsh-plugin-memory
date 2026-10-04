@@ -67,6 +67,7 @@ import {
   formatSleepPlan,
   isBranchVisible,
   isEcho,
+  isExcluded,
   INTRO_NOTICE,
   lexicalMatch,
   listActive,
@@ -743,6 +744,38 @@ test('scanSensitive / maskPii：全角与兼容写法同样被拦截（不能靠
   assert.equal(maskPii('Plain English, full-width ！？ kept as-is'), 'Plain English, full-width ！？ kept as-is')
 })
 
+test('scanSensitive / maskPii：零宽与格式字符不能绕过判定（判定形态必须 = 渲染形态）', () => {
+  // 审计确认的真问题（critical）：`sk-\u200b…` 判定为「不敏感」⇒ 写入成功，
+  // 而注入前 `clampText` 会把零宽整体剥掉 ⇒ **明文密钥进上下文**。
+  // 下面按「先钉住泄漏前提 → 再证明判定已与渲染同步」排列。
+  const zwsp = '\u200B'
+  const sentence = `部署密钥是 sk-${zwsp}abcdefghijklmnop123456，请记住`
+  // ① 泄漏前提：渲染侧确实剥掉零宽（注入文本里就是明文密钥）
+  assert.match(clampText(sentence, 60, cfg.charsPerToken), /sk-abcdefghijklmnop123456/u)
+  // ② 修复后：判定入口做渲染等价归一化，命中 api-key（修复前这里返回 null）
+  assert.equal(scanSensitive(sentence), 'api-key')
+  // ③ 捕获链路同样 fail-closed（`isExcluded` 走 `scanSensitive`）
+  assert.equal(isExcluded(sentence), 'sensitive')
+
+  // 其它「不可见拆写」写法一视同仁：词连接符 / 双向隔离 / BOM / RTL 覆盖 / 软连字符
+  for (const invisible of ['\u2060', '\u2066', '\uFEFF', '\u202E', '\u00AD']) {
+    assert.equal(scanSensitive(`sk-${invisible}abcdefghijklmnop123456`), 'api-key', `密钥拆写 ${JSON.stringify(invisible)} 不得绕过`)
+    assert.equal(scanSensitive(`1101011990${invisible}0307123X`), 'cn-id', `身份证拆写 ${JSON.stringify(invisible)} 不得绕过`)
+  }
+
+  // 控制字符与渲染口径一致：`clampText` 折成空格，判定也折成空格 ⇒ 不把「sk- 空格 abc…」误判成密钥
+  assert.equal(scanSensitive('sk-\u0001abcdefghijklmnop123456'), null)
+
+  // PII 脱敏必须在**同一视图**上做：零宽拆开的号码判定命中，替换也必须真的匹配到
+  assert.equal(maskPii('手机 138\u200b1234\u200b5678'), '手机 138****5678')
+  assert.equal(maskPii('邮箱 alice\u200b@example.com'), '邮箱 a***@example.com')
+
+  // 既有语义不回退：正常文本一字不改、全角写法照旧命中
+  assert.equal(scanSensitive('用户偏好中文回答。'), null)
+  assert.equal(maskPii('没有个人信息'), '没有个人信息')
+  assert.equal(scanSensitive('１１０１０１１９９００３０７１２３Ｘ'), 'cn-id')
+})
+
 test('renderSelfBlock：两段合计（含块头页脚）不超过 selfPortraitMaxTokens', () => {
   const tight: MemoryConfig = { ...cfg, selfPortraitMaxTokens: 40 }
   const records = [
@@ -772,6 +805,55 @@ test('clampText：maxItemTokens 非有限时不放弃截断（否则一条超长
   assert.equal(clampText(long, 60, Number.POSITIVE_INFINITY).length, 150)
   // 正常预算照旧（注意有最小 8 字符的下限）
   assert.equal(clampText('abcdefghij', 2, 2.5), 'abcdefg…')
+})
+
+test('注入预算：maxInjectedTokens / charsPerToken 非有限或 ≤0 一律回落 DEFAULTS（硬上限不得失效）', () => {
+  const records = Array.from({ length: 60 }, (_, index) => makeRecord({
+    kind: 'user_profile', text: `画像条目 ${index}：${'内容'.repeat(20)}。`, importance: 0.9 - index * 0.001,
+  }))
+  const lineCount = (patch: Partial<MemoryConfig>): number => renderContextBlock(records, { ...cfg, ...patch }, null).lines.length
+  const base = lineCount({})
+  // 复现前提：正常配置下不会全量注入（说明「上限」本身在起作用，下面的等值断言才有意义）
+  assert.ok(base > 0 && base < records.length, `正常配置实测 ${base} 行`)
+
+  // 修复前：NaN ⇒ `used + cost > NaN` 恒 false、Infinity ⇒ 每条成本 0 ⇒ 60 条全量注入；
+  // `charsPerToken = 0` ⇒ 除法得 Infinity ⇒ 第一条就 break（静默零注入）。
+  // 修复后：一律按 `DEFAULTS` 的同一项计算，结果与正常配置完全相同。
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 0, -1]) {
+    assert.equal(lineCount({ maxInjectedTokens: bad }), base, `maxInjectedTokens=${String(bad)} 应回落默认`)
+    assert.equal(lineCount({ charsPerToken: bad }), base, `charsPerToken=${String(bad)} 应回落默认`)
+  }
+
+  // 合法值不受影响：调低上限必须真的少注入；合法 charsPerToken 仍参与估算
+  const tight = lineCount({ maxInjectedTokens: 60 })
+  assert.ok(tight > 0 && tight < base, `maxInjectedTokens=60 实测 ${tight} 行`)
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
+    assert.equal(estimateTokens('x'.repeat(100), bad), estimateTokens('x'.repeat(100), cfg.charsPerToken), `estimateTokens charsPerToken=${String(bad)}`)
+  }
+  assert.ok(estimateTokens('x'.repeat(100), 4) < estimateTokens('x'.repeat(100), 2.5), '合法 charsPerToken 仍改变估算')
+
+  // 同一预算路径上的同类数值同样兜底：gistBudgetRatio 与自画像两个小节预算
+  const key = workspaceKeyOf('C:/proj/gist-budget')!
+  const gists = Array.from({ length: 40 }, (_, index) => makeRecord({
+    kind: 'project_gist',
+    text: `项目模糊印象 ${index}：${'细节'.repeat(20)}。`,
+    scope: { level: 'workspace', key },
+    importance: 0.9 - index * 0.001,
+  }))
+  const gistBase = renderContextBlock(gists, cfg, key).lines.length
+  assert.ok(gistBase > 0 && gistBase < gists.length, `gist 段正常配置实测 ${gistBase} 行`)
+  assert.equal(renderContextBlock(gists, { ...cfg, gistBudgetRatio: Number.NaN }, key).lines.length, gistBase)
+  assert.equal(renderContextBlock(gists, { ...cfg, gistBudgetRatio: Number.POSITIVE_INFINITY }, key).lines.length, gistBase)
+  // `0` 是合法值（既有语义：再由 40 token 下限兜住），不得被当成非法而回落默认
+  assert.ok(renderContextBlock(gists, { ...cfg, gistBudgetRatio: 0 }, key).lines.length < gistBase)
+
+  const selfRows = [makeRecord({ kind: 'agent_self', facet: 'persona', text: '先给结论。', origin: 'user_explicit', confidence: 1, pinned: true })]
+  const selfBase = renderSelfBlock(selfRows, cfg).lines.length
+  assert.ok(selfBase > 0)
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
+    assert.equal(renderSelfBlock(selfRows, { ...cfg, selfPersonaMaxTokens: bad }).lines.length, selfBase, `selfPersonaMaxTokens=${String(bad)} 应回落默认`)
+    assert.equal(renderSelfBlock(selfRows, { ...cfg, selfPortraitMaxTokens: bad }).lines.length, selfBase, `selfPortraitMaxTokens=${String(bad)} 应回落默认`)
+  }
 })
 
 // ---------------------------------------------------------------- 热路径缓存（性能回归）

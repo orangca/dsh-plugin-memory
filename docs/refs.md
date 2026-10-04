@@ -26,10 +26,30 @@ export interface MemoryRef {
 ```
 
 - `MemoryRecord.refs?: MemoryRef[]`（可选、向后兼容；**不参与 `recordHash`**，否则同一条记忆因为引用不同会被判成两条）。
-- 上限 `cfg.refsMax`（默认 5），**新引用在前**；同一 `sessionId + from + to` 视为重复，只留一条。
+- 上限 `cfg.refsMax`（默认 5）；同一 `sessionId + from + to` 视为重复，只留一条。
+  **「新引用在前」是调用方约定，不是本层的保证**：`normalizeRefs` 保持入参顺序（见 §3）。
 - 会话 id 一律存**完整 id**（不截断）；展示时可短化（见 §3）。
+- 引用在字符串形态下的语法见 §2.1（`sessionId#from-to`，多条用 `;`）。
 
-### 2.1 配置（`MemoryConfig`，默认值写在 `DEFAULTS`）
+### 2.1 引用的字符串语法（冻结）
+
+引用在**工具输出 / 预览 / `write()` 返回的 `refs` 字段**里是一条字符串，由 `refsToString` 渲染：
+
+| 形态 | 例子 | 什么时候 |
+|---|---|---|
+| 区间 | `session-84a547da-5727-4ffc-adf0-26d02e749e13#120-180` | `from` 与 `to` 都给且**不相等** |
+| 单点 | `session-…-…#93` | 只给 `from`（`to` 省略），或 `from === to` |
+| 只有终点 | `session-…-…#180` | 只给 `to` |
+| 无语号 | `session-…-…` | `from` / `to` 都没给（序列号未知） |
+| 多条 | 上面任意两条用 **`;`** 连接：`session-A#120-180;session-B#93` | 一条记录有多个引用 |
+
+- 分隔符是**单个 `;`**（`formatRefs` 展示时用的是 `'; '`，带一个空格 —— 机器可读串不带空格）。
+- **顺序就是 `refs` 数组的顺序**（约定新在前），**上限 `cfg.refsMax`**、去重键 `sessionId|from|to` 与 §2 同一套规则，
+  由 `normalizeRefs` 在写入时执行；`refsToString` 自己不做去重、不做裁剪，只渲染拿到的数组。
+- 会话 id 不合法（空串等）、序号非整数时该条引用在读取路径被丢弃（`refsOf` 容错，见 §3）；渲染结果可能是空串。
+- 无引用 ⇒ 空串 `''`（`write()` 的 `refs` 字段此时是 `[]`，不是 `['']`）。
+
+### 2.2 配置（`MemoryConfig`，默认值写在 `DEFAULTS`）
 
 | 键 | 类型 | 默认 | 含义 |
 |---|---|---|---|
@@ -42,18 +62,29 @@ export interface MemoryRef {
 /** 容错读取：非法/缺失一律返回空数组。 */
 export function refsOf(record: MemoryRecord | null | undefined): MemoryRef[]
 
-/** 规范化（去重 + 裁剪 + 字段校验）：非法项丢弃，结果新在前，最多 cfg.refsMax 条。 */
+/** 规范化（去重 + 裁剪 + 字段校验）：非法项丢弃，**保持入参顺序**（约定「新在前」，见下），最多 cfg.refsMax 条。 */
 export function normalizeRefs(value: unknown, cfg: MemoryConfig): MemoryRef[]
 
 /** 合并一个新引用（新在前）；`cfg.refsEnabled === false` 时原样返回。 */
 export function withRef(refs: unknown, ref: MemoryRef, cfg: MemoryConfig): MemoryRef[]
 
-/** 展示：`ses-84a547da#120-180`；无引用返回空串。 */
+/** 展示：完整 id 时是 `session-84a547da-5727-4ffc-adf0-26d02e749e13#120-180`；`{ short: true }` 才是 `ses-84a547da#120-180`；无引用返回空串。 */
 export function formatRefs(refs: readonly MemoryRef[] | undefined, options?: { short?: boolean }): string
 
-/** 机器可读的引用串（写进工具输出/预览）：`sessionId#from-to`，多条用 `;` 分隔。 */
+/** 机器可读的引用串（写进工具输出/预览）：`sessionId#from-to`，多条用 `;` 分隔（语法见 §2.1）。 */
 export function refsToString(refs: readonly MemoryRef[] | undefined): string
 ```
+
+**`normalizeRefs` 不排序、也不认「新在前」**：它**保持入参顺序**，只做去重、裁剪与字段校验。
+「新引用在前」是**调用方（写入路径）的责任** —— 纯函数不知道谁更新，不猜。具体约定：
+
+- 新增引用一律用 `withRef`，它把新引用拼在**最前**（`normalizeRefs([ref, ...旧])`）—— 这是唯一的「新在前」来源；
+- 直接调 `normalizeRefs`（例如导入、反序列化）时，**顺序就是调用方给的顺序**，给反了就存反了；
+- 想要「新的在前」却又直接调 `normalizeRefs` 的调用方，请自己先把数组排成新在前。
+
+**`formatRefs` 默认不短化**：`options.short` 只在显式传 `true` 时才把会话 id 短化成 `ses-84a547da`
+（完整 id 存进来，`ses-` 前缀 + `-` 后前 8 个字符）。缺省输出的是**完整会话 id**，
+所以不要把 `formatRefs(refs)` 的结果当成 `ses-…` 形态去断言。
 
 **`/sleep` 回放也要带引用**（这是 refs 最硬的价值：补录的每一条都能指回用户当时说的那条消息）：
 
@@ -109,8 +140,9 @@ export interface SleepCandidate {
 ## 6. 验收标准
 
 - `pnpm typecheck` 四套全绿；`pnpm test` 全绿（现有 146 项不许回退）。
-- lib：`normalizeRefs`（去重/裁剪/非法丢弃/新在前）、`withRef`（开关关闭时原样返回）、`refsOf` 容错、
-  `formatRefs`/`refsToString`、`buildSleepPlan` 为候选填 refs、`recordHash` **不因 refs 改变**。
+- lib：`normalizeRefs`（去重/裁剪/非法丢弃/**保持入参顺序**）、`withRef`（开关关闭时原样返回、新引用拼在最前）、
+  `refsOf` 容错、`formatRefs`（缺省完整 id、`{ short: true }` 才短化）/`refsToString`（`;` 分隔、单点 `#from`）、
+  `buildSleepPlan` 为候选填 refs、`recordHash` **不因 refs 改变**。
 - host：写路径附着（live 区间用 turnStart..lastSeq、tool 单点）、reinforce 合并引用、`/memory show` 显示、
   `/memory verify` 三类结果（命中/未命中/服务缺失）、`refsEnabled=false` 时不附着、stats 行。
 - 文档：README 双语（refs 语义 + `/memory verify` + 两个配置键）、`CHANGELOG.md` 增加 0.5.9。

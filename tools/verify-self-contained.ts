@@ -8,9 +8,13 @@
 //      指向运行期第三方包就等于把上面那条约束抄近路绕开（类型导入不算运行期依赖）；
 //   3. 实际打包产物里必须有入口与文档（lib/index.js、lib/lib.js、lib/client.js、
 //      cordis.patch.yml、README.md、README.zh.md），否则 `files` 字段漏改也没人知道；
-//   4. 发布物里不能出现隐私：本机用户名、绝对路径（盘符 / POSIX 家目录）、真实 $DSH_HOME ——
-//      `docs/` 全量进包之后，顺手贴进文档的本机路径会跟着发布出去；扫描范围就是
-//      npm pack **实际会发布的每个文件**（与第 3 条共用同一次 npm pack，不重复跑）。
+//   4. 发布物里不能出现隐私：本机用户名、绝对路径（盘符 `C:\` / `C:/`、POSIX 家目录、UNC、
+//      `~/` 家目录简写、%USERPROFILE%）、真实 $DSH_HOME，也不能出现凭证（`sk-` / `AKIA` /
+//      `ghp_` / `xox[baprs]-` / `-----BEGIN … PRIVATE KEY-----` / JWT）——`docs/` 全量进包之后，
+//      顺手贴进文档的本机路径或密钥会跟着发布出去；扫描范围就是 npm pack **实际会发布的每个文件**
+//      （与第 3 条共用同一次 npm pack，不重复跑）。
+//      注意：本机用户名与 $DSH_HOME 这两条判据依赖环境——CI（ubuntu-latest，username=runner）里
+//      它们**等于失效**，所以失效时必须显式说明「没有扫」（跳过 ≠ 通过），绝不静默给「干净」。
 //
 // 用法：node tools/verify-self-contained.ts [--json] [--no-pack] [--repo <绝对路径>]
 //   --json      机器可读结果（CI 用）
@@ -653,13 +657,26 @@ function firstLines(text: string, count: number): string {
 // 检查 4：发布物的隐私扫描
 //
 // 为什么：`files` 里放开 `docs/` 之后，「顺手把本机路径贴进文档」会跟着包一起被发布出去
-// （本机用户名、家目录、真实 $DSH_HOME）。靠人工扫迟早会漏，所以对 npm pack **实际会发布的每个文件**逐行扫。
+// （本机用户名、家目录、真实 $DSH_HOME、密钥）；靠人工扫迟早会漏，所以对 npm pack **实际会发布的每个文件**逐行扫。
+//
+// 判据（四条路径类 + 身份类 + 凭证类）：
+//   · 本机用户名（`os.userInfo().username`，大小写不敏感）—— 但 CI / 容器的通用账号（runner、root）
+//     不是任何人的身份信息，拿它当判据只会把通用词当成泄漏：这类环境下这一条**没有扫**；
+//   · 绝对路径：盘符 `[A-Za-z]:\` 与 `[A-Za-z]:/`（含 `file:///D:/…`）、`/Users/<name>`、`/home/<name>`
+//     （**不要求尾斜杠**）、UNC `\\host\share`、`~/…`、`%USERPROFILE%`；
+//   · 真实 $DSH_HOME（若该环境变量存在）；
+//   · 常见凭证形状：`sk-`+长随机串、`AKIA`+16 位、`ghp_`+长随机串、`xox[baprs]-`+长串、
+//     `-----BEGIN … PRIVATE KEY-----`、三段式 JWT。判据只认「前缀 + 足够长度」的形状，
+//     文档里单独出现 `sk-`、`AKIA`、`ghp_` 这类前缀**不算命中**（宁可窄一点，也不要假阳性）。
 //
 // 口径（与检查 3 一致：宁可说「没验证」，也绝不说「通过」）：
 //   · 命中 ⇒ fail（退出码非零），报告 文件 + 行号 + 命中类型；**不回显命中行的内容**，
 //     免得把隐私再誊写进 CI 日志；
 //   · 二进制 / 超大文件安全跳过（读不动不算失败），但跳过必须显式说明「跳过 ≠ 通过」；
-//   · 拿不到 pack 清单（--no-pack / npm 不可用）⇒ 这一条 skip 并说明原因，绝不记成通过。
+//   · 拿不到 pack 清单（--no-pack / npm 不可用）⇒ 这一条 skip 并说明原因，绝不记成通过；
+//   · 身份类判据在本次环境下不可靠（取不到用户名 / 是 runner、root 这类通用账号 / 没有 $DSH_HOME）
+//     ⇒ 显式列出「没有扫」的判据并把整条检查降为 skip（跳过 ≠ 通过）：0 命中只说明扫过的判据
+//     没命中，不说明发布物干净。绝不静默给「干净」。
 
 /** 单文件扫描上限（字节）：超过就跳过。发布物里最大的是编译产物，量级远小于此。 */
 export const PRIVACY_MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -668,31 +685,112 @@ export const PRIVACY_MAX_FILE_BYTES = 2 * 1024 * 1024
 const PRIVACY_MAX_HITS_PER_FILE = 5
 
 /** 命中类型。 */
-export type PrivacyKind = 'username' | 'windows-drive-path' | 'posix-home-path' | 'dsh-home'
+export type PrivacyKind =
+  | 'username'
+  | 'windows-drive-path'
+  | 'posix-home-path'
+  | 'unc-path'
+  | 'home-shorthand'
+  | 'userprofile-env'
+  | 'dsh-home'
+  | 'secret-api-key'
+  | 'secret-aws-access-key'
+  | 'secret-github-token'
+  | 'secret-slack-token'
+  | 'secret-private-key'
+  | 'secret-jwt'
 
 /** 命中类型 → 人话（报告里只说类型，绝不回显命中内容）。 */
 const PRIVACY_KIND_LABELS: Readonly<Record<PrivacyKind, string>> = {
   username: '本机用户名',
   'windows-drive-path': 'Windows 盘符绝对路径',
   'posix-home-path': 'POSIX 家目录绝对路径（/Users/… 或 /home/…）',
+  'unc-path': 'UNC 网络路径（\\\\host\\share）',
+  'home-shorthand': '家目录简写路径（~/…）',
+  'userprofile-env': '%USERPROFILE% 路径',
   'dsh-home': '真实 $DSH_HOME 路径',
+  'secret-api-key': '疑似 API 密钥（sk- 前缀 + 长随机串）',
+  'secret-aws-access-key': '疑似 AWS Access Key ID（AKIA + 16 位）',
+  'secret-github-token': '疑似 GitHub 令牌（ghp_ 前缀 + 长随机串）',
+  'secret-slack-token': '疑似 Slack 令牌（xox[baprs]- 前缀 + 长串）',
+  'secret-private-key': '私钥文件头（PRIVATE KEY）',
+  'secret-jwt': '疑似 JWT（三段式随机串）',
 }
 
 /**
- * Windows 盘符绝对路径：`C:\…`。
- *
- * 为什么不是裸的 `[A-Za-z]:\\`：编译产物 lib/*.js 里有 `/^\s*gitdir:\s*(.+?)\s*$/`、
- * `/^ref:\s*(.+)$/` 这类正则字面量，裸模式会把 `r:\`、`f:\` 认成盘符（假阳性，而且那是生成物，
- * 从源码里也改不掉）。所以要求盘符**不紧跟在标识符字符后面**：`gitdir:` 被挡掉，`C:\Users\x` 照旧命中。
+ * CI / 容器里的通用账号：这些名字不是「某个人的身份」，出现在文档里是常态，
+ * 拿它当隐私判据只会把通用词当成泄漏（假阳性）。命中它们时这一条判据**等于失效**。
+ *   · `runner` —— GitHub Actions（ubuntu-latest）的默认用户；
+ *   · `root`   —— POSIX 容器 / 多数 CI 镜像的默认用户。
  */
-const WINDOWS_DRIVE_PATH = /(?<![A-Za-z0-9_])[A-Za-z]:\\/u
+export const GENERIC_CI_USERNAMES: ReadonlySet<string> = new Set(['runner', 'root'])
+
+/** 这个用户名能不能当隐私判据：空串与 CI 通用账号都不能（见 {@link GENERIC_CI_USERNAMES}）。 */
+export function isUsableIdentityUsername(name: string | null | undefined): boolean {
+  const value = (name ?? '').trim()
+  return value.length > 0 && !GENERIC_CI_USERNAMES.has(value.toLowerCase())
+}
 
 /**
- * POSIX 家目录：`/Users/<name>/` 与 `/home/<name>/`，名字段只认 `[A-Za-z0-9._-]`。
- * 文档里的占位写法（`/Users/<name>/`）因此不算命中 —— 它没有泄漏任何真实名字；
- * 真实用户名（含 `.` `_` `-`）都会命中。
+ * Windows 盘符绝对路径：`C:\…` 与 `C:/…` 两种分隔符都认（`file:///D:/secret` 也算 —— 盘符前的 `/`
+ * 不是标识符字符，不会被下面的边界挡住）。
+ *
+ * 为什么不是裸的 `[A-Za-z]:[\\/]`：编译产物 lib/*.js 里有 `/^\s*gitdir:\s*(.+?)\s*$/`、
+ * `/^ref:\s*(.+)$/` 这类正则字面量，裸模式会把 `r:\`、`f:\` 认成盘符（假阳性，而且那是生成物，
+ * 从源码里也改不掉）。所以要求盘符**不紧跟在标识符字符后面**：`gitdir:` 被挡掉，`C:\Users\x`、`C:/work/x` 照旧命中。
  */
-const POSIX_HOME_PATH = /\/(?:Users|home)\/[A-Za-z0-9._-]+\//u
+const WINDOWS_DRIVE_PATH = /(?<![A-Za-z0-9_])[A-Za-z]:[\\/]/u
+
+/**
+ * POSIX 家目录：`/Users/<name>` 与 `/home/<name>`，**不要求尾斜杠**（`see /home/bob` 这种写法同样命中）。
+ * 名字段只认 `[A-Za-z0-9._-]`，所以文档里的占位写法（`/Users/<name>`、`/home/<name>`）不算命中 ——
+ * 它没有泄漏任何真实名字；真实用户名（含 `.` `_` `-`）都会命中。
+ *
+ * 左边的 `(?<![A-Za-z0-9._-])` 挡掉「前面还连着路径/主机名」的情况：`docs/home/x`、`host/home/index.html`
+ * 属于相对路径或 URL 路径段，不是某台机器的家目录。`file:///home/bob` 之类仍然命中（`/` 不是标识符字符）。
+ */
+const POSIX_HOME_PATH = /(?<![A-Za-z0-9._-])\/(?:Users|home)\/[A-Za-z0-9._-]+(?![A-Za-z0-9._-])/u
+
+/**
+ * UNC 网络路径：`\\host\share…`。
+ * 主机名与共享名都至少两位，且前面不能是反斜杠或标识符字符 —— 这样转义序列 `\\w\\s`、`\\s\\s`
+ * （正则字面量里常见）不会因为「反斜杠 + 单字母」被误认成主机名与共享名。
+ */
+const UNC_PATH = /(?<![\\A-Za-z0-9_])\\\\[A-Za-z0-9][A-Za-z0-9._-]{1,}\\[A-Za-z0-9$][A-Za-z0-9$._-]{0,}/u
+
+/**
+ * 家目录简写：`~/…`，要求 `~/` 后面真的跟着一个路径字符（`~/` 单独出现不算），
+ * 且左边不是标识符字符（挡掉 `docs~/x` 之类噪声）。
+ */
+const HOME_SHORTHAND_PATH = /(?<![A-Za-z0-9._-])~\/[A-Za-z0-9._$-]/u
+
+/** `%USERPROFILE%`（大小写不敏感，在 lower 上判）。它指向真实家目录，进包等于泄漏。 */
+const USERPROFILE_ENV = '%userprofile%'
+
+// ── 凭证形状 ────────────────────────────────────────────────────────────────
+// 刻意只认「前缀 + 足够长度的随机串」：文档里单独出现 `sk-`、`AKIA`、`ghp_`、`xoxb-` 不该报，
+// 普通长单词（`risk-management-strategy-documentation`）也不该报 —— 所以每个判据都带左右边界，
+// 并给了最小长度。宁可窄一点漏一点，也不要让开发文档频繁误报、最后把这条检查关掉。
+//
+// 反例（刻意**不**命中）写在 tests/tools.test.ts 里，与判据一一对应。
+
+/** `sk-` + ≥20 位随机串（OpenAI / Anthropic 等；左边不能是标识符字符，挡掉 `risk-management-…`）。 */
+const SECRET_API_KEY = /(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/u
+
+/** `AKIA` + ≥16 位大写字母数字（AWS Access Key ID 是 AKIA + 16 位）。 */
+const SECRET_AWS_ACCESS_KEY = /(?<![A-Za-z0-9])AKIA[A-Z0-9]{16,}(?![A-Za-z0-9])/u
+
+/** `ghp_` + ≥20 位字母数字（GitHub personal access token 是 ghp_ + 36 位）。 */
+const SECRET_GITHUB_TOKEN = /(?<![A-Za-z0-9_])ghp_[A-Za-z0-9]{20,}(?![A-Za-z0-9])/u
+
+/** `xox[baprs]-` + ≥10 位字母数字/连字符（Slack 令牌）。 */
+const SECRET_SLACK_TOKEN = /(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9-])/u
+
+/** PEM 私钥头：`-----BEGIN PRIVATE KEY-----`、`-----BEGIN RSA PRIVATE KEY-----`、OpenSSH / EC / PGP 等。 */
+const SECRET_PRIVATE_KEY_HEADER = /-----BEGIN [A-Z ]*PRIVATE KEY[A-Z ]*-----/u
+
+/** JWT：`eyJ…`（base64 的 `{"`）开头的三段式，每段都要求足够长。 */
+const SECRET_JWT = /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?![A-Za-z0-9_-])/u
 
 /** 一条命中。 */
 export interface PrivacyHit {
@@ -724,6 +822,14 @@ export interface PrivacyScanOptions {
   maxBytes?: number
 }
 
+/** 一条在本次环境下**不可靠、实际没有扫**的判据（CI 局限：跳过 ≠ 通过）。 */
+export interface UnavailableCriterion {
+  /** 判据标识（复用命中类型，便于 CI 里筛选）。 */
+  kind: PrivacyKind
+  /** 一句人话：为什么这次扫不了，以及「跳过 ≠ 通过」。 */
+  reason: string
+}
+
 /** 隐私扫描结论。 */
 export interface PrivacyScanResult {
   /** 命中明细（每个文件最多 `PRIVACY_MAX_HITS_PER_FILE` 条）。 */
@@ -734,8 +840,10 @@ export interface PrivacyScanResult {
   scanned: number
   /** 跳过的文件（二进制 / 超大 / 读不到 / 越界）。 */
   skipped: PrivacySkip[]
-  /** 没能覆盖到的扫描项（取不到用户名 / 没设 `$DSH_HOME`）。 */
+  /** 没能覆盖到的扫描项（取不到用户名 / 通用账号 / 没设 `$DSH_HOME`），也含在 `unavailable` 里。 */
   notes: string[]
+  /** 本次环境下不可靠、实际没有扫的判据（调用方必须显式说「跳过 ≠ 通过」，不许当「干净」）。 */
+  unavailable: UnavailableCriterion[]
 }
 
 /** 本机用户名：取不到就返回空串，报告里明说这一项没扫，不假装扫过。 */
@@ -764,16 +872,32 @@ export function scanReleasePrivacy(options: PrivacyScanOptions): PrivacyScanResu
   const hits: PrivacyHit[] = []
   const skipped: PrivacySkip[] = []
   const notes: string[] = []
+  const unavailable: UnavailableCriterion[] = []
   let hitsTotal = 0
   let scanned = 0
 
   const maxBytes = options.maxBytes ?? PRIVACY_MAX_FILE_BYTES
-  const username = (options.username === undefined ? localUsername() : options.username) ?? ''
+  const rawUsername = (options.username === undefined ? localUsername() : options.username) ?? ''
+  const username = rawUsername.trim()
+  // 空串 / CI 通用账号（runner、root）都不能当判据：前者取不到身份，后者不是任何人的身份。
+  const usernameUsable = isUsableIdentityUsername(username)
   const dshHome = (options.dshHome === undefined ? (process.env.DSH_HOME ?? '') : options.dshHome) ?? ''
-  if (username.length === 0) notes.push('取不到本机用户名（os.userInfo() 不可用），「本机用户名」这一项**没有扫**。')
-  if (dshHome.length === 0) notes.push('环境里没有 $DSH_HOME，这一项**没有扫**（不是通过）。')
+  if (!usernameUsable) {
+    const reason =
+      username.length === 0
+        ? '取不到本机用户名（os.userInfo() 不可用），「本机用户名」这一项**没有扫**（跳过 ≠ 通过，不是通过）。'
+        : `本机用户名是 CI / 容器通用账号（${[...GENERIC_CI_USERNAMES].join('、')} 之类），它不是任何人的身份信息：` +
+          '「本机用户名」这一项在本次环境下不可靠，**没有扫**（跳过 ≠ 通过，不是通过）。'
+    notes.push(reason)
+    unavailable.push({ kind: 'username', reason })
+  }
+  if (dshHome.length === 0) {
+    const reason = '环境里没有 $DSH_HOME，这一项**没有扫**（跳过 ≠ 通过，不是通过）。'
+    notes.push(reason)
+    unavailable.push({ kind: 'dsh-home', reason })
+  }
 
-  const usernameLower = username.toLowerCase()
+  const usernameLower = usernameUsable ? username.toLowerCase() : ''
   // 同一份 $DSH_HOME，文本里可能写成反斜杠或正斜杠，两种写法都算命中。
   const dshNeedles =
     dshHome.length === 0 ? [] : [...new Set([dshHome, dshHome.replace(/\\/gu, '/')])].map((value) => value.toLowerCase())
@@ -784,9 +908,19 @@ export function scanReleasePrivacy(options: PrivacyScanOptions): PrivacyScanResu
   }
   matchers.push({ kind: 'windows-drive-path', match: (line) => WINDOWS_DRIVE_PATH.test(line) })
   matchers.push({ kind: 'posix-home-path', match: (line) => POSIX_HOME_PATH.test(line) })
+  matchers.push({ kind: 'unc-path', match: (line) => UNC_PATH.test(line) })
+  matchers.push({ kind: 'home-shorthand', match: (line) => HOME_SHORTHAND_PATH.test(line) })
+  matchers.push({ kind: 'userprofile-env', match: (_line, lower) => lower.includes(USERPROFILE_ENV) })
   if (dshNeedles.length > 0) {
     matchers.push({ kind: 'dsh-home', match: (_line, lower) => dshNeedles.some((needle) => lower.includes(needle)) })
   }
+  // 凭证形状：只报「前缀 + 足够长度」，文档里的普通词与单独出现的前缀都不报。
+  matchers.push({ kind: 'secret-api-key', match: (line) => SECRET_API_KEY.test(line) })
+  matchers.push({ kind: 'secret-aws-access-key', match: (line) => SECRET_AWS_ACCESS_KEY.test(line) })
+  matchers.push({ kind: 'secret-github-token', match: (line) => SECRET_GITHUB_TOKEN.test(line) })
+  matchers.push({ kind: 'secret-slack-token', match: (line) => SECRET_SLACK_TOKEN.test(line) })
+  matchers.push({ kind: 'secret-private-key', match: (line) => SECRET_PRIVATE_KEY_HEADER.test(line) })
+  matchers.push({ kind: 'secret-jwt', match: (line) => SECRET_JWT.test(line) })
 
   const repoRoot = resolvePath(options.repo)
   const rootPrefix = repoRoot.endsWith(sep) ? repoRoot : `${repoRoot}${sep}`
@@ -853,13 +987,22 @@ export function scanReleasePrivacy(options: PrivacyScanOptions): PrivacyScanResu
     }
   }
 
-  return { hits, hitsTotal, scanned, skipped, notes }
+  return { hits, hitsTotal, scanned, skipped, notes, unavailable }
 }
 
-/** 检查 4：npm pack 会发布的每个文件里不能出现隐私（用户名 / 绝对路径 / 真实 $DSH_HOME）。 */
-function checkPrivacy(options: VerifyOptions, packCheck: CheckResult, files: readonly string[] | null): CheckResult {
+/**
+ * 检查 4：npm pack 会发布的每个文件里不能出现隐私（用户名 / 绝对路径 / 真实 $DSH_HOME / 凭证）。
+ *
+ * `identity` 只是给测试用的注入点（用户名 / `$DSH_HOME`）；生产调用不传，走环境探测。
+ */
+export function checkPrivacy(
+  options: VerifyOptions,
+  packCheck: CheckResult,
+  files: readonly string[] | null,
+  identity: { username?: string | null; dshHome?: string | null } = {},
+): CheckResult {
   const id = 'privacy'
-  const title = '发布物里不能出现本机用户名、绝对路径或真实 $DSH_HOME'
+  const title = '发布物里不能出现本机用户名、绝对路径、真实 $DSH_HOME 或凭证'
 
   if (files === null) {
     // pack 拿不到清单：这一条必须显式「跳过」并说明原因，绝不记成通过。
@@ -876,7 +1019,7 @@ function checkPrivacy(options: VerifyOptions, packCheck: CheckResult, files: rea
     }
   }
 
-  const result = scanReleasePrivacy({ repo: options.repo, files })
+  const result = scanReleasePrivacy({ repo: options.repo, files, ...identity })
   const details = [
     `扫描范围：npm pack 实际会发布的 ${files.length} 个文件；逐行扫过 ${result.scanned} 个，跳过 ${result.skipped.length} 个。`,
   ]
@@ -891,11 +1034,22 @@ function checkPrivacy(options: VerifyOptions, packCheck: CheckResult, files: rea
     details.push(`命中 ${result.hitsTotal} 处（只报文件、行号与命中类型，不回显命中内容）：`)
     for (const hit of result.hits) details.push(`  · ${hit.file}:${hit.line} 命中「${PRIVACY_KIND_LABELS[hit.kind]}」`)
     if (result.hitsTotal > result.hits.length) details.push(`  …另有 ${result.hitsTotal - result.hits.length} 处未逐条列出`)
-    details.push('本机用户名 / 绝对路径 / 真实 $DSH_HOME 进包就等于一起发布出去：请改成占位写法（如 <home>、<name>）或把该文件移出 `files`。')
+    details.push('本机用户名 / 绝对路径 / 真实 $DSH_HOME / 凭证进包就等于一起发布出去：请改成占位写法（如 <home>、<name>）或把该文件移出 `files`；')
+    details.push('若命中凭证（sk- / AKIA / ghp_ / xox[baprs]- / PRIVATE KEY / JWT），发布出去的那把密钥必须**撤销并轮换**，只删文件不够。')
     return { id, title, status: 'fail', details }
   }
 
-  const clean = `干净：已扫过的 ${result.scanned} 个文件里没有本机用户名、绝对路径或真实 $DSH_HOME。`
+  // 判据本身不可靠（CI 里 username=runner、$DSH_HOME 通常缺失）⇒ 不许静默给「干净」：
+  // 显式列出「没有扫」的判据，整条检查降为 skip（与检查 3 的 npm 不可用同一种口径）。
+  if (result.unavailable.length > 0) {
+    const labels = result.unavailable.map((item) => PRIVACY_KIND_LABELS[item.kind]).join('、')
+    details.push(`本次环境不可靠、实际**没有扫**的判据：${labels}（原因见上）。`)
+    details.push('跳过 ≠ 通过：这一条**没有完整验证通过** —— 命中 0 处只说明扫过的那些判据没命中，不说明发布物干净。')
+    details.push('这些判据要在具备条件的环境（开发者本机、或设了 $DSH_HOME 的机器）里再跑一次才算验证过；CI 的 runner、root 账号不构成身份信息。')
+    return { id, title, status: 'skip', details }
+  }
+
+  const clean = `干净：已扫过的 ${result.scanned} 个文件里没有本机用户名、绝对路径、真实 $DSH_HOME 或凭证。`
   details.push(result.skipped.length > 0 ? `${clean}（但跳过 ≠ 通过，见上。）` : clean)
   return { id, title, status: 'pass', details }
 }

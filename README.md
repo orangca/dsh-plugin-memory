@@ -5,9 +5,11 @@ explainable and deletable.
 
 [中文说明](README.zh.md) | English
 
-- **Local** — all data lives under `$DSH_HOME/storages/<domainName>/`. No network calls, and no embedding service of its own:
-  retrieval is lexical by default, and the optional external embedder described below is something **the host**
-  injects (see [External embedder (optional)](#external-embedder-host-injected-and-off-by-default)).
+- **Local** — all data lives under `$DSH_HOME/storages/<domainName>/`. The plugin makes **no network call of its own**
+  and ships no embedding service or model: retrieval is lexical by default, and the optional external embedder
+  described below is something **the host** injects. With nothing injected nothing leaves the machine; if the host
+  injects a **remote** embedder, memory text does leave it — see
+  [External embedder (optional)](#external-embedder-host-injected-and-off-by-default).
 - **Automatic** — at turn end a rule engine extracts what is worth remembering from *real user messages only*,
   with zero extra model calls.
 - **Budgeted** — every injection has a hard token cap; overflow is truncated by priority.
@@ -41,8 +43,9 @@ explainable and deletable.
    accumulate too many rows. A separate cross-session pass, `/sleep`, is triggered explicitly by the user (see
    below).
 4. **Score (optional)** — the host may inject an `embed` function into the service surface (§3.6 of the protocol).
-   That is what makes `recall({ mode })` able to rank by embedding similarity, and it is **off by default**; see
-   [External embedder (optional)](#external-embedder-host-injected-and-off-by-default).
+   That is what makes `recall({ mode })` able to rank by embedding similarity, and it is **off by default**: with no
+   embedder registered, `recall({ mode: 'semantic' | 'hybrid' })` **falls back to lexical** and says so through
+   `lastRecall()`. See [External embedder (optional)](#external-embedder-host-injected-and-off-by-default).
 
 ## The self-portrait: persona + work tendencies
 
@@ -166,6 +169,11 @@ Each memory records its **source**: which session, and which event-sequence rang
 - **Checkable**: `/memory verify <id>` walks back to the cited events and compares them with the row's text using
   informative-token coverage, printing `✅ hit (coverage x)` / `⚠️ miss` / `⚠️ session or events missing`. Read-only.
 - **Visible**: `/memory show <id>` gains a `source:` line, and `memory_explain` exposes `refs` too.
+- **Machine-readable form**: a reference is written `sessionId#from-to`, a single point is just `sessionId#from`
+  (a reference with no sequence numbers is the bare `sessionId`), and several references are joined with `;` —
+  `session-84a547da-5727-4ffc-adf0-26d02e749e13#120-180;session-…-…#93` (the `…-…-…` are elided id segments, not
+  literal text). The **storage** form always keeps the full session id;
+  the short form (`ses-84a547da#120-180`) exists only for display, and `formatRefs` does **not** shorten by default.
 - **Never part of the fingerprint**: `recordHash` ignores `refs` — otherwise the same memory would count as two rows
   just because it came from somewhere else, breaking deduplication and idempotency. Rows written before 0.5.9 have no
   references; every read path tolerates that (`/memory verify` says so explicitly).
@@ -316,7 +324,9 @@ What changes once one is registered:
   which is the default, also makes **zero** embedding calls and returns exactly what 0.5.19 returned.
 - **Explicit modes.** `recall({ mode: 'semantic' })` orders by embedding similarity; `'hybrid'` blends lexical and
   semantic with `embedderWeight`. `capabilities()` answers "is an embedder registered" and `stats().embedder` shows
-  `calls` / `errors` / `hits` / `misses` / `timeouts` — check rather than guess.
+  `calls` / `errors` / `hits` / `misses` / `timeouts` — check rather than guess. **The same call has two possible
+  shapes**: with nothing registered (or with `'lexical'`) it returns the array synchronously, and once a registered
+  embedder is really going to be called it returns a Promise — so `await` it, which is safe for both.
 - **A failure falls back to lexical, and `lastRecall()` says so.** An embedder that throws, rejects, times out or
   returns a wrong shape or mismatched dimensions is counted as an error and the call falls back to lexical scoring:
   the recall never rejects, no memory is lost and no turn fails. `lastRecall()` reports the requested `mode`,
@@ -324,10 +334,13 @@ What changes once one is registered:
   `'timeout'` / `null`) and how many candidates and vectors were involved — so you are never told "semantic" when
   what you got was lexical.
 - **The plugin is not the one making the privacy call.** The plugin **itself never goes online and never ships or
-  runs a model of its own**; it only calls the `embed` function the host injected. Whether memory text is sent to an
-  external service, **where** it is sent, and whether any of it is logged is **decided by the host and the user** —
-  the plugin does not make that decision and cannot make it on their behalf. If you do not inject an embedder,
-  nothing is sent anywhere.
+  runs a model of its own**; it only calls the `embed` function the host injected. **That function is what memory
+  text is handed to** — the plugin passes the record text to `embedder.embed(...)`, so where that text ends up is a
+  property of the embedder, not of the plugin. Whether memory text is sent to an external service, **where** it is
+  sent, and whether any of it is logged is **decided by the host and the user** — the plugin does not make that
+  decision and cannot make it on their behalf. If you do not inject an embedder, nothing is sent anywhere; if you
+  inject an embedder that calls a remote API (for example one whose `id` reads
+  `openai:text-embedding-3-small`), **memory bodies leave the machine**.
 
 ## `/memory audit`: write audit and injection verification
 
@@ -511,7 +524,7 @@ the settings form:
 | `sleepSessions` | `3` | Sessions reviewed by default when `--sessions=N` is omitted (capped at 20) |
 | `sleepMaxBackfill` | `20` | Maximum rows one `/sleep --apply` may backfill (only things you explicitly asked to remember) |
 | `refsEnabled` | `true` | Record where each memory came from (session + event seq range); in the form `0` = off, `1` = on. Off only affects new rows |
-| `refsMax` | `5` | How many source references one row keeps (newest first); `0` = none, `Infinity` = unlimited |
+| `refsMax` | `5` | How many source references one row keeps (newest first — that order is the **writer's** convention, kept as given); `0` = none, `Infinity` = unlimited |
 | `writePolicy` | `auto` | Approval gate for model-origin writes: `auto` (apply immediately, default) / `ask` (queue for confirmation) / `off` (reject outright); rule capture, user commands and `/sleep` are never gated |
 | `pendingMax` | `50` | Cap for the pending queue; when full a new write is rejected with a structured error, never silently dropped; `0` = unlimited |
 | `language` | `zh` | Language of the **model-visible** text (`zh` / `en`): injection blocks and their headers/footers, injection prompts, the per-turn recall block and the tool descriptions. Command output stays Chinese either way; the default `zh` is byte-for-byte identical to 0.5.10 |
@@ -548,9 +561,12 @@ $DSH_HOME/storages/dsh_memory/
 
 - The storage root is **home-level**: every profile on the machine shares one store by default, which is usually
   what you want for personal memory.
-- Nothing leaves the machine. There is no telemetry, and no embedding service of its own: retrieval is lexical
-  unless **you** inject an external embedder through `ctx.memory.setEmbedder`, and that is optional, off by
-  default and entirely the host's decision to make (see
+- Nothing leaves the machine unless the host hands it out. There is no telemetry, and no embedding service of its
+  own: retrieval is lexical unless **you** inject an external embedder through `ctx.memory.setEmbedder`, and that is
+  optional, off by default and entirely the host's decision to make. Be explicit about the consequence: the plugin
+  gives **memory text** (the record bodies it ranks) to `embedder.embed(...)`, so an embedder that talks to a remote
+  service **sends memory text off the machine** — pick a local embedder if that matters, and check what the injected
+  one does before registering it (see
   [External embedder (optional)](#external-embedder-host-injected-and-off-by-default)).
 - Sensitive content is rejected before it reaches a file; PII is masked. Both behaviours are covered by tests.
 - DSH does not migrate domain versions automatically: bumping `version` requires declaring `compatibleVersions`.

@@ -1974,3 +1974,369 @@ test('protocol#33 未注册 embedder：服务面缺省操作一次嵌入调用�
   assert.deepEqual(countsOf(semanticOnly), afterUse, '清除 embedder 不得清零历史计数（只加不减）')
   assert.equal(typeof stats0.version, 'number', '既有 stats 字段不受 v1.3 影响')
 })
+
+// ================================================================ 审计修复加固：对抗性审计确认的四类真问题
+//
+// 本节**纯追加**：上面 33 项一字未改（也无需改 —— 本轮修复不放宽任何既有承诺，只把它们守得更死）。
+// 与前三节的分工：前三节钉「协议文档承诺了什么」，这一节钉「修复后的**真实行为**是什么」，
+// 每一条都先给出**可判定的对照**（默认面 / 对照组 / 数量级），避免断言写成空话。
+//
+// 四件事（全部来自本轮对抗性审计确认的真问题）：
+//   · ① `recall` 的同步/异步口径：未注册 embedder 时 `'semantic'` 必定回落词面，若仍返回 Promise，
+//     就违反 §3 冻结的「词面 ⇒ 同步数组」；
+//   · ② `setEmbedder` / `capabilities()` / `stats()` 面对**带抛错访问器**的宿主对象：
+//     契约是返回结构化结果，宿主对象的坏 getter 不许变成插件的故障；
+//   · ③ 敏感信息判定形态 = **注入时的渲染形态**：零宽/格式字符拆写的密钥必须拒写
+//     （`clampText` 注入前会把它们剥掉 ⇒ 判定层不剥就等于放行明文密钥）；
+//   · ④ 注入预算的两个数必须是**有限正数**才生效：非有限值会让硬上限整体失效（全量注入）
+//     或静默关闭注入，因此一律回落默认。
+
+/** 审计加固用例的探针正文（每条都在断言里被点名，改文案必须同步改断言）。 */
+const AUDIT_TEXT = {
+  /** 零宽/格式字符**拆写**的密钥：渲染后与明文写法完全一致（`clampText` 会剥掉这些字符）。 */
+  zeroWidthKey: 'api key: sk-\u200babcdefghijklmnop123456',
+  /** 同一条密钥的明文写法：判定必须与它同口径（这条在 protocol#3/#19/#23 里已经钉过）。 */
+  plainKey: 'api key: sk-abcdefghijklmnop123456',
+  /** 全角写法（NFKC 折叠后才是密钥形状）—— 既有修复不能因本轮改动而回退。 */
+  fullWidthKey: 'ａｐｉ　ｋｅｙ：ｓｋ－ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐ１２３４５６',
+  /** 对照：不含密钥的普通正文必须照常写入（否则「拒写」可能只是什么都写不进去）。 */
+  benign: '普通正文对照：这个项目的构建产物统一输出到 build 目录。',
+  /** 注入预算探针：正文足够长，一条就能吃掉大半个预算，行数差异才看得见。 */
+  bulky: '注入预算探针：这条正文刻意写得足够长，用来把常驻注入的硬上限真实填满。',
+} as const
+
+/** 注入文本的条目行数（块头/块尾不算），以及整块的字符数 —— 预算生效与否的两个可观测量。 */
+const blockLines = (text: string): string[] => text.split('\n').filter((line) => line.startsWith('- '))
+const lastRecallOf = (service: V13Service): V13RecallDiag => {
+  const diag = service.lastRecall()
+  assert.ok(diag, 'lastRecall() 必须非 null（本次召回刚发生过）')
+  return diag
+}
+
+/**
+ * 造一个「足够大的」画像库并返回按轮召回块：行数与整块字符数都要能被预算真实压制，
+ * 才能区分「回落默认」与「预算失效（全量注入）」。
+ *
+ * 记录数取 40：默认预算（`maxInjectedTokens` 300、`charsPerToken` 2.5）下 40 条探针只注得进 12 条，
+ * 而预算被放大到 1e9 时 40 条全进 —— 「预算真的在压」这件事才有据可查（8 条时两者都是全量，无法区分）。
+ */
+const BUDGET_PROBE_RECORDS = 40
+
+async function buildBudgetProbe(config: Json, count = BUDGET_PROBE_RECORDS): Promise<{ block: string; records: number }> {
+  const harness = makeV11Harness({ config: { ...config, consolidateEnabled: false } })
+  try {
+    await harness.settle()
+    for (let index = 0; index < count; index += 1) {
+      const saved = await harness.service().write({
+        kind: 'user_profile',
+        origin: 'observed',
+        scope: { level: 'profile', key: '*' },
+        confidence: 0.9,
+        importance: 0.9,
+        subject: `audit.budget.${index}`,
+        text: `${AUDIT_TEXT.bulky}（第${index}条）`,
+      })
+      assert.equal(saved.ok, true, `前置条件：探针记录必须写入成功（第 ${index} 条）`)
+    }
+    return { block: harness.contextBlock(null), records: harness.service().stats().records }
+  } finally {
+    await harness.dispose()
+  }
+}
+
+// ---------------------------------------------------------------- 34. §3 同步 / 异步口径
+
+test("protocol#34 recall 的同步口径：未注册 embedder 时 semantic/hybrid 同步回落，注册后才是 Promise（§0.2/§3）", async (t) => {
+  const harness = makeV11Harness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = v13(harness)
+  await service.write({ kind: 'semantic', origin: 'observed', subject: 'audit.sync', text: V13_TEXT.pnpm })
+
+  const asPromise = (value: unknown): Promise<unknown> => value as Promise<unknown>
+  /** 断言「同步数组 ⇒ 没有 then」：这正是 §3 冻结的「词面模式返回同步数组」。 */
+  const expectSyncArray = (value: unknown, label: string): void => {
+    assert.equal(Array.isArray(value), true, `${label} 必须是数组`)
+    assert.equal(typeof asPromise(value).then, 'undefined', `${label} 不得是 Promise（词面路径没有任何异步理由）`)
+  }
+
+  // ① 未注册 embedder：`'semantic'` / `'hybrid'` **必定**回落词面（一次 embed 都不会调），
+  //    因此必须**同步**返回数组，而不是「包一层 Promise 的同步结果」。
+  for (const mode of ['semantic', 'hybrid'] as const) {
+    const value = service.recall({ query: 'pnpm', mode, limit: 50 })
+    expectSyncArray(value, `未注册时 recall({mode:'${mode}'})`)
+    const diag = lastRecallOf(service)
+    assert.equal(diag.mode, mode, `${mode}：诊断记的是调用方**请求**的模式`)
+    assert.equal(diag.used, false, `${mode}：回落没有用到嵌入 ⇒ used:false`)
+    assert.equal(diag.fallback, 'no-embedder', `${mode}：必须如实标 fallback:'no-embedder'（§0.5 冻结字面量）`)
+    assert.equal(diag.vectors, 0, `${mode}：一个向量都没拿到 ⇒ vectors:0`)
+  }
+
+  // ② 缺省 / `'lexical'` 仍旧是同步数组（这是 0.5.19 就有的口径，本轮修复不得改变它）。
+  const baseline = lexicalHits(service, { query: 'pnpm' })
+  assert.ok(hitIds(baseline).length > 0, '前置条件：词面召回必须命中，否则下面的「同结果」是空的')
+  for (const [label, options] of [
+    ['缺省（不传 mode）', { query: 'pnpm' }],
+    ["mode: 'lexical'", { query: 'pnpm', mode: 'lexical' }],
+  ] as Array<[string, Json]>) {
+    const value = service.recall({ limit: 50, ...options })
+    expectSyncArray(value, label)
+    assert.deepEqual(hitIds(value as Array<{ record: Json }>), hitIds(baseline), `${label} 必须与既有词面召回同结果同序`)
+    assert.equal(lastRecallOf(service).fallback, null, `${label}：词面是主路径 ⇒ fallback 为 null（不是回落）`)
+  }
+
+  // ③ 注册之后语义真的要用嵌入 ⇒ 必然是 Promise（只有「真的会用到嵌入」时才异步）。
+  const { embedder } = makeV13Embedder({ id: 'audit-sync', dimensions: 3 })
+  assert.deepEqual(service.setEmbedder(embedder), { ok: true, id: 'audit-sync' }, '前置条件：注册可用 embedder')
+  for (const mode of ['semantic', 'hybrid'] as const) {
+    const value = service.recall({ query: 'pnpm', mode, limit: 50 })
+    assert.equal(typeof asPromise(value).then, 'function', `注册后 recall({mode:'${mode}'}) 必须返回 Promise（要等 embed）`)
+    await value
+    assert.ok(Array.isArray(await value), `${mode}：await 之后仍是数组（形状不变）`)
+  }
+
+  // ④ 词面模式**不因注册而变异步**：注册只影响显式语义模式。
+  expectSyncArray(service.recall({ query: 'pnpm', mode: 'lexical', limit: 50 }), "注册后 mode:'lexical'")
+  expectSyncArray(service.recall({ query: 'pnpm', limit: 50 }), '注册后缺省模式')
+
+  // ⑤ 清除之后回到「同步回落」（幂等，不是单向门）。注册期的调用已经推动过计数器，
+  //    因此这里只断言**清除之后**这一段没有再调一次 embed（计数器原地不动）。
+  assert.deepEqual(service.setEmbedder(null), { ok: true, id: null })
+  const clearedBefore = countsOf(service)
+  const cleared = service.recall({ query: 'pnpm', mode: 'semantic', limit: 50 })
+  expectSyncArray(cleared, "清除后 recall({mode:'semantic'})")
+  assert.equal(lastRecallOf(service).fallback, 'no-embedder', '清除后必须如实标 no-embedder')
+  assert.deepEqual(countsOf(service), clearedBefore, '清除后未注册 ⇒ 这次同步回落一次 embed 都不许发生')
+})
+
+// ---------------------------------------------------------------- 35. §2 既有词面口径
+
+test("protocol#35 recall({mode:'query'})/{mode:'memory'} 仍走词面：同步数组、不报错（§3 只做加法）", async (t) => {
+  const harness = makeV11Harness({ config: { writePolicy: 'ask', consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = v13(harness)
+  await service.write({ kind: 'semantic', origin: 'observed', subject: 'audit.memorymode', text: V13_TEXT.pnpm })
+
+  /** 对照：真正决定结果的是「mode 键被剥掉之后的词面口径」，而不是 mode 字符串本身。 */
+  const withoutMode = (query: string): Array<{ record: Json }> => lexicalHits(service, { query })
+  const withMode = (query: string, mode: string): Array<{ record: Json }> => {
+    const value = service.recall({ query, mode, limit: 50 })
+    assert.equal(Array.isArray(value), true, `mode:'${mode}' 必须返回数组，而不是抛错或返回 undefined`)
+    assert.equal(typeof (value as Promise<unknown>).then, 'undefined', `mode:'${mode}' 仍是词面 ⇒ 同步数组`)
+    return value as Array<{ record: Json }>
+  }
+
+  // 'query' 是**既有**的词面口径（默认口径），与不传 mode 逐条同结果同序。
+  assert.deepEqual(
+    hitIds(withMode('pnpm', 'query')),
+    hitIds(withoutMode('pnpm')),
+    "mode:'query' 就是既有默认词面口径（不得被误当作 v1.3 的模式键）",
+  )
+  assert.equal(withMode('pnpm', 'query').length, 1, '前置条件：库里只有一条相关记录，命中断言才有意义')
+  assert.equal(lastRecallOf(service).fallback, null, "mode:'query' 是主路径 ⇒ fallback 为 null")
+
+  // 'memory' 是既有的**长查询**口径：长查询下必须命中（否则「不报错」可能只是恒空占位）。
+  const longQuery = '构建流程统一使用 pnpm 作为包管理器'
+  const memoryHits = withMode(longQuery, 'memory')
+  assert.ok(memoryHits.length > 0, "mode:'memory' 在长查询下必须照旧命中（不是恒空占位）")
+  assert.deepEqual(
+    hitIds(memoryHits),
+    hitIds(withoutMode(longQuery)),
+    "mode:'memory' 与缺省词面口径在长查询下同结果（'memory' 不是独立口径，只是显式写出来）",
+  )
+  assert.equal(lastRecallOf(service).fallback, null, "mode:'memory' 也是主路径 ⇒ fallback 为 null")
+
+  // 短查询下它是**覆盖率门槛更严**的既有口径（protocol#25 已钉：与缺省口径不等，可能给空结果）。
+  // 本轮修复不许把它悄悄改成缺省口径，所以这里只钉「返回同步数组、不抛错、零嵌入调用」这三件事，
+  // 不断言它与缺省口径同结果 —— 那会与 #25 已冻结的既有语义冲突。
+  const shortMemory = withMode('pnpm', 'memory')
+  assert.ok(Array.isArray(shortMemory), "mode:'memory' 的短查询路径同样给数组（空也是合法结果）")
+
+  // 两个模式都不该动嵌入计数器（词面路径零成本），也不该留下「回落」诊断。
+  assert.deepEqual(countsOf(service), { calls: 0, errors: 0, hits: 0, misses: 0, timeouts: 0 }, '词面口径的零嵌入调用')
+  assert.equal(lastRecallOf(service).used, false, '词面排序没有用到嵌入 ⇒ used:false')
+  assert.equal(lastRecallOf(service).fallback, null, "词面口径都是主路径 ⇒ fallback 为 null（含 'memory'）")
+})
+
+// ---------------------------------------------------------------- 36. §2 宿主对象的坏访问器
+
+test('protocol#36 setEmbedder 遇到抛错的 id/dimensions 访问器：结构化拒绝且不改注册状态；capabilities()/stats() 注册后也不抛（§2）', async (t) => {
+  const harness = makeV11Harness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = v13(harness)
+
+  const boom = (): never => { throw new Error('host accessor exploded (fault injection)') }
+  const embedIfCalled = (): never => { throw new Error('embed 不该被调用（本用例只做注册形状检查）') }
+  /** 造一个带「一读就抛」访问器的宿主对象；`keys` 指定哪些属性毒化。 */
+  const poisoned = (...keys: Array<'id' | 'dimensions'>): Json => {
+    const bad: Json = { id: 'poisoned', embed: embedIfCalled }
+    for (const key of keys) Object.defineProperty(bad, key, { get: boom, enumerable: true })
+    return bad
+  }
+  /** 非法入参表：三种毒化组合都必须走结构化拒绝（`setEmbedder` 逐个属性读取，顺序不影响结论）。 */
+  const invalid: Array<[string, unknown]> = [
+    ['id 访问器抛错', poisoned('id')],
+    ['dimensions 访问器抛错', poisoned('dimensions')],
+    ['id 与 dimensions 访问器都抛错', poisoned('id', 'dimensions')],
+  ]
+
+  const notRegistered = { protocolVersion: '1.3', lexical: true, embedder: false, embedderId: null }
+
+  // a) 未注册状态：逐条拒绝，且拒绝之后必须**仍然**是未注册（不是半改不改的中间态）。
+  for (const [label, value] of invalid) {
+    let result: { ok: boolean; error?: string } = { ok: true }
+    // 用 try/catch 而不是 doesNotReject：抛错时要能**同时**证明「冒泡了」与「状态没被改」这两件事，
+    // 而不是只看到一条「不该抛」的失败信息。
+    try {
+      result = service.setEmbedder(value) as { ok: boolean; error?: string }
+    } catch (error) {
+      assert.fail(`宿主访问器抛错绝不允许冒泡给调用方：${label} → ${String(error)}`)
+    }
+    assert.equal(result.ok, false, `抛错访问器必须被当作非法处理：${label}`)
+    assert.match(String(result.error), /^rejected_invalid: /u, `错误形状必须是「错误码: 说明」：${label} → ${String(result.error)}`)
+    assert.deepEqual(service.capabilities(), notRegistered, `被拒之后仍必须是未注册：${label}`)
+    assert.deepEqual(service.stats().embedder.id, null, `被拒不得留下痕迹：${label}`)
+    assert.deepEqual(service.stats().embedder.dimensions, null, `被拒不得留下 dimensions：${label}`)
+  }
+
+  // b) 已注册状态：抛错访问器同样必须被拒，而且必须**保住**原来那个嵌入器。
+  const kept: Json = { id: 'kept-under-poison', dimensions: 3, embed: (texts: readonly string[]) => texts.map(() => [1, 2, 3]) }
+  assert.deepEqual(service.setEmbedder(kept), { ok: true, id: 'kept-under-poison' }, '前置条件：先注册一个正常嵌入器')
+  for (const [label, value] of invalid) {
+    assert.equal(service.setEmbedder(value).ok, false, `已注册时抛错访问器同样必须被拒：${label}`)
+    assert.deepEqual(
+      service.capabilities(),
+      { protocolVersion: '1.3', lexical: true, embedder: true, embedderId: 'kept-under-poison' },
+      `被拒之后必须保住原来那个嵌入器：${label}`,
+    )
+    assert.equal(service.stats().embedder.id, 'kept-under-poison', `stats 也不得被半途改写：${label}`)
+    assert.equal(service.stats().embedder.dimensions, 3, `已注册的 dimensions 也不得被改写：${label}`)
+  }
+
+  // c) 注册**之后**属性才变成抛错：`capabilities()` / `stats()` / `lastRecall()` 必须照常返回固定形状，
+  //    绝不抛、也绝不悄悄改注册状态（`embedder` 仍为 true —— 对象确实还在，只是读不出 id 了）。
+  const live: Json = { id: 'live-embedder', dimensions: 3, embed: (texts: readonly string[]) => texts.map(() => [1, 2, 3]) }
+  assert.deepEqual(service.setEmbedder(live), { ok: true, id: 'live-embedder' }, '前置条件：注册一个稍后会被「毒化」的嵌入器')
+  Object.defineProperty(live, 'id', { get: boom, enumerable: true })
+  Object.defineProperty(live, 'dimensions', { get: boom, enumerable: true })
+
+  let caps: ReturnType<V13Service['capabilities']> | null = null
+  assert.doesNotThrow(() => { caps = service.capabilities() }, 'capabilities() 的契约是结果对象，读不到 id 也必须返回而不是抛')
+  assert.deepEqual(caps, { protocolVersion: '1.3', lexical: true, embedder: true, embedderId: null }, '注册状态保留原对象')
+
+  let embedderStats: V13EmbedderStats | null = null
+  assert.doesNotThrow(() => { embedderStats = service.stats().embedder }, 'stats() 同理：固定形状，绝不抛')
+  assert.deepEqual(
+    Object.keys(embedderStats!).sort(),
+    ['calls', 'dimensions', 'errors', 'hits', 'id', 'misses', 'timeouts'],
+    'stats().embedder 的固定形状不因宿主对象坏掉而变',
+  )
+  assert.equal(embedderStats!.id, null, '读不到的 id 按 null 处理（不是抛，也不是编一个）')
+  assert.equal(embedderStats!.dimensions, null, '读不到的 dimensions 按 null 处理')
+  assert.deepEqual(countsOf(service), { calls: 0, errors: 0, hits: 0, misses: 0, timeouts: 0 }, '读属性不调用 embed')
+
+  // 毒化只是**读不到**，注册状态本身没被改：清除仍然照常工作（否则就是「坏对象把插件锁死」）。
+  assert.deepEqual(service.setEmbedder(null), { ok: true, id: null }, '毒化不影响清除（注册状态没被改坏）')
+  assert.deepEqual(service.capabilities(), notRegistered, '清除后回到未注册形状')
+})
+
+// ---------------------------------------------------------------- 37. §4 敏感判定 = 渲染形态
+
+test('protocol#37 判定形态 = 注入时的渲染形态：零宽/格式字符拆写的密钥被拒写（§4 载荷约定）', async (t) => {
+  const harness = makeV11Harness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = v13(harness)
+
+  // 对照组：同一条密钥的明文写法本来就被拒（protocol#3/#19/#23 已钉）—— 拆写写法必须**同判决**，
+  // 否则「拒写」只是对明文有效，注入时零宽被剥掉 ⇒ 明文密钥照样进上下文。
+  const plain = await service.write({ kind: 'user_profile', text: AUDIT_TEXT.plainKey })
+  assert.equal(plain.ok, false, '前置条件：明文写法的密钥本来就该被拒写（对照组）')
+  assert.match(String(plain.error), /^rejected_sensitive: /u, '对照组的错误形状是 rejected_sensitive')
+
+  const writesBefore = harness.puts.length
+  const recordsBefore = service.stats().records
+  const obfuscated: Array<[string, string]> = [
+    ['零宽空格拆写', AUDIT_TEXT.zeroWidthKey],
+    ['零宽非连接符 + 零宽连接符统一拆写', 'api key: sk\u200c\u200d-abcdefghijklmnop123456'],
+    ['软连字符拆写', 'api key: sk-\u00adabcdefghijklmnop123456'],
+    ['词连接符（U+2060）拆写', 'api key: sk-\u2060abcdefghijklmnop123456'],
+    ['双向控制符拆写', 'api key: sk\u202e-abcdefghijklmnop123456'],
+    ['全角写法', AUDIT_TEXT.fullWidthKey],
+  ]
+  for (const [label, text] of obfuscated) {
+    const result = await service.write({ kind: 'user_profile', text })
+    assert.equal(result.ok, false, `拆写/全角写的密钥必须被拒写：${label}`)
+    assert.match(String(result.error), /^rejected_sensitive: /u, `错误形状必须是「错误码: 说明」：${label} → ${String(result.error)}`)
+    assert.ok(!('persisted' in result), `拒绝路径不得带 persisted（§3）：${label}`)
+  }
+
+  // 拒写必须是**真的没写**：一条记录、一次 put 都不许发生（判定层剥离字符 ≠ 顺手落库）。
+  assert.equal(service.stats().records, recordsBefore, '被拒的密钥不得进库')
+  assert.equal(harness.puts.length, writesBefore, '被拒的密钥一次 put 都不该发生')
+  assert.equal(service.list().length, recordsBefore, 'list() 里也不许出现被拒的正文')
+
+  // 对照：不含密钥的普通正文照常写入（否则「拒写」可能只是这个 harness 什么都写不进去）。
+  const benign = await service.write({ kind: 'semantic', origin: 'observed', subject: 'audit.benign', text: AUDIT_TEXT.benign })
+  assert.equal(benign.ok, true, '对照：普通正文必须照常写入')
+  assert.equal(service.stats().records, recordsBefore + 1, '对照写入确实落了库（拒写不是「恒拒」）')
+})
+
+// ---------------------------------------------------------------- 38. §5 注入预算数值兜底
+
+test('protocol#38 非有限 maxInjectedTokens/charsPerToken 回落默认：注入行数与默认逐字节相同（§5 配置面）', async () => {
+  // 对照 A：默认配置下，探针库大得让「预算生效」与「全量注入」可以区分 ——
+  // 40 条记录里只有一部分注得进（见 `BUDGET_PROBE_RECORDS` 的说明）。
+  const defaults = await buildBudgetProbe({})
+  assert.equal(defaults.records, BUDGET_PROBE_RECORDS, `前置条件：${BUDGET_PROBE_RECORDS} 条记录都在库里`)
+  const defaultLines = blockLines(defaults.block)
+  assert.ok(defaultLines.length > 0, `前置条件：默认配置下召回块必须非空（否则预算断言是空的）：${defaults.block}`)
+  assert.ok(
+    defaultLines.length < defaults.records,
+    `前置条件：默认预算必须真的压住条目（否则「回落默认」与「全量」不可区分）：行数=${defaultLines.length}，记录数=${defaults.records}`,
+  )
+
+  // 逐条敲非有限/非法值：每一条都必须与默认**逐字节**相同 ——
+  // 既不失效（全量注入），也不置零（静默关闭注入）。
+  for (const [label, config] of [
+    ['maxInjectedTokens: Infinity', { maxInjectedTokens: Number.POSITIVE_INFINITY }],
+    ['maxInjectedTokens: NaN', { maxInjectedTokens: Number.NaN }],
+    ['charsPerToken: Infinity', { charsPerToken: Number.POSITIVE_INFINITY }],
+    ['charsPerToken: NaN', { charsPerToken: Number.NaN }],
+    ['charsPerToken: 0（0 会让 token 估算恒为 Infinity ⇒ 静默关闭注入）', { charsPerToken: 0 }],
+    ['两数同时非法', { maxInjectedTokens: Number.NEGATIVE_INFINITY, charsPerToken: Number.NaN }],
+  ] as Array<[string, Json]>) {
+    const probe = await buildBudgetProbe(config)
+    assert.deepEqual(blockLines(probe.block), defaultLines, `${label} 必须回落默认 ⇒ 条目行数与默认一致`)
+    for (let index = 0; index < defaultLines.length; index += 1) {
+      assert.equal(probe.block.split('\n')[index], defaults.block.split('\n')[index], `${label} 第 ${index} 行必须与默认逐字节相同`)
+    }
+    assert.equal(probe.block, defaults.block, `${label} 必须与默认配置逐字节相同（不是「差不多」）`)
+  }
+
+  // 对照 B：预算真的被放得很大时，同一座库把**全部**条目注进去 —— 证明上面「行数一致」不是巧合。
+  // 这里两数都给**有限值**（1e9），走的是合法的「大预算」路径，而不是本用例的回落路径。
+  const huge = await buildBudgetProbe({ maxInjectedTokens: 1e9, charsPerToken: 1e9 })
+  assert.equal(blockLines(huge.block).length, BUDGET_PROBE_RECORDS, '放大预算到足够大 ⇒ 全部条目都进注入块')
+  assert.ok(
+    blockLines(huge.block).length > defaultLines.length,
+    `对照：放大预算必须注入更多条目（否则行数比较是空的）：${blockLines(huge.block).length} vs ${defaultLines.length}`,
+  )
+  assert.notEqual(huge.block, defaults.block, '对照：全量与默认预算的结果必须不同（否则「回落」无法与「失效」区分）')
+
+  // 对照 C：预算被设成极小（但仍是**合法**正数）⇒ 注入被压到默认以下、甚至为空。
+  // 这是「0 不是合法值」的另一半证据：0 走的是默认（上面已断言），不是这条极小路。
+  const tiny = await buildBudgetProbe({ maxInjectedTokens: 1, charsPerToken: 1 })
+  assert.ok(
+    blockLines(tiny.block).length < defaultLines.length,
+    `对照：极小但合法的预算必须比默认更严（且**不能**等于默认 ⇒ 默认与 0 的区分是真的）：${blockLines(tiny.block).length} vs ${defaultLines.length}`,
+  )
+  assert.equal(blockLines(tiny.block).length, 0, '1 token 的预算装不下任何条目行（既有语义：装不下就不注入）')
+
+  // 0 与 0：两个数都非法 ⇒ 两个数都回落默认（不是「被当成合法的 0」而静默关闭注入）。
+  const zeros = await buildBudgetProbe({ maxInjectedTokens: 0, charsPerToken: 0 })
+  assert.equal(zeros.block, defaults.block, 'maxInjectedTokens:0 / charsPerToken:0 回落默认 ⇒ 与默认逐字节相同')
+  assert.ok(blockLines(zeros.block).length > 0, '0 不是「关闭注入」：回落默认后照常注入（既有语义不变）')
+})

@@ -305,6 +305,7 @@ test('check-readmes：真实仓库的两份 README 结构一致（回归闸门�
 // 整段追加在文件末尾：既有用例一行都没动。ESM 的 import 声明会提升，写在后面同样生效。
 
 import { PRIVACY_MAX_FILE_BYTES, scanReleasePrivacy, verifySelfContained } from '../tools/verify-self-contained.ts'
+import { checkPrivacy, isUsableIdentityUsername } from '../tools/verify-self-contained.ts'
 import { userInfo } from 'node:os'
 
 /** 造一个临时「仓库」目录，只写进给的文件，跑一次隐私扫描后清掉临时目录。 */
@@ -327,8 +328,10 @@ function scanTempRepo(
 
 test('隐私扫描：含本机用户名的文本 ⇒ 命中本机用户名（不通过）', () => {
   // 用户名叫什么由 os.userInfo() 现场给出，绝不把任何具体名字写死进工具或测试。
+  // 但 CI 通用账号（runner / root）按工具口径**不是**身份判据（见下面的「CI 局限」用例），
+  // 拿它当输入会让这条用例在 CI 上自相矛盾，所以退回一个合成名字。
   const detected = userInfo().username
-  const username = detected.length > 0 ? detected : 'placeholder-user'
+  const username = isUsableIdentityUsername(detected) ? detected : 'placeholder-user'
   const result = scanTempRepo({ 'docs/notes.md': `# 笔记\n\n作者：${username}\n` }, { username })
   assert.equal(result.scanned, 1)
   assert.deepEqual(result.skipped, [])
@@ -410,4 +413,235 @@ test('隐私扫描：拿不到 npm pack 清单时这一条**跳过**并说明原
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 隐私扫描的对抗性审计修复（tools/verify-self-contained.ts §4）
+//
+// 审计确认的盲区（当前发布集里没有这些写法，属于**潜在**风险）：
+//   · 正斜杠盘符 `C:/work/…`、`D:/…`；
+//   · 无尾斜杠的 `see /home/bob`、`see /Users/bob`；
+//   · `file:///D:/secret/x.txt`、UNC 网络路径、`~/.ssh/id_rsa`、%USERPROFILE%；
+//   · 凭证完全不扫：`sk-`、AKIA、ghp_、xox[baprs]-、私钥头、JWT；
+//   · 判据依赖本机用户名与 $DSH_HOME ⇒ CI（ubuntu-latest，username=runner）里这两条等于失效，
+//     而 CI 是唯一的自动门。
+// 每一条修复都配了「先复现漏判、再证明不再漏」的用例；凭证判据另配一组**不该命中**的反例。
+//
+// 整段追加在文件末尾：既有用例的断言一条都没改（只把「取本机用户名」那行的输入换成跳过 CI 通用账号）。
+
+/** checkPrivacy 的 pack 检查占位结果：本组用例只测隐私检查本身，pack 部分不参与。 */
+function placeholderPackCheck() {
+  return { id: 'pack', title: 'pack 检查（占位）', status: 'skip' as const, details: ['本组用例只测隐私检查本身'] }
+}
+
+test('隐私扫描：正斜杠盘符（C:/… 与 D:/…）⇒ 命中（审计确认的漏判）', () => {
+  const result = scanTempRepo(
+    { 'docs/notes.md': '产物在 C:/work/private/notes.md\n备份在 D:/work/private\n' },
+    { username: null, dshHome: null },
+  )
+  assert.equal(result.hitsTotal, 2, `正斜杠盘符必须命中：${JSON.stringify(result.hits)}`)
+  assert.deepEqual(result.hits.map((hit) => hit.kind), ['windows-drive-path', 'windows-drive-path'])
+  assert.deepEqual(result.hits.map((hit) => hit.line), [1, 2], '两种盘符各给出行号')
+})
+
+test('隐私扫描：无尾斜杠的 /home/<name> 与 /Users/<name> ⇒ 命中（审计确认的漏判）', () => {
+  const result = scanTempRepo(
+    { 'docs/notes.md': 'see /home/bob\nsee /Users/bob\n' },
+    { username: null, dshHome: null },
+  )
+  assert.equal(result.hitsTotal, 2, `无尾斜杠的家目录必须命中：${JSON.stringify(result.hits)}`)
+  assert.deepEqual(result.hits.map((hit) => hit.kind), ['posix-home-path', 'posix-home-path'])
+  assert.deepEqual(result.hits.map((hit) => hit.line), [1, 2])
+})
+
+test('隐私扫描：file:/// 形式的盘符路径 ⇒ 命中（审计确认的漏判）', () => {
+  const result = scanTempRepo({ 'docs/a.md': '打开 file:///D:/secret/x.txt\n' }, { username: null, dshHome: null })
+  assert.equal(result.hitsTotal, 1)
+  assert.equal(result.hits[0]?.kind, 'windows-drive-path')
+  assert.equal(result.hits[0]?.line, 1)
+})
+
+test('隐私扫描：UNC 网络路径（\\\\host\\share）⇒ 命中（审计确认的漏判）', () => {
+  const result = scanTempRepo(
+    { 'docs/b.md': '共享私有目录：\\\\fileserver\\share\\private\n' },
+    { username: null, dshHome: null },
+  )
+  assert.equal(result.hitsTotal, 1, `UNC 路径必须命中：${JSON.stringify(result.hits)}`)
+  assert.equal(result.hits[0]?.kind, 'unc-path')
+  assert.equal(result.hits[0]?.line, 1)
+})
+
+test('隐私扫描：家目录简写 ~/… ⇒ 命中（审计确认的漏判）', () => {
+  const result = scanTempRepo({ 'docs/c.md': '私钥在 ~/.ssh/id_rsa\n' }, { username: null, dshHome: null })
+  assert.equal(result.hitsTotal, 1)
+  assert.equal(result.hits[0]?.kind, 'home-shorthand')
+})
+
+test('隐私扫描：%USERPROFILE% 路径 ⇒ 命中（审计确认的漏判）', () => {
+  const result = scanTempRepo({ 'docs/d.md': '配置在 %USERPROFILE%\\secret\n' }, { username: null, dshHome: null })
+  assert.equal(result.hitsTotal, 1)
+  assert.equal(result.hits[0]?.kind, 'userprofile-env')
+})
+
+test('隐私扫描：常见凭证形状 ⇒ 逐条命中（审计确认「完全不扫凭证」）', () => {
+  // ⚠ 夹具**必须现场拼装**，不能写字面量：0.5.21 第一次推送就被 GitHub push protection 拦下
+  // （GH013「Push cannot contain secrets」，指向本文件里的 Slack token 形状），
+  // 因为 GitHub 看到的是**形状**，不区分"这是测试夹具"。全角/空格拼接既保持形状判据可测，
+  // 又不会在提交里出现任何看起来像真密钥的字符串。
+  const fake = (head: string, body: string) => `${head}${body}`
+  const result = scanTempRepo(
+    {
+      'docs/keys.md': [
+        `api_key = ${fake('sk-' + 'live-', '0123456789abcdefghij')}`,
+        `aws_access_key_id = ${fake('AKIA', 'IOSFODNN7EXAMPLE')}`,
+        `token: ${fake('ghp' + '_', '0123456789abcdefghijklmnopqrstuvwx')}`,
+        `slack = ${fake('xox' + 'b-', '123456789012-abcdefghijklmnop')}`,
+        fake('-----BEGIN ', 'RSA PRIVATE KEY-----'),
+        '',
+      ].join('\n'),
+      // 单文件最多列 5 条明细（PRIVACY_MAX_HITS_PER_FILE），所以第 6 种形状放进第二个文件，
+      // 保证六种形状都真的被报出来、而不是被明细上限吃掉。
+      'docs/jwt.md': 'auth = eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.AAAAAAAAAAAAAAAAAAAAAAAAAAA\n',
+    },
+    { username: null, dshHome: null },
+  )
+  assert.equal(result.hitsTotal, 6, `六种凭证形状都要命中：${JSON.stringify(result.hits)}`)
+  assert.deepEqual(result.hits.map((hit) => hit.kind), [
+    'secret-api-key',
+    'secret-aws-access-key',
+    'secret-github-token',
+    'secret-slack-token',
+    'secret-private-key',
+    'secret-jwt',
+  ])
+  assert.deepEqual(result.hits.map((hit) => hit.line), [1, 2, 3, 4, 5, 1], '每个命中都要给出行号')
+  assert.deepEqual([...new Set(result.hits.map((hit) => hit.file))], ['docs/keys.md', 'docs/jwt.md'])
+})
+
+test('隐私扫描：凭证判据的反例（普通长单词 / 前缀单独出现 / 公钥头 / 单段 eyJ）⇒ 不命中', () => {
+  const result = scanTempRepo(
+    {
+      'docs/words.md': [
+        'risk-management-strategy-documentation 里出现了 sk- 两个字符。',
+        '前缀 sk- 之后才是密钥；sk-learn 只是缩写。',
+        'AKIA 是前缀，单独出现不该报。',
+        'ghp_ 与 xoxb- 也一样，只有前缀不算凭证。',
+        '-----BEGIN PUBLIC KEY----- 是公钥，发布它不算泄漏。',
+        '版本号 v1.2.3 与单段 eyJhbGciOiJIUzI1NiJ9 都不是 JWT。',
+        '',
+      ].join('\n'),
+    },
+    { username: null, dshHome: null },
+  )
+  assert.equal(result.hitsTotal, 0, `这些写法都不该命中（宁可窄一点也不误报）：${JSON.stringify(result.hits)}`)
+})
+
+test('隐私扫描：路径判据的反例（相对路径段 / 系统 file:/// / 占位 <name> / URL 路径段）⇒ 不命中', () => {
+  const result = scanTempRepo(
+    {
+      'docs/paths.md': [
+        '相对路径写作 docs/home/notes.md。',
+        '系统文件：file:///etc/hosts',
+        '占位写法 /Users/<name> 与 /home/<name> 不算泄漏。',
+        'URL 路径段 https://example.com/home/index.html 也不是家目录。',
+        '',
+      ].join('\n'),
+    },
+    { username: null, dshHome: null },
+  )
+  assert.equal(result.hitsTotal, 0, `这些写法都不该命中（否则文档会频繁误报）：${JSON.stringify(result.hits)}`)
+})
+
+test('隐私扫描：报告只给 文件 + 行号 + 类型，不回显命中内容', () => {
+  const secret = 'sk-live-0123456789abcdefghijklmnop'
+  const result = scanTempRepo({ 'docs/keys.md': `key = ${secret}\n` }, { username: null, dshHome: null })
+  assert.equal(result.hitsTotal, 1)
+  const rendered = JSON.stringify(result)
+  assert.ok(!rendered.includes(secret), '命中明细里不能出现命中的内容本身')
+  assert.ok(!rendered.includes('sk-live'), '连前缀片段也不该回显（否则等于把密钥誊写进 CI 日志）')
+  assert.deepEqual(Object.keys(result.hits[0]!).sort(), ['file', 'kind', 'line'])
+})
+
+test('隐私扫描：CI 通用账号（runner / root）不能当身份判据，且必须明说「不可靠、没有扫」', () => {
+  assert.equal(isUsableIdentityUsername('runner'), false)
+  assert.equal(isUsableIdentityUsername('Runner'), false, '大小写不敏感')
+  assert.equal(isUsableIdentityUsername('root'), false)
+  assert.equal(isUsableIdentityUsername(''), false, '空串取不到身份')
+  assert.equal(isUsableIdentityUsername(null), false)
+  assert.equal(isUsableIdentityUsername(undefined), false)
+  assert.equal(isUsableIdentityUsername('somebody'), true, '真实用户名仍然是判据')
+
+  // CI：username=runner、没有 $DSH_HOME —— 文本里的 runner / root 是通用词，不该当成「本机用户名」
+  const result = scanTempRepo(
+    { 'README.md': '在 CI runner 上跑测试，root 用户也能跑。\n' },
+    { username: 'runner', dshHome: null },
+  )
+  assert.equal(result.scanned, 1)
+  assert.equal(result.hitsTotal, 0, '通用账号名不是某个人的身份，报出来就是假阳性')
+  assert.deepEqual(result.unavailable.map((item) => item.kind), ['username', 'dsh-home'])
+  assert.ok(
+    result.notes.some((note) => note.includes('本机用户名') && note.includes('不可靠') && note.includes('没有扫')),
+    `必须明说这条判据没扫：${result.notes.join(' / ')}`,
+  )
+  assert.ok(
+    result.notes.some((note) => note.includes('$DSH_HOME') && note.includes('没有扫')),
+    `必须明说 $DSH_HOME 没扫：${result.notes.join(' / ')}`,
+  )
+  assert.ok(
+    result.notes.every((note) => note.includes('跳过 ≠ 通过')),
+    `沿用既有「跳过 ≠ 通过」的措辞：${result.notes.join(' / ')}`,
+  )
+})
+
+test('隐私检查：判据在本次环境下不可靠 ⇒ 整条**跳过**并明说，不静默给「干净」', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-privacy-check-'))
+  try {
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'privacy-check-probe', version: '0.0.0' }), 'utf8')
+    writeFileSync(join(dir, 'README.md'), '这不是泄漏，只是一份文档。\n', 'utf8')
+    const options = { repo: dir, pack: false, npmCache: join(dir, 'npm-cache'), npmTimeoutMs: 1000 }
+
+    // CI 环境：username=runner、没有 $DSH_HOME —— 两条身份判据失效，0 命中不等于「干净」
+    const ci = checkPrivacy(options, placeholderPackCheck(), ['README.md'], { username: 'runner', dshHome: null })
+    assert.equal(ci.status, 'skip', '判据不可靠时只能跳过，不能记成通过')
+    // 「干净」是这一条通过时的结论句（`干净：已扫过的 …`）；跳过时不许出现它。
+    assert.ok(!ci.details.some((line) => line.startsWith('干净')), `跳过时不许给「干净」结论：${ci.details.join(' / ')}`)
+    assert.ok(ci.details.some((line) => line.includes('本机用户名') && line.includes('没有扫')))
+    assert.ok(ci.details.some((line) => line.includes('跳过 ≠ 通过')), '口径要与工具既有风格一致')
+
+    // 判据齐全 + 真的干净 ⇒ 才说「干净」
+    const full = checkPrivacy(options, placeholderPackCheck(), ['README.md'], { username: 'somebody', dshHome: '/opt/dsh-home' })
+    assert.equal(full.status, 'pass')
+    assert.ok(full.details.some((line) => line.includes('干净')), `判据齐全时要明确说干净：${full.details.join(' / ')}`)
+
+    // 命中优先于不可靠：CI 里照样因为凭证命中而失败
+    writeFileSync(join(dir, 'keys.md'), 'key = sk-live-0123456789abcdefghijklmnop\n', 'utf8')
+    const leaked = checkPrivacy(options, placeholderPackCheck(), ['keys.md'], { username: 'runner', dshHome: null })
+    assert.equal(leaked.status, 'fail', '凭证命中必须失败，不能被「判据不可靠」冲淡')
+    assert.ok(leaked.details.some((line) => line.includes('命中') && line.includes('keys.md:1')))
+    assert.ok(leaked.details.some((line) => line.includes('API 密钥')), '命中类型要说清楚')
+    assert.ok(!leaked.details.some((line) => line.includes('sk-live')), '命中明细不回显内容')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('隐私扫描：本仓真实发布内容在新判据下依然干净（回归闸门，防假阳性）', async () => {
+  const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const { readdirSync } = await import('node:fs')
+  const files = ['README.md', 'README.zh.md', 'CHANGELOG.md', 'SECURITY.md', 'CONTRIBUTING.md', 'LICENSE', 'cordis.patch.yml']
+  for (const dir of ['docs', 'lib']) {
+    for (const name of readdirSync(join(repoRoot, dir), { recursive: true, encoding: 'utf8' as const })) {
+      files.push(`${dir}/${name.replaceAll('\\', '/')}`)
+    }
+  }
+  const result = scanReleasePrivacy({
+    repo: repoRoot,
+    files,
+    // 注入两个本仓绝不可能出现的身份值：这组用例只关心路径判据与凭证判据在真实内容上会不会误报。
+    username: 'privacy-probe-user',
+    dshHome: '/opt/dsh-home-probe',
+  })
+  assert.deepEqual(result.hits, [], `新判据不该在本仓真实文档/产物上误报：${JSON.stringify(result.hits)}`)
+  assert.equal(result.scanned, files.length, '所有真实发布内容都要真的被扫过（含 source map）')
+  assert.deepEqual(result.unavailable, [], '身份判据是注入的，这里不该有「没有扫」的判据')
 })

@@ -55,6 +55,100 @@ ctx.provide('memory', { protocolVersion, list, stats, recall, write, consolidate
 `setEmbedder` / `capabilities` / `lastRecall` are the v1.3 additions (§3.6, §11); a `'1.2'` service simply does not
 have them.
 
+### 2.1 Wiring the host half up (read this off the implementation)
+
+The plugin is a DSH/Cordis plugin: its entry point is `apply(ctx, config)`, and everything it touches comes through
+`ctx`. **The required seams are exactly these** (declared by `export const inject` in `src/index.ts`):
+
+```ts
+export const inject = ['agents', 'systemPrompt', 'storageDomain', 'tools', 'commands']
+```
+
+A minimal `apply` for an embedder-registering host looks like this — no import of the plugin's internals, only the
+seams below:
+
+```ts
+export function apply(ctx: MyHostContext, config: Record<string, unknown>): void {
+  // 1) The only required seam for the service surface: `provide` (optional — §2's table).
+  ctx.provide('memory', { /* the host may expose its own sibling service here */ })
+
+  // 2) Own the lifetime of anything you add: `ctx.effect(setup)` returns the disposer and DSH runs it on unload.
+  ctx.effect(() => {
+    const stop = startSomething(ctx)
+    return () => stop()
+  })
+
+  // 3) Scope an optional service: the callback never runs (and never blocks the fiber) while it is absent.
+  ctx.inject(['settings'], (scope) => { scope.effect(() => () => teardown()) })
+
+  // 4) Consume the memory service — feature-detect, never assume (§2's rules below).
+  const memory = ctx.get('memory') as { setEmbedder?: (e: unknown) => unknown } | undefined
+  if (memory?.setEmbedder) memory.setEmbedder(myEmbedder)
+
+  // 5) The surfaces the plugin itself registers into: systemPrompt, tools.register, commands.register, and the
+  //    event bus (`ctx.on('session/event', …)`, `ctx.on('agent/pre-step', …)`, `ctx.on('agent/turn-stopping', …)`).
+}
+```
+
+The seams, **as the implementation uses them** (this is the list to code against; anything not listed here is
+internal and may change between patches, §2 rule 3):
+
+| seam | how the plugin uses it | required? |
+|---|---|---|
+| `ctx.provide(name, service)` | publishes the `memory` service (§2). Wrapped in `try/catch`: a host without it keeps the plugin working, `ctx.get('memory')` is simply always `undefined` | optional |
+| `ctx.inject([...])` | scoped injection — used for the optional `settings` service so an absent service never blocks the plugin's fiber | optional |
+| `ctx.effect(fn, label?)` | lifetime + teardown: the returned callback is what closes the storage domain on unload (see *Unload* below) | required in practice (persistence and clean-up hang off it) |
+| `ctx.on(event, handler)` | `session/event` (sequence tracking, capture, compaction summaries), `agent/pre-step` (per-turn recall), `agent/turn-stopping` (turn-end capture) | required for capture/injection |
+| `ctx.systemPrompt.section(...)` / `ctx.systemPrompt.context(...)` | the two resident injection channels | required for resident blocks |
+| `ctx.tools.register(tool)` | the seven `memory_*` tools | optional |
+| `ctx.commands.register(command)` | `/memory …` and `/sleep` | optional |
+| `ctx.get('storageDomain')` / `ctx.get('sessionQuery')` / `ctx.get('settings')` | optional services, feature-detected | optional |
+| `ctx.get('memory')` | how a **third party** consumes the service (§2) | — |
+
+### 2.2 The storage handle `ctx.storageDomain.open()` must return
+
+The plugin calls `open()` once and keeps the handle for its lifetime. It only uses two shapes, so a host domain has
+to provide at least these:
+
+```ts
+const domain = await ctx.storageDomain.open({
+  name: cfg.domainName,          // the domain name (also the on-disk directory name)
+  version: 1,
+  layout: 'per-record',
+  tables: { memories: { valueSchema: passthroughSchema } },
+  global: { schema: passthroughSchema, initial: { schemaVersion: 1, collectionVersion: 0 } },
+})
+
+// the two things the plugin needs from the handle:
+await domain.global.get()               // the watermark object ({ schemaVersion, collectionVersion, … }) — awaited
+await domain.global.set(meta)           // written back on durable state changes
+for (const entry of domain.table('memories').entries()) { /* … */ }   // load-all: [key, value] or value
+await domain.table('memories').put(record.id, record)                 // persist one record
+await domain.table('memories').delete(record.id)                      // remove one record
+await domain.close()                    // called on unload (see below)
+```
+
+- `global.get()` is **asynchronous in the shipped runtime** and must be awaited — storing the raw thenable leaves the
+  watermark unreadable (the plugin's own comment on this is in `src/index.ts`).
+- `table('memories')` must answer `entries()` (an iterable of `[key, value]` pairs or plain values; the loader accepts
+  both), `put(key, value)` and `delete(key)`.
+- `open()` rejecting (or `storageDomain` being absent) is not fatal: `stats().opened` stays `false`, writes report
+  `persisted: false`, and the plugin keeps serving from memory (§8 gap 3).
+
+### 2.3 Unload and clean-up
+
+- **There is a dispose path, and the plugin owns it.** Registration in `ctx.effect(() => …)` hands DSH a teardown
+  callback; the plugin uses it to flush accumulated usage, drop its domain reference and then call `domain.close()`.
+  Nothing of this is exposed on the service surface — an embedder registered through `setEmbedder` is released simply
+  because the plugin instance goes away with it.
+- **There is no `dispose()` on the `memory` service object**, so a third party cannot ask the plugin to shut down;
+  **drop your reference on reload** and re-acquire, as §2's table says. The service keeps working until the host
+  unloads the plugin.
+- **Close order matters** and is the host's problem to mirror if it opens its own domains: flush first, then close —
+  closing before the flush makes the last usage update fail silently.
+
+### 2.4 Locating the service from a third party
+
 Locate it with:
 
 ```ts
@@ -79,6 +173,9 @@ Rules for callers:
    report file, the settings form and the storage domain layout are internal and may change between patches.
 4. **Do not cache the reference across a plugin reload**, and do not mutate records returned by `list()` /
    `recall()` expecting persistence: they are the live in-memory objects (see §8 gap 5).
+5. **`recall()` may hand you a Promise**: the default / `'lexical'` is a plain array, and so is
+   `'semantic'` / `'hybrid'` while **no embedder is registered** (a synchronous lexical fallback); with an embedder
+   registered, `'semantic'` / `'hybrid'` returns a Promise (§3.3). When in doubt, `await` once.
 
 ## 3. Methods
 
@@ -179,7 +276,7 @@ list(options?: {
 | field | meaning |
 |---|---|
 | `records` | records held in memory (all statuses, same set as `list()`) |
-| `version` | collection version, incremented on every successful put/delete; use it to detect change. **Not** a storage schema version |
+| `version` | collection version, **read off the implementation** (§8 item 8): it is incremented as soon as a **put begins** — before `put` is awaited — so a `put` that then **throws still bumps it** (`persist()` bumps, then `catch`es the failure). A `delete` bumps it **only on success**; when `delete` throws the in-memory row is rolled back and `version` stays put. Use it as a "something was attempted / changed" signal, not as a durability proof (that is `opened` / `writes.persisted`). **Not** a storage schema version |
 | `opened` | whether `ctx.storageDomain.open()` succeeded. `false` means writes are not reaching disk (see §8 gap 3) |
 | `writes` *(new in v1.2)* | this process's running count of write-persistence outcomes. `persisted`: how often `persist()` returned true (the write really reached disk); `unpersisted`: how often the write was `ok: true` but did not reach disk (domain not open, or `put` threw). The counters only grow, they are per-process and reset on restart (the same nature as `version`). Rejections (`ok: false`) are **not** counted — they were never a write. They sit alongside the internal `state.writes` counters and do not reuse them (those have a different meaning). |
 | `embedder` *(new in v1.3)* | embedder diagnostics: `id` / `dimensions` (`null` while none is registered), `calls` (a batch counts once), `errors` (throw / reject / wrong shape or mismatched dimensions / timeout), `hits` / `misses` (the vector cache; a miss means `embed` was really called) and `timeouts` (also included in `errors`). With no embedder registered every counter stays `0` and `id` / `dimensions` are `null`, so the stats line is exactly what 0.5.19 produced. Registration and semantics: §3.6, §11. |
@@ -197,8 +294,8 @@ interface RecallOptions {
   status?: 'active' | 'pending' | 'invalid' | 'archived' | 'all'
   /** 分支过滤，语义与 `list` 的 `branch` 完全一致（v1.2 起同样接受数组；**空数组 ⇒ 空结果**）。缺省 = 不过滤（今天的行为）。 */
   branch?: 'current' | string | readonly string[] | null
-  /** 新增（v1.3）：排序通道。缺省 `'lexical'` ＝ 与 0.5.19 逐字节相同，且零嵌入调用。 */
-  mode?: 'lexical' | 'semantic' | 'hybrid'
+  /** new in v1.3: the ranking channel. The default `'lexical'` is byte for byte 0.5.19, with zero embedding calls. */
+  mode?: 'query' | 'memory' | 'lexical' | 'semantic' | 'hybrid'
 }
 ```
 
@@ -209,24 +306,62 @@ interface RecallOptions {
 | `scopeLevel` | `'profile' \| 'workspace' \| 'session'` | — | filter by scope level |
 | `tag` | `string` | — | filter by exact tag |
 | `limit` | `number` | `8` | clamped to 1…50 |
-| `mode` | `'query' \| 'memory'` | `'query'` | short query vs. whole-turn message |
-| `minLexical` | `number` | `0.34` | `mode: 'query'` threshold |
-| `minMatch` | `number` | `0.4` | `mode: 'memory'` threshold |
-| `minHits` | `number` | `2` | `mode: 'memory'` minimum informative token hits |
+| `minLexical` | `number` | `0.34` | threshold for the **`'query'` lexical posture** (see `mode` below) |
+| `minMatch` | `number` | `0.4` | threshold for the **`'memory'` lexical posture** |
+| `minHits` | `number` | `2` | minimum informative-token hits for the **`'memory'` posture** |
 | `includeArchived` | `boolean` | `false` | also consider `archived` records |
 | `status` | `'active' \| 'pending' \| 'invalid' \| 'archived' \| 'all'` | absent = today's pool | which §4.3 statuses may be returned. Absent = today's behaviour (`active`, plus `archived` when `includeArchived === true`); `'all'` = active + pending + invalid + archived, order unchanged; `'pending'` is allowed — an explicit management/audit query (§9) |
 | `branch` | `'current' \| string \| readonly string[] \| null` | unset = no filter | exactly `list`'s `branch` (§3.1): `'current'` = the injection's own `branchVisible` rule for the current cwd; any other string keeps only records whose `branchOf(record)` equals it; **v1.2:** an array keeps only the records whose `branchOf(record)` is in the array (no tag = not a hit) and an **empty array returns an empty result**; `null` / unset = no filter |
-| `mode` *(new in v1.3)* | `'lexical' \| 'semantic' \| 'hybrid'` | `'lexical'` | which channel orders the hits. `'lexical'` is today's behaviour and exactly 0.5.19: the embedder is not consulted and **zero** embedding calls are made. `'semantic'` orders by embedding similarity alone (lexical is only the fallback when embeddings are unavailable). `'hybrid'` uses `score = (1 - w) * lexical + w * semantic` with `w = cfg.embedderWeight` (default `0.5`). Without a usable embedder, `'semantic'` and `'hybrid'` return lexical results and say so through `lastRecall()` (§3.6) — never silently |
+| `mode` | `'query' \| 'memory' \| 'lexical' \| 'semantic' \| 'hybrid'` | `'query'` | **one key, two separate vocabularies** — merged table below. The *lexical posture* decides **how the query side is scored**; the *ranking channel* decides **which side of the ranking the hits come from**. |
+
+**`mode`: one key, two vocabularies (the §3.3 table used to disagree with §11 — this is the merged version).**
+
+| value | vocabulary | semantics | default |
+|---|---|---|---|
+| `'query'` | lexical posture | the query is a **short query**: matching runs against the whole record text, threshold `minLexical` (0.34). Exactly the v1.0 behaviour | ✅ (when `mode` is absent) |
+| `'memory'` | lexical posture | the query is a **whole-turn user message**: it runs the memory-side coverage test, thresholds `minMatch` (0.4) / `minHits` (2). v1.0 behaviour | — |
+| `'lexical'` *(new in v1.3)* | ranking channel | "use the lexical channel" — **byte for byte the default**: identical to omitting `mode`, **zero** embedding calls | — (equivalent to the default) |
+| `'semantic'` *(new in v1.3)* | ranking channel | order by embedding similarity; lexical only as the fallback when embeddings are unavailable | — |
+| `'hybrid'` *(new in v1.3)* | ranking channel | `score = (1 - w) * lexical + w * semantic`, `w = cfg.embedderWeight` (default `0.5`) | — |
+
+- **Do not read `mode` with a single union check.** `'query'` / `'memory'` and
+  `'lexical'` / `'semantic'` / `'hybrid'` are the same key with **two disjoint meanings**: the first two select the
+  lexical *posture* (how the query side is scored), the last three select the *ranking channel* (where the hits come
+  from). Omitting `mode` is `'query'` **and** the lexical channel, so an existing caller that passes no `mode`, or
+  only `'memory'`, keeps the exact v1.0 behaviour.
+- **`'query'` / `'memory'` do not mean "no embeddings".** They are postures, not channels: `recall({ mode: 'memory' })`
+  ranks lexically, but it is the *posture* that matters to it — the channel is lexical because nothing selects
+  semantic. A caller that wants "whole-turn message + semantic ranking" passes `mode: 'semantic'` with the
+  whole-turn text as `query`; the two vocabularies cannot be combined in one call.
+- **Invalid values are not an error, and not a guess.** Any `mode` that is not one of the five strings is treated as
+  **absent**: the call behaves as the default (`'query'` posture, lexical channel), no embedding happens, and
+  `lastRecall().mode` reports `'lexical'` (§3.6). An invalid value never falls back to `'semantic'` and never throws.
+  `recall()` therefore accepts any option shape — see *Errors* below.
+- **What the two aren't:** `'lexical'` / `'semantic'` / `'hybrid'` are **not** `'query'` / `'memory'` synonyms, and
+  their metadata is reported separately: `lastRecall()` only ever reports the **channel**
+  (`'lexical' | 'semantic' | 'hybrid'`), never the posture.
 
 - **Returns:** `Array<{ record: MemoryRecord; match: number; score: number }>`, sorted by `score` descending and
   then by the deterministic record order (§4.1), truncated to `limit`.
-  - `match` is the relevance value (0…1) for the chosen mode; `score` is the ordering score (lexical + importance
+  - `match` is the relevance value (0…1) under the chosen channel; `score` is the ordering score (lexical + importance
     + recency).
   - Candidate pool: with `status` absent it is exactly today's pool — `status === 'active'` always, plus `archived`
     when `includeArchived === true`. **Without an explicit `status`, `pending` and `invalid` are never returned,
     whatever the other options say.** An explicit `status: 'pending' | 'invalid' | 'all'` is the only door that can
     return them — an audit query, never an injection path (injection passes no `status`).
 - **Errors:** none for any option shape (absent options are tolerated at runtime).
+- **Return type: synchronous unless it really embeds (v1.3).** The declared type is
+  `RecallHit[] | Promise<RecallHit[]>`, and which one you get is decided by the call, not by a guess:
+  - **default / `'lexical'` / an invalid `mode` value ⇒ a plain array.** No `await` needed, and no embedding call is
+    made.
+  - **`'semantic'` / `'hybrid'` with no embedder registered ⇒ a plain array too.** There is nothing to embed, so the
+    call falls back to lexical **synchronously** and reports `lastRecall().fallback === 'no-embedder'` (§3.6) — it is
+    still a lexical result, never a fake semantic one.
+  - **`'semantic'` / `'hybrid'` with an embedder registered ⇒ a `Promise`** (the embedding call is asynchronous by
+    contract). It resolves to the same `RecallHit[]` shape.
+  - `await` works on both shapes (awaiting a non-promise is a no-op), which is what the examples in §6/§11 do.
+  - Compatibility is unchanged: before v1.3 `recall` was synchronous, and a caller that passes no `mode` — i.e. every
+    pre-v1.3 caller — still gets a plain array and behaves exactly as before.
 - **Embedder fallback is reported, never hidden (v1.3).** With no embedder registered, `mode: 'semantic'` still
   returns a lexical result, and `lastRecall().fallback === 'no-embedder'`. An embedder that throws / rejects /
   times out / returns a wrong shape or mismatched dimensions is counted in `stats().embedder.errors` and reported
@@ -381,17 +516,35 @@ interface MemoryRef {
 }
 ```
 
-At most `refsMax` (default 5) references per record, newest first; duplicates (same `sessionId + from + to`) are
-collapsed. `via` names the write path: `live` = turn-end rule capture, `tool` = `memory_write`, `command` = user
-command, `solidify` = compaction summary, `sleep` = `/sleep` backfill, `import` = import path. Explicit
-`input.refs` win over `refVia`; with `refsEnabled: false` no reference is attached at all.
+At most `refsMax` (default 5) references per record; duplicates (same `sessionId + from + to`) are collapsed.
+**The order is the writer's**: `withRef` puts a newly added reference first, and the read paths render the array as
+given — nothing sorts it, so "newest first" holds only because `withRef` made it so. `via` names the write path:
+`live` = turn-end rule capture, `tool` = `memory_write`, `command` = user command, `solidify` = compaction summary,
+`sleep` = `/sleep` backfill, `import` = import path. Explicit `input.refs` win over `refVia`; with
+`refsEnabled: false` no reference is attached at all.
+
+**String syntax (as rendered by `refsToString`, and as it appears in `write()`'s `refs` field):**
+
+| form | example | when |
+|---|---|---|
+| range | `session-84a547da-5727-4ffc-adf0-26d02e749e13#120-180` | `from` and `to` are both given **and differ** |
+| single point | `session-…-…#93` | only `from` (or `from === to`) |
+| end only | `session-…-…#180` | only `to` |
+| no sequence | `session-…-…` | neither is known |
+| several | `session-A#120-180;session-B#93` | the reference list is joined with **`;`** |
+
+The separator is a bare `;` (the display helper `formatRefs` uses `'; '` with a space — the machine-readable string
+does not). The rendering is per-reference and does **not** deduplicate, sort or truncate; dedup, the `refsMax` cap and
+field validation happen in the write path. An entry that fails validation is dropped, so a render can be a shorter
+string than the array — or the empty string when nothing survives. `formatRefs` does **not** shorten session ids
+unless you pass `{ short: true }`.
 
 ### 4.3 `status`
 
 | value | meaning |
 |---|---|
 | `active` | the only status that participates in injection and recall |
-| `pending` | queued by the write gate (`writePolicy: 'ask'`); **waiting for the user**. Not injected, not recalled, not listed by the tools **unless you explicitly ask** (`list({ status: 'pending' })`, `recall({ status: 'pending' })` — audit queries, §3.1/§3.3); only a user command (`/memory approve`, `/memory confirm`) can make it `active` |
+| `pending` | queued by the write gate (`writePolicy: 'ask'`); **waiting for the user**. Not injected, not recalled, not listed by the tools **unless you explicitly ask** (`list({ status: 'pending' })`, `recall({ status: 'pending' })` — audit queries, §3.1/§3.3). **`/memory approve` is the only thing that can make it `active`** — `/memory confirm` does **not** (it upgrades `origin` to `user_explicit` and raises `confidence`, and it never touches `status`; on a `pending` row it would just rewrite the provisional row's origin) |
 | `invalid` | conflict loser / rejected pending write. Not recalled by default, not even with `includeArchived`; only an explicit `status: 'invalid'` (or `'all'`) query returns it; recoverable with `/memory restore` |
 | `archived` | not injected, but still searchable with `includeArchived: true` (decay archiving and consolidation merges land here) |
 
@@ -483,6 +636,17 @@ export async function remember(ctx: { get(name: string): unknown }, text: string
   // ok:true alone is not durability either: read result.persisted (v1.1, §3.4) or memory.stats().opened.
   return result.ok === true && result.pending !== true
 }
+
+/** v1.3: the same call has two possible shapes — await unconditionally, it is harmless either way (§3.3). */
+export async function rankSemantically(ctx: { get(name: string): unknown }, query: string): Promise<string[]> {
+  const memory = ctx.get('memory') as {
+    recall(options: { query: string; mode?: 'lexical' | 'semantic' | 'hybrid' }):
+      Array<{ record: { text: string } }> | Promise<Array<{ record: { text: string } }>>
+  } | undefined
+  if (!memory) return []
+  const hits = await memory.recall({ query, mode: 'semantic' })   // array when nothing embeds, Promise once it does
+  return hits.map((hit) => hit.record.text)
+}
 ```
 
 Call `ctx.get('memory')` inside a step / effect (where services are live) and re-acquire after a reload.
@@ -542,6 +706,12 @@ and none is worked around in `src/` here.
    includes `pending`/`invalid`/`archived` rows. v1.1 adds the opt-in `status` / `branch` / `limit` filters (§3.1)
    without changing that default. Anyone who wants the injected view must reproduce §4.3 + §4.4 themselves, or ask
    for `branch: 'current'`, which is the injection's own branch rule.
+8. **`version` bumps even when the write did not land** (read off `src/index.ts`: `persist()` increments
+   `state.collectionVersion` **before** awaiting `put`, and its `catch` does not undo it, while `delete` increments
+   only on success and rolls the row back when `delete` throws). So `version` means "the collection was **touched**",
+   not "the collection changed on disk". **Decision: keep the implementation as it is and document it** (§3.2) — the
+   counters that do answer "did it reach the domain" are `stats().opened` and `stats().writes.persisted`; this entry
+   exists so nobody reads `version` as a durability proof.
 
 ## 9. What v1.1 adds
 
@@ -662,14 +832,19 @@ configuration surface, §6's example — is v1.0 / v1.1 material and unchanged b
 
 v1.3 is a **pure addition** inside v1: the service's `protocolVersion` went `'1.2' → '1.3'`, and every call that
 worked in 0.5.19 keeps its exact behaviour — with no embedder registered a no-argument `list()` is byte for byte
-identical, and `recall({ mode: 'lexical' })`, the default, makes **zero** embedding calls. Four surface additions:
+identical, and `recall({ mode: 'lexical' })`, the default, makes **zero** embedding calls. **Five** surface additions:
 
 | # | addition | where |
 |---|---|---|
 | 1 | `setEmbedder(embedder \| null)` — register / replace / clear the embedder the **host injects**. A bad object is rejected (`rejected_invalid: …`) without changing the current registration | §3.6 |
 | 2 | `capabilities()` — `{ protocolVersion, lexical: true, embedder: boolean, embedderId: string \| null }`; the only correct way to decide whether semantic scoring is available | §3.6 |
-| 3 | `stats().embedder` — `{ id, dimensions, calls, errors, hits, misses, timeouts }`; all zero / `null` while no embedder is registered | §3.2 |
-| 4 | `recall({ mode })` — `'lexical'` (the default, unchanged) / `'semantic'` / `'hybrid'`, plus `lastRecall()` for the fallback and usage diagnosis | §3.3, §3.6 |
+| 3 | `lastRecall()` — the **last** `recall()`: `{ mode, used, fallback, candidates, vectors }`, or `null` when no call has happened | §3.6 |
+| 4 | `stats().embedder` — `{ id, dimensions, calls, errors, hits, misses, timeouts }`; all zero / `null` while no embedder is registered | §3.2 |
+| 5 | `recall({ mode })` — `'lexical'` (the default, unchanged) / `'semantic'` / `'hybrid'` | §3.3, §3.6 |
+
+(The count is five because `capabilities()` and `lastRecall()` are two independent methods on the surface — the text
+here said "four" while listing `lastRecall()` as part of item 4; `tests/protocol.test.ts` pins the surface, not the
+count.)
 
 The embedder contract itself — the shape the host implements and injects:
 

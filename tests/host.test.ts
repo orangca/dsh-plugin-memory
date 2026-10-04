@@ -5470,5 +5470,378 @@ test("host#116 按轮召回：默认 off 时注入路径与 0.5.19 逐字节相�
   assert.equal(failHarness.memory().stats().embedder.errors, 1)
 })
 
+// ================================================================ 对抗性审计回归（0.5.20 → 0.5.21）
+// 每条用例都先复现审计里那条真实证据，再钉死修复后的行为；断言只认**可观测**结果
+// （落盘记录、盘上文件、注入文本、诊断值），不读实现内部变量。
+
+/** 一个只提供 `agent.session.deriveMessages()` 的最小 exec 夹具（`memory_write`/`memory_explain` 判来源用）。 */
+const execWithMessages = (messages: Json[], cwd = WORKSPACE_CWD): Json => ({
+  agent: {
+    session: {
+      id: 'session-1',
+      seq: 5,
+      header: { cwd },
+      deriveMessages: () => messages,
+    },
+  },
+})
+
+/** 一条「真实用户侧」消息（`deriveOriginFromMessages` 只认 role=user + source.kind=user）。 */
+const userMessage = (text: string): Json => ({ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] })
+
+// ---------------------------------------------------------------- 117. memory_explain --apply 的 origin 与门控
+
+test('host#117 memory_explain --apply 不得绕过 writePolicy、也不得伪造 user_explicit 来源（审计 critical）', async (t) => {
+  const text = '记住：默认时区是 Mars/Phobos'
+
+  // a) writePolicy=off：模型自造的「记住：…」既不能落盘，也不能进注入 —— 旧实现会以 user_explicit 落库
+  const off = makeHarness({ config: { writePolicy: 'off' } })
+  t.after(() => off.dispose())
+  await off.settle()
+  const offResult = JSON.parse(String(await off.tool('memory_explain').execute({ text, apply: true }))) as Json
+  const offWritten = (offResult.written as Json[])[0]!
+  assert.equal(offWritten.ok, false, 'off 下 apply 必须被 writePolicy 门控拒掉')
+  assert.match(String(offWritten.error), /^rejected_write_policy/u, '拒绝原因必须可结构化识别')
+  assert.equal('id' in offWritten, false, '被拒的写入不得给出 id')
+  assert.equal(off.domain.puts.length, 0, 'off 下零落盘（一次 put 都不能发生）')
+  assert.equal(off.memory().list().length, 0, 'off 下零记录')
+  assert.ok(!residentText(off).includes('Mars/Phobos'), `off 下不得进注入：${residentText(off)}`)
+  assert.equal(off.memory().recall({ query: 'Mars Phobos 默认时区' }).length, 0, 'off 下不得被召回')
+  // 候选自身的信号来源仍然是 user_explicit（文本命中了 explicit-imperative），但真正落库的来源由会话推导
+  const offCandidate = (offResult.candidates as Json[])[0]!
+  assert.equal(offCandidate.origin, 'user_explicit', '诊断里要能看出信号表声明的来源')
+  assert.equal(offCandidate.writeOrigin, 'model_proposed', '模型可控的路径必须按 model_proposed 走门控')
+
+  // a2) 候选来源是 user_correction（文本命中 correction 信号）也一样：不得自选来源
+  const correctionText = '这里不对：默认时区其实是 Mars/Phobos'
+  const correction = JSON.parse(String(await off.tool('memory_explain').execute({ text: correctionText, apply: true }))) as Json
+  const correctionWritten = (correction.written as Json[])[0]!
+  assert.equal((correction.candidates as Json[])[0]!.origin, 'user_correction', '信号表确实把它判成 correction')
+  assert.equal(correctionWritten.ok, false, '信号表给的 user_correction 也不得绕过门控')
+  assert.match(String(correctionWritten.error), /^rejected_write_policy/u)
+  assert.equal(off.memory().list().length, 0, '零落盘、零记录')
+
+  // b) writePolicy=ask：进待确认队列，而不是直接生效；来源必须是 model_proposed
+  const ask = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false } })
+  t.after(() => ask.dispose())
+  await ask.settle()
+  const askResult = JSON.parse(String(await ask.tool('memory_explain').execute({ text, apply: true }))) as Json
+  const askWritten = (askResult.written as Json[])[0]!
+  assert.equal(askWritten.ok, true, '入队不是失败')
+  assert.equal(askWritten.pending, true, 'ask 下 apply 必须进待确认队列')
+  assert.equal(askWritten.status, undefined, 'pending 不是 created：此刻没有生效')
+  assert.match(String(askResult.notice), /尚未生效/u, '必须如实告诉模型「尚未生效」')
+  const askRow = allRows(ask).find((row) => row.id === askWritten.id)!
+  assert.equal(askRow.status, 'pending', '落库状态是 pending')
+  assert.equal(askRow.origin, 'model_proposed', '队列里的来源不得是 user_explicit')
+  assert.ok(!residentText(ask).includes('Mars/Phobos'), 'pending 不进注入')
+
+  // c) auto：正常写入，但来源**不是** user_explicit（会话里没人说过这句话）
+  const auto = makeHarness({ config: { selfIntroEnabled: false } })
+  t.after(() => auto.dispose())
+  await auto.settle()
+  const autoResult = JSON.parse(String(await auto.tool('memory_explain').execute({ text, apply: true }))) as Json
+  const autoWritten = (autoResult.written as Json[])[0]!
+  assert.equal(autoWritten.ok, true)
+  assert.equal(autoWritten.status, 'created')
+  assert.equal(autoWritten.persisted, true, 'apply 路径同样如实回报 persisted（与 memory_write 同口径）')
+  const autoRow = allRows(auto).find((row) => row.id === autoWritten.id)!
+  assert.equal(autoRow.status, 'active')
+  assert.equal(autoRow.origin, 'model_proposed', '模型自选的文本不得伪造 user_explicit 来源')
+  assert.ok(residentText(auto).includes('Mars/Phobos'), 'auto 下确实生效并进注入')
+
+  // d) 用户**真的**在会话里说过：来源才是 user_explicit（toolMessages 夹具区分两种情形）
+  const said = makeHarness({ config: { writePolicy: 'off', selfIntroEnabled: false } })
+  t.after(() => said.dispose())
+  await said.settle()
+  const saidExec = execWithMessages([userMessage(text)])
+  const saidResult = JSON.parse(String(await said.tool('memory_explain').execute({ text, apply: true }, saidExec))) as Json
+  const saidWritten = (saidResult.written as Json[])[0]!
+  assert.equal(saidWritten.ok, true, '真实用户消息里的明确要求不受 writePolicy=off 影响（与 memory_write 同口径）')
+  const saidRow = allRows(said).find((row) => row.id === saidWritten.id)!
+  assert.equal(saidRow.origin, 'user_explicit', '只有真实用户消息才配得上 user_explicit')
+  assert.equal((saidResult.candidates as Json[])[0]!.writeOrigin, 'user_explicit')
+
+  // e) 安全闸在这条路径上同样先于门控：命中硬秘密的文本连候选都不是（不落盘、不入队）
+  const secretHarness = makeHarness({ config: { writePolicy: 'ask' } })
+  t.after(() => secretHarness.dispose())
+  await secretHarness.settle()
+  const secretText = '记住：这台机器的部署密钥是 sk-abcdefghijklmnop123456'
+  const secret = JSON.parse(String(await secretHarness.tool('memory_explain').execute({ text: secretText, apply: true }))) as Json
+  assert.equal((secret.candidates as Json[]).length, 0, '硬秘密在抽候选阶段就被丢掉')
+  assert.equal(Number((secret.skipped as Json).sensitive), 1, '排除原因要如实记成 sensitive')
+  assert.equal((secret.written as Json[]).length, 0, '没有候选 ⇒ 一条都不写')
+  assert.equal(secretHarness.memory().list().length, 0, '硬秘密零落盘')
+
+  // e2) 邮箱按策略脱敏后再入队 —— 与 memory_write 的 PII 口径一致
+  const piiText = '记住：用户邮箱是 zhangsan@example.com，请记录下来'
+  const pii = JSON.parse(String(await secretHarness.tool('memory_explain').execute({ text: piiText, apply: true }))) as Json
+  const piiWritten = (pii.written as Json[])[0]!
+  assert.equal(piiWritten.pending, true, 'ask 下 PII 候选进队列')
+  assert.doesNotMatch(String(piiWritten.text), /zhangsan@example\.com/u, '入队前必须已经脱敏')
+  assert.match(String(piiWritten.text), /\*\*\*/u)
+
+  // f) 回声剔除在这条路径上同样生效：与刚注入的记忆高度相似的复述不得作为新观察写回。
+  //    这条正是旧实现漏掉的闸门 —— 候选来源被写成 user_explicit 时回声检查会被直接跳过。
+  const echoHarness = makeHarness({ config: { selfIntroEnabled: false } })
+  t.after(() => echoHarness.dispose())
+  await echoHarness.settle()
+  const echoText = '记住：默认时区是 Mars/Phobos'
+  const echoSeed = await echoHarness.memory().write({ kind: 'user_profile', text: echoText, origin: 'observed' })
+  assert.equal(echoSeed.ok, true, '前置条件：这条已生效')
+  assert.ok(residentText(echoHarness).includes('Mars/Phobos'), '前置条件：它确实进了注入（回声检测的对照面）')
+  const echoed = JSON.parse(String(await echoHarness.tool('memory_explain').execute({ text: echoText, apply: true }))) as Json
+  const echoedWritten = (echoed.written as Json[])[0]!
+  assert.equal(echoedWritten.ok, false, '与刚注入内容高度相似的复述必须被回声闸挡下')
+  assert.match(String(echoedWritten.error), /^rejected_echo/u)
+  assert.equal(echoHarness.memory().list().length, 1, '不得新增第二条（库里仍只有初始那一条）')
+})
+
+// ---------------------------------------------------------------- 118. ask 入队去重（§4.4）
+
+test('host#118 ask 模式同指纹去重：不重复入队，批准后不出现同指纹双份 active（审计 high，§4.4）', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const text = '未批准的模型猜想：构建流程统一改用 bun 并输出到 build 目录'
+  const first = await writeTool(harness, { kind: 'semantic', text })
+  const second = await writeTool(harness, { kind: 'semantic', text })
+  assert.equal(first.pending, true, '第一条正常入队')
+  assert.equal(second.ok, false, '同指纹第二次写入必须被去重挡下')
+  assert.match(String(second.error), /^already_pending:/u, '去重必须是可结构化识别的结果')
+  const queue = allRows(harness).filter((row) => row.status === 'pending')
+  assert.equal(queue.length, 1, 'ask 下同文本写两次只留一条 pending')
+  assert.equal(queue[0]!.id, first.id, '留下的是第一条（第二次不新建、也不替换）')
+
+  // 不同文本仍然各自入队（去重只按指纹，不是「一次只能有一条 pending」）
+  const other = await writeTool(harness, { kind: 'semantic', text: '另一条与上面完全不同的待确认内容' })
+  assert.equal(other.pending, true, '不同文本仍然各自入队')
+  assert.equal(allRows(harness).filter((row) => row.status === 'pending').length, 2)
+
+  // 批准：active 只有一条，distinctHashes 与条数一致
+  assert.equal((await harness.runCommand(`approve ${String(first.id)}`)).kind, 'success')
+  const actives = allRows(harness).filter((row) => row.status === 'active')
+  assert.equal(actives.length, 1, '批准后 active 只有一条')
+  assert.equal(new Set(actives.map((row) => row.hash)).size, actives.length, '不存在同指纹双份 active')
+
+  // 库里已有同指纹 active：明确回报「已存在同一条」，既不重复入队、也不新建
+  const again = await writeTool(harness, { kind: 'semantic', text })
+  assert.equal(again.ok, false, '同指纹已有 active ⇒ 不得再入队')
+  assert.match(String(again.error), /^already_exists:/u, '必须是可结构化识别的结果')
+  assert.equal(allRows(harness).filter((row) => row.status === 'active').length, 1, 'active 仍然只有一条')
+  assert.equal(allRows(harness).filter((row) => row.status === 'pending').length, 1, '队列里仍只有那条不同的文本')
+
+  // 存量数据（旧版本留下的两条同指纹 pending）：批准第二条必须**合并**，不能造出第二条 active
+  const legacy = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false } })
+  t.after(() => legacy.dispose())
+  await legacy.settle()
+  const queuedOnce = await writeTool(legacy, { kind: 'semantic', text: '存量重复的待确认内容：构建流程统一改用 bun' })
+  const persistedRow = legacy.domain.rows.get(String(queuedOnce.id))!
+  // 克隆一条同指纹的 pending（模拟旧版本留下的重复入队）；id 前缀刻意避开第一条，
+  // 否则 `/memory approve <完整 id>` 会被 id 前缀歧义规则先挡下（那是另一条契约，不在本用例范围）。
+  const twinRow = { ...(JSON.parse(JSON.stringify(persistedRow)) as Json), id: `twin_${String(queuedOnce.id)}` }
+  const seeded = new Map(legacy.domain.rows)
+  seeded.set(String(twinRow.id), twinRow)
+  const reborn = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false }, seedDomainRows: seeded })
+  t.after(() => reborn.dispose())
+  await reborn.settle()
+  assert.equal(allRows(reborn).filter((row) => row.status === 'pending').length, 2, '前置条件：存量数据里确实有两条同指纹 pending')
+
+  assert.equal((await reborn.runCommand(`approve ${String(queuedOnce.id)}`)).kind, 'success', '第一条批准成 active')
+  const secondApprove = await reborn.runCommand(`approve ${String(twinRow.id)}`)
+  assert.equal(secondApprove.kind, 'success', `第二条必须合并而不是新建第二条：${secondApprove.text}`)
+  assert.match(secondApprove.text, /同一条/u, '文案要说明「库里已有同一条」')
+  const legacyActives = allRows(reborn).filter((row) => row.status === 'active')
+  assert.equal(legacyActives.length, 1, '同指纹批两条之后 active 仍只有一条')
+  assert.equal(String(legacyActives[0]!.id), String(queuedOnce.id), '留下的是先批准的那条')
+  assert.equal(Number((reborn.reportState().writes as Json).merged), 1, '第二条走的是合并路径')
+})
+
+// ---------------------------------------------------------------- 119. 治理命令的 persist 失败
+
+test('host#119 persist() 失败的治理命令必须报错、不得谎报成功（审计 high）', async (t) => {
+  // 前置：造一份「盘上已经有」的库（一条 active + 两条 pending），再交给一个 put 必失败的实例。
+  const seed = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false } })
+  t.after(() => seed.dispose())
+  await seed.settle()
+  const active = await seed.memory().write({ kind: 'semantic', text: '盘上已有的 active 记录：构建产物统一放到 dist 目录', origin: 'observed' })
+  const queuedA = await writeTool(seed, { kind: 'semantic', text: '盘上已有的待确认记录甲' })
+  const queuedB = await writeTool(seed, { kind: 'semantic', text: '盘上已有的待确认记录乙' })
+  assert.equal(active.ok, true)
+  assert.equal(queuedA.pending, true)
+  assert.equal(queuedB.pending, true)
+  const rowsBefore = new Map(seed.domain.rows)
+  const observedAtBefore = rowsBefore.get(String(active.id))!.observedAt
+  // 假领域不做序列化：把「盘上数据」深拷一份当快照，否则内存里的改动会顺着共享对象引用写回快照，
+  // 「重启后回退」就变成自我实现的假命题（真宿主是反序列化，不存在这种别名）。
+  const diskSnapshot = (): Map<string, Json> =>
+    new Map([...rowsBefore].map(([key, value]) => [key, JSON.parse(JSON.stringify(value)) as Json]))
+
+  const failing = makeHarness({
+    config: { writePolicy: 'ask', selfIntroEnabled: false },
+    failPuts: true,
+    seedDomainRows: diskSnapshot(),
+  })
+  t.after(() => failing.dispose())
+  await failing.settle()
+
+  // 审计证据：这些命令在 put 失败时仍旧报 success（`/memory approve` 甚至说「从现在起它可以被注入」），
+  // 而重启后记录回到 pending。现在必须逐条返回 error，并如实说明「未落盘、重启后会回退」。
+  const cases: Array<[string, string]> = [
+    ['pin', `pin ${String(active.id)}`],
+    ['refresh', `refresh ${String(active.id)}`],
+    ['confirm', `confirm ${String(active.id)}`],
+    ['archive', `archive ${String(active.id)}`],
+    ['reject-pending', `reject-pending ${String(queuedB.id)}`],
+    ['approve', `approve ${String(queuedA.id)}`],
+  ]
+  for (const [label, line] of cases) {
+    const result = await failing.runCommand(line)
+    assert.equal(result.kind, 'error', `${label} 落盘失败时必须返回 error：${result.text}`)
+    assert.match(result.text, /未落盘/u, `${label} 的文案必须明说没落盘：${result.text}`)
+    assert.match(result.text, /重启后会回退/u, `${label} 的文案必须点明重启后会回退：${result.text}`)
+  }
+  assert.equal(failing.domain.rows.size, rowsBefore.size, '落盘失败 ⇒ 盘上一个条目都不许变')
+
+  // 内存里确实改了（这正是文案「只在内存里」的依据）——失败报错不等于什么都没发生
+  const inMemory = failing.memory().list().find((row) => String(row.id) === String(active.id))!
+  assert.equal(inMemory.pinned, true, 'pin 在内存里已生效（所以文案说的是「只在内存里」）')
+  assert.equal(inMemory.status, 'archived', 'archive 在内存里已生效')
+
+  // 重启：从同一份**未被改动**的盘上数据重建实例 ⇒ 状态与「重启后会回退」逐条一致
+  const reborn = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false }, seedDomainRows: diskSnapshot() })
+  t.after(() => reborn.dispose())
+  await reborn.settle()
+  const rebornActive = reborn.memory().list().find((row) => String(row.id) === String(active.id))!
+  assert.equal(rebornActive.pinned, false, 'pin 没落盘 ⇒ 重启后仍未固定')
+  assert.equal(rebornActive.status, 'active', 'archive 没落盘 ⇒ 重启后仍是 active')
+  assert.equal(rebornActive.origin, 'observed', 'confirm 没落盘 ⇒ 重启后来源没被升级')
+  assert.equal(rebornActive.observedAt, observedAtBefore, 'refresh 没落盘 ⇒ 重启后衰减计时没有重算')
+  const rebornA = reborn.memory().list().find((row) => String(row.id) === String(queuedA.id))!
+  assert.equal(rebornA.status, 'pending', 'approve 没落盘 ⇒ 重启后该记录回到 pending（审计复现的正是这条）')
+  const rebornB = reborn.memory().list().find((row) => String(row.id) === String(queuedB.id))!
+  assert.equal(rebornB.status, 'pending', 'reject-pending 没落盘 ⇒ 重启后仍留在队列里')
+})
+
+// ---------------------------------------------------------------- 120. 抛错的访问器
+
+test('host#120 抛错的 embedder 访问器：setEmbedder / capabilities / stats 一律不抛、不改状态（审计 medium）', async (t) => {
+  const harness = makeHarness({ noReport: true })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = harness.memory()
+
+  /** 一个属性 `key` 一读就抛的候选 embedder。 */
+  const throwingAccessor = (key: string): Json => {
+    const target: Json = { embed: async () => [] }
+    Object.defineProperty(target, key, {
+      get() { throw new Error(`访问器抛错：${key}`) },
+      enumerable: true,
+      configurable: true,
+    })
+    return target
+  }
+
+  // id / dimensions / embed 三条：抛错的访问器按**非法**处理（rejected_invalid），绝不冒泡
+  for (const key of ['id', 'dimensions', 'embed']) {
+    let result: { ok: boolean; error?: string } | null = null
+    try {
+      result = service.setEmbedder(throwingAccessor(key))
+    } catch (error) {
+      assert.fail(`setEmbedder 不得因 ${key} 的访问器抛错而抛：${String(error)}`)
+    }
+    assert.equal(result!.ok, false, `${key} 的访问器抛错 ⇒ 非法输入`)
+    assert.match(String(result!.error), /^rejected_invalid/u, `${key} 的拒绝原因必须结构化：${result!.error}`)
+    assert.equal(service.capabilities().embedder, false, `${key} 被拒后不得改变注册状态`)
+  }
+
+  // 注册一个合法 embedder，再把 id / dimensions 改成抛错的访问器：capabilities() / stats() 不得抛
+  const keeper = makeFakeEmbedder({ id: 'keeper', dimensions: 3, vectors: {} })
+  assert.deepEqual(service.setEmbedder(keeper.embedder), { ok: true, id: 'keeper' })
+  Object.defineProperty(keeper.embedder, 'id', { get() { throw new Error('id 访问器抛错') }, configurable: true })
+  Object.defineProperty(keeper.embedder, 'dimensions', { get() { throw new Error('dimensions 访问器抛错') }, configurable: true })
+
+  let caps: { embedder: boolean; embedderId: string | null } | null = null
+  try {
+    caps = service.capabilities()
+  } catch (error) {
+    assert.fail(`capabilities() 不得抛：${String(error)}`)
+  }
+  assert.equal(caps!.embedder, true, '注册状态不因访问器抛错而改变')
+  assert.equal(caps!.embedderId, null, '读不到 id ⇒ null（不是抛，也不是伪造一个 id）')
+
+  let stats: { embedder: { id: string | null; dimensions: number | null; calls: number } } | null = null
+  try {
+    stats = service.stats()
+  } catch (error) {
+    assert.fail(`stats() 不得抛：${String(error)}`)
+  }
+  assert.equal(stats!.embedder.id, null, 'stats 里读不到的 id 如实为 null')
+  assert.equal(stats!.embedder.dimensions, null, 'stats 里读不到的 dimensions 如实为 null')
+  assert.equal(stats!.embedder.calls, 0, '其余计数照常返回')
+
+  // 抛错不影响「能不能写」：清除是合法路径，且拒绝过的注册从不半途生效
+  assert.equal(service.setEmbedder(throwingAccessor('id')).ok, false, '再来一次仍然是 rejected_invalid')
+  assert.equal(service.capabilities().embedder, true, '拒绝路径不得把已注册的 embedder 摘掉')
+  assert.deepEqual(service.setEmbedder(null), { ok: true, id: null }, 'null = 清除仍然可用')
+})
+
+// ---------------------------------------------------------------- 121. recall 的同步 / 异步契约
+
+test("host#121 recall 的同步契约：词面（缺省 / lexical / query / memory）与「无 embedder 的 semantic/hybrid」都是同步数组（审计 medium，§3）", async (t) => {
+  const harness = makeHarness({ noReport: true })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  const service = harness.memory()
+  await service.write({ kind: 'semantic', text: '构建流程统一用 pnpm 输出到 dist 目录' })
+  const query = '构建流程 pnpm dist 目录'
+
+  // a) 词面口径（含既有的 'query' / 'memory'）：同步数组，诊断如实写 'lexical'、无回落
+  const lexicalModes: Array<[string, Json]> = [
+    ['缺省', { query }],
+    ["mode:'lexical'", { query, mode: 'lexical' }],
+    ["mode:'query'", { query, mode: 'query' }],
+    ["mode:'memory'", { query, mode: 'memory' }],
+  ]
+  for (const [label, options] of lexicalModes) {
+    const result = service.recall(options)
+    assert.ok(Array.isArray(result), `${label} 必须同步返回数组（0.5.19 的缺省路径逐字节不变）`)
+    assert.equal(service.lastRecall()?.mode, 'lexical', `${label} 的诊断必须如实写实际用的那套（'lexical'）`)
+    assert.equal(service.lastRecall()?.fallback, null, `${label} 不是回落，fallback 必须是 null`)
+  }
+  const plain = service.recall({ query })
+  assert.ok(plain.length > 0, '前置条件：词面召回确实命中')
+  assert.equal(canonicalHits(service.recall({ query, mode: 'query' })), canonicalHits(plain), "'query' 与缺省逐字节等价")
+  assert.equal(canonicalHits(service.recall({ query, mode: 'memory' })), canonicalHits(plain), "'memory' 与缺省逐字节等价")
+
+  // b) 没注册 embedder：semantic / hybrid **必定**回落词面 ⇒ 同步数组（不得是 Promise），fallback 如实标
+  for (const mode of ['semantic', 'hybrid'] as const) {
+    const result = service.recall({ query, mode })
+    assert.ok(Array.isArray(result), `无 embedder 时 mode='${mode}' 必须同步返回数组`)
+    assert.equal(typeof (result as unknown as { then?: unknown }).then, 'undefined', `mode='${mode}' 不得返回 thenable`)
+    assert.deepEqual(hitRecordIds(result), hitRecordIds(plain), `${mode} 的回落结果就是词面结果`)
+    assert.ok(scoresClose(result, plain), `${mode} 的回落分值必须与词面一致`)
+    assert.deepEqual(service.lastRecall(), { mode, used: false, fallback: 'no-embedder', candidates: plain.length, vectors: 0 })
+  }
+  assert.deepEqual(service.stats().embedder, {
+    id: null, dimensions: null, calls: 0, errors: 0, hits: 0, misses: 0, timeouts: 0,
+  }, '同步回落路径同样一次 embed 都不调')
+
+  // c) 注册 embedder 后：semantic / hybrid 才异步（真的要用嵌入）
+  const fake = makeFakeEmbedder({ id: 'sync-contract', dimensions: 2, vectors: {}, fallback: [1, 0] })
+  assert.deepEqual(service.setEmbedder(fake.embedder), { ok: true, id: 'sync-contract' })
+  for (const mode of ['semantic', 'hybrid'] as const) {
+    const result = service.recall({ query, mode })
+    assert.equal(
+      typeof (result as unknown as { then?: unknown }).then,
+      'function',
+      `已注册 embedder ⇒ mode='${mode}' 必须返回 Promise（这次真的要用嵌入）`,
+    )
+    await result
+  }
+  assert.ok(fake.calls.length > 0, '异步路径确实调用了 embed')
+})
+
 
 

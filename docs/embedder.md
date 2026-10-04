@@ -78,11 +78,26 @@ mode?: 'lexical' | 'semantic' | 'hybrid'   // 缺省 'lexical'（＝今天的行
 - `'semantic'`：只用嵌入相似度排序（词面只作为**兜底**：嵌入不可用时回落词面）。
 - `'hybrid'`：`score = (1 - w) * lexical + w * semantic`，`w = cfg.embedderWeight`（默认 0.5）。
 - 返回元数据（`ctx.memory.recall` 的返回结构是 `RecallHit[]`，为保持签名兼容，
-  **不改返回类型**；把回落与用量通过 `stats().embedder` 与新增的 `lastRecall` 诊断暴露：
+  **命中结构不改**；把回落与用量通过 `stats().embedder` 与新增的 `lastRecall` 诊断暴露：
   ```ts
   lastRecall(): { mode: 'lexical'|'semantic'|'hybrid'; used: boolean; fallback: 'no-embedder'|'embed-error'|'timeout'|null; candidates: number; vectors: number } | null
   ```
 - **超时**：每个嵌入调用受 `cfg.embedderTimeoutMs`（默认 200）约束，超时按失败处理并计 `timeouts`。
+- **返回类型与实现一致（重要）**：`recall()` 只有**确实要调嵌入**时才异步 ——
+  ```ts
+  recall(options): RecallHit[] | Promise<RecallHit[]>   // 不走嵌入 ⇒ 同步数组；要调 embed ⇒ Promise
+  ```
+  也就是「先看这次会不会真的调 `embed`」：
+  - **缺省、显式 `'lexical'`、以及非法/未知 `mode` 值** ⇒ **同步返回数组**（一次嵌入调用都不会发生）；
+  - **`mode: 'semantic' | 'hybrid'` 且未注册 embedder** ⇒ **也是同步数组**：没有东西可嵌入 ⇒ **同步**回落词面，
+    并在 `lastRecall()` 里如实报 `fallback: 'no-embedder'`。实现里这就是一条同步的提前返回
+    （`if (embedderState.current === null) return lexicalHits(mode, 'no-embedder')`）。
+    别写成「未注册时 semantic 返回 Promise」—— 与实现不符；
+  - **`mode: 'semantic' | 'hybrid'` 且已注册 embedder** ⇒ **`Promise`**（`embed` 按契约就是异步的），
+    resolve 出来还是 `RecallHit[]`。
+  - 调用方如果不确定拿到的形状，`await` 一次最省事：`await` 一个数组是合法且无副作用的。
+  - **签名的兼容性没变**：v1.3 之前 `recall` 就是同步的，所以没有 embedder 的老调用方行为一字未动；
+    只有「注册了 embedder 又显式要语义」的调用方需要 `await`。
 
 ## 4. 配置（`src/types.ts` 的 `MemoryConfig`，Lead 加）
 
@@ -115,7 +130,9 @@ export function vectorKeyOf(record: MemoryRecord): string
   **零嵌入调用**、`semantic`/`hybrid` 在注册后生效、**未注册时回落并如实标记 fallback**、
   embedder 抛错/超时/形状错/维度错 ⇒ 不抛且计 errors、缓存命中不重复调用（hits/misses 数字）、
   `embedderRecallMode:'recall'` 时按轮召回用混合、默认 `'off'` 时注入路径与 0.5.19 逐字节相同。
-- 协议套件：`protocolVersion === '1.3'`、五个新方法/字段存在且形状正确、未注入时 `capabilities().embedder === false`。
+- 协议套件：`protocolVersion === '1.3'`、五个新方法/字段存在且形状正确、未注入时 `capabilities().embedder === false`、
+  **返回类型与 §3 一致**（缺省/`'lexical'` 同步数组；`'semantic'`/`'hybrid'` 在注册后返回 Promise，
+  未注册时仍是同步数组 + `fallback: 'no-embedder'`）。
 - 文档：两份协议文档加 **§11 v1.3 的加法**（含"插件不联网、是否外发由宿主决定"的隐私说明），两版**逐节对齐**；
   README 两份加一节「外接嵌入器（可选）」并**中英对齐**（`pnpm check:readmes` 会验）。
 - `pnpm verify:self-contained` 继续保持通过（**零运行期依赖**这条不能被破坏）。

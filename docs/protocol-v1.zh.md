@@ -45,6 +45,92 @@ ctx.provide('memory', { protocolVersion, list, stats, recall, write, consolidate
 
 `setEmbedder` / `capabilities` / `lastRecall` 是 v1.3 的加法（§3.6、§11）；写着 `'1.2'` 的服务面根本没有它们。
 
+### 2.1 怎么把宿主半边接起来（照实现读出来的）
+
+本插件是 DSH/Cordis 插件：入口就是 `apply(ctx, config)`，它用到的一切都从 `ctx` 上拿。
+**必需的接缝就是下面这些**（`src/index.ts` 的 `export const inject` 声明的）：
+
+```ts
+export const inject = ['agents', 'systemPrompt', 'storageDomain', 'tools', 'commands']
+```
+
+一个「顺便注册嵌入器」的宿主，最小 `apply` 长这样 —— 不需要 import 插件的任何内部件，只用下面这些接缝：
+
+```ts
+export function apply(ctx: MyHostContext, config: Record<string, unknown>): void {
+  // 1) 服务面唯一必需的接缝：`provide`（可选 —— 见下面那张表）
+  ctx.provide('memory', { /* 宿主自己的兄弟服务在这里发布 */ })
+
+  // 2) 自己加的东西自己管生命周期：`ctx.effect(setup)` 返回清理函数，卸载时 DSH 会调它
+  ctx.effect(() => {
+    const stop = startSomething(ctx)
+    return () => stop()
+  })
+
+  // 3) 作用域注入可选服务：服务缺席时这段永不执行，也不会让 fiber 卡住
+  ctx.inject(['settings'], (scope) => { scope.effect(() => () => teardown()) })
+
+  // 4) 消费记忆服务 —— 先探测再调用，别假设它存在（见下方「调用方的规矩」）
+  const memory = ctx.get('memory') as { setEmbedder?: (e: unknown) => unknown } | undefined
+  if (memory?.setEmbedder) memory.setEmbedder(myEmbedder)
+
+  // 5) 插件自己注册进去的面：systemPrompt、tools.register、commands.register，以及事件总线
+  //    （`ctx.on('session/event', …)`、`ctx.on('agent/pre-step', …)`、`ctx.on('agent/turn-stopping', …)`）
+}
+```
+
+接缝清单，**按实现如实列出**（照它写代码；没列在这里的都是内部实现，patch 版之间可能变 —— §2 规矩 3）：
+
+| 接缝 | 插件怎么用它 | 必需吗 |
+|---|---|---|
+| `ctx.provide(name, service)` | 发布 `memory` 服务（§2）。整段包在 `try/catch` 里：宿主没有它插件照常工作，只是 `ctx.get('memory')` 恒为 `undefined` | 可选 |
+| `ctx.inject([...])` | 作用域注入 —— 用于可选的 `settings` 服务，服务缺席时不会让插件的 fiber 永久 PENDING | 可选 |
+| `ctx.effect(fn, label?)` | 生命周期 + 清理：卸载时靠它关闭存储域（见下方*卸载*） | 实践中必需（持久化与清理都挂着它） |
+| `ctx.on(event, handler)` | `session/event`（序号跟踪、捕获、压缩摘要）、`agent/pre-step`（按轮召回）、`agent/turn-stopping`（回合收尾捕获） | 捕获/注入必需 |
+| `ctx.systemPrompt.section(...)` / `ctx.systemPrompt.context(...)` | 两条常驻注入通道 | 常驻块必需 |
+| `ctx.tools.register(tool)` | 七个 `memory_*` 工具 | 可选 |
+| `ctx.commands.register(command)` | `/memory …` 与 `/sleep` | 可选 |
+| `ctx.get('storageDomain')` / `ctx.get('sessionQuery')` / `ctx.get('settings')` | 可选服务，全部先探测再用 | 可选 |
+| `ctx.get('memory')` | **第三方**消费本服务的方式（§2） | — |
+
+### 2.2 `ctx.storageDomain.open()` 返回的句柄必需形状
+
+插件只打开一次并把句柄留到生命期结束。它只用到两种形状，所以宿主的 domain 至少要提供这些：
+
+```ts
+const domain = await ctx.storageDomain.open({
+  name: cfg.domainName,          // 领域名（同时也是落盘目录名）
+  version: 1,
+  layout: 'per-record',
+  tables: { memories: { valueSchema: passthroughSchema } },
+  global: { schema: passthroughSchema, initial: { schemaVersion: 1, collectionVersion: 0 } },
+})
+
+// 句柄上插件真正需要的东西：
+await domain.global.get()               // 水位对象（{ schemaVersion, collectionVersion, … }）—— 必须 await
+await domain.global.set(meta)           // 持久状态变化时写回
+for (const entry of domain.table('memories').entries()) { /* … */ }   // 全量加载：[key, value] 或直接 value
+await domain.table('memories').put(record.id, record)                 // 落盘一条
+await domain.table('memories').delete(record.id)                      // 删除一条
+await domain.close()                    // 卸载时调用（见下）
+```
+
+- `global.get()` 在运行版里**是异步的**，必须 `await` —— 直接把 thenable 存下来会让水位永远读不出来（`src/index.ts` 里有对应注释）。
+- `table('memories')` 必须能应答 `entries()`（可迭代的 `[key, value]` 对或裸值；加载器两种都接受）、
+  `put(key, value)` 与 `delete(key)`。
+- `open()` reject（或 `storageDomain` 根本缺席）不是致命错误：`stats().opened` 保持 `false`、写入报 `persisted: false`，
+  插件继续用内存库提供服务（§8 缺口 3）。
+
+### 2.3 卸载与清理
+
+- **有 dispose 路径，而且是插件自己持有的。** 清理注册在 `ctx.effect(() => …)` 返回的回调里：卸载时插件先补落盘用量、
+  把领域引用置空，再调 `domain.close()`。这些都不在服务面上暴露 —— 通过 `setEmbedder` 注册的嵌入器跟着插件实例一起消失。
+- **服务面**（`memory` 服务对象）上**没有** `dispose()`，第三方没法要求插件自己关停；请**自行丢弃引用**、重载后重新获取（§2 表格那条）。
+  在宿主卸载插件之前，服务照常可用。
+- **关闭顺序有讲究**，宿主自己开 domain 时要照做：先补落盘、再关闭 —— 反过来会让最后一次用量更新静默失败。
+
+### 2.4 第三方怎么定位服务
+
 定位方式：
 
 ```ts
@@ -68,6 +154,7 @@ const memory = ctx.get('memory')
 3. **只有本文是接缝。** 工具注册、`/memory` 与 `/sleep` 的命令输出、开发期自报告文件、设置页表单、存储域的盘上布局
    都是内部实现，patch 版之间可能变。
 4. **不要把引用缓存过插件重载**；也不要把 `list()` / `recall()` 返回的记录当副本改（它们是内存里的活对象，见 §8 缺口 5）。
+5. **`recall()` 可能返回 Promise**：缺省 / `'lexical'` 是同步数组，`'semantic'` / `'hybrid'` 在**没注册嵌入器**时同样是同步数组（同步回落词面）；注册之后 `'semantic'` / `'hybrid'` 才返回 Promise（§3.3）。不确定就 `await` 一次。
 
 ## 3. 方法：签名 / 入参 / 返回结构 / 错误形状
 
@@ -166,7 +253,9 @@ list(options?: {
 | 字段 | 含义 |
 |---|---|
 | `records` | 内存中的记录条数（含全部状态，与 `list()` 同一集合） |
-| `version` | 库版本号：每次成功的 put/delete 都 +1，可用来判断「有没有变」。**不是**存储 schema 版本 |
+| `version` | 库版本号，**照实现如实描述**（§8 第 8 条）：它在 **put 开始时就 +1** —— 在 `await put` 之前 ——
+所以随后 **put 抛错也照样自增**（`persist()` 先加、后 catch 失败）。`delete` **只在成功时** +1；`delete` 抛错时内存里的记录会**回滚**，
+`version` 不动。把它当「库被动过」的信号，不要当落盘凭据（落盘看 `opened` / `writes.persisted`）。**不是**存储 schema 版本 |
 | `opened` | `ctx.storageDomain.open()` 是否成功。`false` 表示写入没有落到盘上（见 §8 缺口 3） |
 | `writes`（v1.2 新增） | 本进程内累计的写入落盘结果。`persisted`：`persist()` 返回真的次数（真的落盘）；`unpersisted`：`ok: true` 但没落盘的次数（域未打开 / `put` 抛错）。计数**只加不减**，进程内累计、重启归零（与 `version` 同性质）。拒绝路径（`ok: false`）**不计入**这两个数 —— 那根本不叫写入。它与内部既有的 `state.writes` 计数器**并列存在、不复用**（既有计数器语义不同）。 |
 | `embedder`（v1.3 新增） | 嵌入器运行状况：`id` / `dimensions`（未注册时为 `null`）、`calls`（批量算一次）、`errors`（抛出 / reject / 形状或维度不对 / 超时）、`hits` / `misses`（向量缓存；未命中＝真的调了 `embed`）、`timeouts`（同样计入 `errors`）。没注册嵌入器时所有计数恒为 `0`、`id` / `dimensions` 恒为 `null`，所以统计行与 0.5.19 完全一致。注册方式与语义见 §3.6、§11。 |
@@ -185,7 +274,7 @@ interface RecallOptions {
   /** 分支过滤，语义与 `list` 的 `branch` 完全一致（v1.2 起同样接受数组；**空数组 ⇒ 空结果**）。缺省 = 不过滤（今天的行为）。 */
   branch?: 'current' | string | readonly string[] | null
   /** 新增（v1.3）：排序通道。缺省 `'lexical'` ＝ 与 0.5.19 逐字节相同，且零嵌入调用。 */
-  mode?: 'lexical' | 'semantic' | 'hybrid'
+  mode?: 'query' | 'memory' | 'lexical' | 'semantic' | 'hybrid'
 }
 ```
 
@@ -197,21 +286,53 @@ interface RecallOptions {
 | `tag` | `string` | — | 按标签精确过滤 |
 | `limit` | `number` | `8` | 夹到 1…50 |
 | `mode` | `'query' \| 'memory'` | `'query'` | 短查询 / 整轮用户消息 |
-| `minLexical` | `number` | `0.34` | `mode: 'query'` 的阈值 |
-| `minMatch` | `number` | `0.4` | `mode: 'memory'` 的阈值 |
-| `minHits` | `number` | `2` | `mode: 'memory'` 的最少有信息量 token 命中数 |
+| `minLexical` | `number` | `0.34` | **`'query'` 词面口径**的阈值（见下方 `mode`） |
+| `minMatch` | `number` | `0.4` | **`'memory'` 词面口径**的阈值 |
+| `minHits` | `number` | `2` | **`'memory'` 口径**的最少有信息量 token 命中数 |
 | `includeArchived` | `boolean` | `false` | 同时纳入 `archived` 记录 |
 | `status` | `'active' \| 'pending' \| 'invalid' \| 'archived' \| 'all'` | 不给 = 今天的候选集合 | 允许返回哪些 §4.3 状态。不给 = 今天的行为（`active`，外加 `includeArchived === true` 时的 `archived`）；`'all'` = active + pending + invalid + archived，排序不变；`'pending'` **是允许的** —— 这是显式的管理/审计查询（§9） |
 | `branch` | `'current' \| string \| readonly string[] \| null` | 不给 = 不过滤 | 与 `list` 的 `branch` 语义完全一致（§3.1）：`'current'` = 注入自己那套 `branchVisible` 口径，按当前 cwd 过滤；其它字符串只保留 `branchOf(record)` 等于该值的记录；**v1.2：** 数组只保留 `branchOf(record)` 落在数组里的记录（无标签不算命中），**空数组返回空结果**；`null`/不给 = 不过滤 |
-| `mode`（v1.3 新增） | `'lexical' \| 'semantic' \| 'hybrid'` | `'lexical'` | 用哪条通道给命中排序。`'lexical'` 就是今天的行为、与 0.5.19 完全一致：**根本不看 embedder，也不会产生任何嵌入调用**。`'semantic'` 只用嵌入相似度排序（词面只作为嵌入不可用时的兜底）。`'hybrid'` 用 `score = (1 - w) * lexical + w * semantic`，`w = cfg.embedderWeight`（默认 `0.5`）。没有可用嵌入器时，`'semantic'` / `'hybrid'` 返回词面结果并由 `lastRecall()` 明说原因（§3.6）—— 绝不静默 |
+| `mode` | `'query' \| 'memory' \| 'lexical' \| 'semantic' \| 'hybrid'` | `'query'` | **同一个键，两套词汇表** —— 合并表见下方。*词面口径* 决定**查询侧怎么打分**；*检索通道* 决定**命中来自哪一路排序**。 |
+
+**`mode`：一个键，两套词汇表（原 §3.3 的表与 §11 冲突，这里合并成一张）。**
+
+| 取值 | 属于 | 语义 | 缺省 |
+|---|---|---|---|
+| `'query'` | 词面口径 | 查询是**短查询**：拿整条记录正文去匹配，阈值 `minLexical`（0.34）。就是 v1.0 的行为 | ✅（`mode` 不给时） |
+| `'memory'` | 词面口径 | 查询是**整轮用户消息**：走记忆侧覆盖率判定，阈值 `minMatch`（0.4）/ `minHits`（2）。v1.0 行为 | — |
+| `'lexical'`（v1.3 新增） | 检索通道 | 「走词面通道」—— **与缺省逐字节相同**：等价于不给 `mode`，**零**嵌入调用 | —（等价于缺省） |
+| `'semantic'`（v1.3 新增） | 检索通道 | 只用嵌入相似度排序；词面只作为嵌入不可用时的兜底 | — |
+| `'hybrid'`（v1.3 新增） | 检索通道 | `score = (1 - w) * lexical + w * semantic`，`w = cfg.embedderWeight`（默认 `0.5`） | — |
+
+- **不要用一个 union 去读 `mode`。** `'query'` / `'memory'` 与 `'lexical'` / `'semantic'` / `'hybrid'` 是同一个键上的
+  **两套互不相交的含义**：前两个选的是词面*口径*（查询侧怎么打分），后三个选的是*检索通道*（命中来自哪一路）。
+  不给 `mode` 既是 `'query'`、也是词面通道，所以既有调用方（不传 `mode`，或只传 `'memory'`）行为与 v1.0 完全一致。
+- **`'query'` / `'memory'` 不等于「不走嵌入」。** 它们是口径不是通道：`recall({ mode: 'memory' })` 是词面排序，
+  但决定它的是「口径」；通道是词面的，因为没有谁选语义。想要「整轮消息 + 语义排序」的调用方请传 `mode: 'semantic'`
+  并用整轮文本做 `query` —— **两套词汇表没法在同一次调用里叠用**。
+- **非法值不报错，也不猜。** 任何不属于这五个字符串的 `mode` 一律**按缺省处理**：等价于不给（`'query'` 口径 +
+  词面通道）、不产生任何嵌入调用，`lastRecall().mode` 报 `'lexical'`（§3.6）。非法值**绝不**被当成 `'semantic'`，也不抛。
+  所以 `recall()` 容忍任何入参形状 —— 见下面的*错误形状*。
+- **两套词不是同义词**：`'lexical'` / `'semantic'` / `'hybrid'` **不是** `'query'` / `'memory'` 的别名；诊断也分开报：
+  `lastRecall()` 只会报**通道**（`'lexical' | 'semantic' | 'hybrid'`），永远不报口径。
 
 - **返回**：`Array<{ record: MemoryRecord; match: number; score: number }>`，按 `score` 降序、再按记录确定性顺序（§4.1）
   排序，截断到 `limit`。
-  - `match` 是所选模式下的相关性（0…1）；`score` 是排序分（词面 + 重要度 + 时效）。
+  - `match` 是所选**通道**下的相关性（0…1）；`score` 是排序分（词面 + 重要度 + 时效）。
   - 候选集合：不给 `status` 时就是今天的集合 —— `status === 'active'` 恒在内，`includeArchived === true` 时再加上
     `archived`；**只有不给 `status` 时，无论其它入参怎么组合，`pending` 与 `invalid` 都永不返回。** 显式的
     `status: 'pending' | 'invalid' | 'all'` 是唯一能取到它们的门 —— 那是审计查询，绝不是注入路径（注入路径不传 `status`）。
 - **错误形状**：任何入参形状都不抛（运行期容忍 options 缺席）。
+- **返回类型：只有真的要走嵌入时才是异步（v1.3）。** 声明的类型是 `RecallHit[] | Promise<RecallHit[]>`，
+  拿到哪一种看这次调用的实际情况：
+  - **缺省 / `'lexical'` / 非法的 `mode` 值 ⇒ 普通数组**：不需要 `await`，也不会产生任何嵌入调用；
+  - **`'semantic'` / `'hybrid'` 且没注册嵌入器 ⇒ 也是普通数组**：没有东西可嵌入，于是**同步**回落词面，
+    并由 `lastRecall().fallback === 'no-embedder'` 如实说明（§3.6）—— 它仍是词面结果，绝不是假装出来的语义结果；
+  - **`'semantic'` / `'hybrid'` 且已注册嵌入器 ⇒ `Promise`**（嵌入调用按契约就是异步的），resolve 出来的还是同一个
+    `RecallHit[]` 形状。
+  - 两种形状都能 `await`（await 一个非 Promise 是无副作用的），§6/§11 的示例就是这么写的。
+  - **兼容性没变**：v1.3 之前 `recall` 就是同步的，不传 `mode` 的调用方（＝所有 v1.3 之前的调用方）拿到的仍是普通数组，
+    行为与以前一字不差。
 - **回落必须说出来，绝不藏着（v1.3）。** 没注册嵌入器时，`mode: 'semantic'` 照样返回词面结果，且
   `lastRecall().fallback === 'no-embedder'`。嵌入器抛出 / reject / 超时 / 返回形状或维度不对时，计进
   `stats().embedder.errors`，并由 `lastRecall()` 如实报成 `'embed-error'` / `'timeout'`（§3.6）。这类失败
@@ -353,16 +474,32 @@ interface MemoryRef {
 }
 ```
 
-每条记录最多 `refsMax`（默认 5）个引用，**新在前**；`sessionId + from + to` 相同视为重复，只留一条。`via` 是写入路径：
+每条记录最多 `refsMax`（默认 5）个引用；`sessionId + from + to` 相同视为重复，只留一条。
+**顺序是写入方的约定**：`withRef` 把新引用拼在最前，读取路径按数组原样渲染 —— 没有任何一层排序，
+所以「新的在前」只是因为 `withRef` 这么拼。`via` 是写入路径表：
 `live` = 回合收尾规则捕获，`tool` = `memory_write`，`command` = 用户命令，`solidify` = 压缩摘要固化，`sleep` = `/sleep`
 补录，`import` = 导入。显式 `input.refs` 优先于 `refVia`；`refsEnabled: false` 时完全不附着引用。
+
+**字符串语法（`refsToString` 渲染出来的样子，也是 `write()` 的 `refs` 字段的样子）：**
+
+| 形态 | 例子 | 什么时候 |
+|---|---|---|
+| 区间 | `session-84a547da-5727-4ffc-adf0-26d02e749e13#120-180` | `from` 与 `to` 都给且**不相等** |
+| 单点 | `session-…-…#93` | 只给 `from`（或 `from === to`） |
+| 只有终点 | `session-…-…#180` | 只给 `to` |
+| 无语号 | `session-…-…` | 两个都没给 |
+| 多条 | `session-A#120-180;session-B#93` | 引用列表用 **`;`** 连接 |
+
+分隔符是裸 `;`（展示 helper `formatRefs` 用的是带空格的 `'; '`，机器可读串不带空格）。渲染是逐条进行的，
+**不做去重、不排序、不裁剪**；去重、`refsMax` 上限与字段校验都发生在写入路径。校验不过的条目会被丢掉，
+所以渲染结果可能比数组短，也可能整个是空串。`formatRefs` 除非显式传 `{ short: true }`，否则**不**短化会话 id。
 
 ### 4.3 `status` 取值语义
 
 | 取值 | 含义 |
 |---|---|
 | `active` | 唯一会参与注入与召回的取值 |
-| `pending` | 被写入审批门（`writePolicy: 'ask'`）排队的条目，**在等用户确认**。不进注入、工具也列不出来；默认召回拿不到，**除非显式点名**（`list({ status: 'pending' })`、`recall({ status: 'pending' })`，属审计查询，§3.1/§3.3）；只有用户命令（`/memory approve`、`/memory confirm`）能让它变 `active` |
+| `pending` | 被写入审批门（`writePolicy: 'ask'`）排队的条目，**在等用户确认**。不进注入、工具也列不出来；默认召回拿不到，**除非显式点名**（`list({ status: 'pending' })`、`recall({ status: 'pending' })`，属审计查询，§3.1/§3.3）。**能让它变 `active` 的只有 `/memory approve`** —— `/memory confirm` **不能**（它做的是把 `origin` 升成 `user_explicit`、把 `confidence` 提上去，**从不碰 `status`**；对一条 pending 记录它只会改写那条临时记录的来源） |
 | `invalid` | 冲突落败方 / 被拒绝的待确认写入。默认不参与召回，连 `includeArchived` 也拿不到；只有显式 `status: 'invalid'`（或 `'all'`）查询能取到；可用 `/memory restore` 恢复 |
 | `archived` | 不进注入，但 `includeArchived: true` 时仍可被检索（衰减归档与整合合并都落在这里） |
 
@@ -444,6 +581,17 @@ export async function remember(ctx: { get(name: string): unknown }, text: string
   // 只有 ok:true 也不代表落盘：v1.1 看 result.persisted（§3.4），否则看 memory.stats().opened。
   return result.ok === true && result.pending !== true
 }
+
+/** v1.3：同一个调用有两种可能形状 —— 无脑 await 一次，两种都没副作用（§3.3）。 */
+export async function rankSemantically(ctx: { get(name: string): unknown }, query: string): Promise<string[]> {
+  const memory = ctx.get('memory') as {
+    recall(options: { query: string; mode?: 'lexical' | 'semantic' | 'hybrid' }):
+      Array<{ record: { text: string } }> | Promise<Array<{ record: { text: string } }>>
+  } | undefined
+  if (!memory) return []
+  const hits = await memory.recall({ query, mode: 'semantic' })   // 没嵌入时是数组，真嵌入时是 Promise
+  return hits.map((hit) => hit.record.text)
+}
 ```
 
 `ctx.get('memory')` 要在 step / effect 里调用（那时服务才是活的），插件重载后要重新获取。
@@ -492,6 +640,11 @@ export async function remember(ctx: { get(name: string): unknown }, text: string
 6. **`list()` 不排序，且无参时不过滤。** 只有插入顺序，无参调用含 `pending`/`invalid`/`archived`。v1.1 新增的是可选
    `status` / `branch` / `limit` 过滤（§3.1），默认不变。想要「注入看到的样子」，请自己按 §4.3 + §4.4 复现，或者直接传
    `branch: 'current'` —— 那正是注入自己那套分支口径。
+8. **写入没落盘时 `version` 也自增**（照 `src/index.ts` 读出来：`persist()` 在 `await put` **之前**就
+   `state.collectionVersion += 1`，它的 `catch` 不回滚；而 `delete` 只在成功时 +1，`delete` 抛错时会把记录回滚到内存）。
+   所以 `version` 的含义是「库**被动过**」，不是「盘上变了」。**裁决：实现保持现状、文档写明**（§3.2）——
+   回答「到底有没有落到存储域」的是 `stats().opened` 与 `stats().writes.persisted`；这一条存在，只是为了不让人
+   把 `version` 当落盘凭据读。
 
 ## 9. v1.1 的加法
 
@@ -607,14 +760,18 @@ v1.2 没有改动，v1.1 的默认行为也一条没动：无参 `list()` 仍是
 ## 11. v1.3 的加法
 
 v1.3 是 v1 之内的**纯加法**：服务面的 `protocolVersion` 从 `'1.2'` 变成 `'1.3'`，0.5.19 能用的调用行为全部照旧 ——
-没注册嵌入器时无参 `list()` 逐字节不变，缺省 `recall({ mode: 'lexical' })` **零**嵌入调用。四处服务面新增：
+没注册嵌入器时无参 `list()` 逐字节不变，缺省 `recall({ mode: 'lexical' })` **零**嵌入调用。**五处**服务面新增：
 
 | # | 新增 | 位置 |
 |---|---|---|
 | 1 | `setEmbedder(embedder \| null)` —— 注册 / 替换 / 清除**宿主注入**的嵌入器。不合法对象被拒（`rejected_invalid: …`），且不改变当前注册状态 | §3.6 |
 | 2 | `capabilities()` —— `{ protocolVersion, lexical: true, embedder: boolean, embedderId: string \| null }`；判断能不能用语义打分的**唯一正确方式** | §3.6 |
-| 3 | `stats().embedder` —— `{ id, dimensions, calls, errors, hits, misses, timeouts }`；未注册嵌入器时全为 `0` / `null` | §3.2 |
-| 4 | `recall({ mode })` —— `'lexical'`（缺省，行为不变）/ `'semantic'` / `'hybrid'`，外加用于诊断回落与用量的 `lastRecall()` | §3.3、§3.6 |
+| 3 | `lastRecall()` —— **最近一次** `recall()` 的诊断：`{ mode, used, fallback, candidates, vectors }`；一次都没调过时为 `null` | §3.6 |
+| 4 | `stats().embedder` —— `{ id, dimensions, calls, errors, hits, misses, timeouts }`；未注册嵌入器时全为 `0` / `null` | §3.2 |
+| 5 | `recall({ mode })` —— `'lexical'`（缺省，行为不变）/ `'semantic'` / `'hybrid'` | §3.3、§3.6 |
+
+（是五处：`capabilities()` 与 `lastRecall()` 是服务面上两个**互相独立**的方法 —— 原文写「四处」却把 `lastRecall()`
+并列在第 4 项里；`tests/protocol.test.ts` 钉的是服务面上的成员，不是这个数字。）
 
 嵌入器契约本身 —— 宿主实现并注入的那个形状：
 

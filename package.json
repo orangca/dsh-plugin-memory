@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-memory",
-  "version": "0.5.20",
+  "version": "0.5.21",
   "type": "module",
   "packageManager": "pnpm@11.7.0",
   "description": "Personalized long-term memory for DSH (DeepSeek Harness): local-first, rule-based capture, dual-channel injection, explainable and deletable. 个性化长期记忆插件：本地优先、自动捕获、双通道注入、可解释可删除。",
@@ -49,11 +49,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node tools/build-client.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit && tsc -p tsconfig.tools.json && tsc -p tsconfig.tests.json",
-    "test": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node tools/build-client.ts && node --test tests/lib.test.ts tests/client.test.ts tests/host.test.ts tests/tools.test.ts tests/module.test.ts tests/protocol.test.ts && node tools/check-readmes.ts",
+    "test": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node tools/build-client.ts && node --test tests/lib.test.ts tests/client.test.ts tests/host.test.ts tests/tools.test.ts tests/module.test.ts tests/protocol.test.ts tests/docs.test.ts && node tools/check-readmes.ts",
     "lint": "oxlint --config .oxlintrc.json",
     "check:readmes": "node tools/check-readmes.ts",
     "verify:self-contained": "node tools/verify-self-contained.ts",
-    "coverage": "node --test --experimental-test-coverage --test-coverage-exclude=\"**/node_modules/**\" tests/lib.test.ts tests/client.test.ts tests/host.test.ts tests/tools.test.ts tests/module.test.ts tests/protocol.test.ts",
+    "coverage": "node --test --experimental-test-coverage --test-coverage-exclude=\"**/node_modules/**\" tests/lib.test.ts tests/client.test.ts tests/host.test.ts tests/tools.test.ts tests/module.test.ts tests/protocol.test.ts tests/docs.test.ts",
     "coverage:check": "node tools/coverage-check.ts --report .tmp/coverage.txt",
     "eval": "node tools/eval-recall.ts",
     "bench": "node tools/bench.ts",
