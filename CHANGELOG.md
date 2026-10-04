@@ -3,6 +3,55 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.23 — 2026-10-04
+
+**Mutation testing, round two** — aimed at the four large functions round one deliberately skipped because their
+assertions are expensive: `recallRecords` (thresholds, IDF weighting, ranking, caches), the `/sleep` planning cluster
+(`transcriptOf`, `buildSleepPlan`, `formatSleepPlan`), the self-portrait revision chain, and the renderers. Same
+method, same rule: no production code changed, only tests.
+
+| Track | Breaks tried | Killed by existing tests | Survived | Now killed by new tests |
+|---|---|---|---|---|
+| Retrieval + self-portrait (`tests/lib.test.ts`) | 38 | 15 | **23** | 23 (lib 206 → 228) |
+| `/sleep` + audit paths, end to end (`tests/host.test.ts`) | 30 | 18 | **12**, 10 worth pinning | 10 (host 139 → 149) |
+
+Suite: **435 → 467**.
+
+### What the second round found
+
+- **`recallRecords`' `mode: 'memory'` had no pure-layer coverage at all.** Its default threshold, its df injection
+  and its IDF weighting could each be broken without a single failure — the mode was only exercised through the host
+  and protocol suites. It now has direct cases, including one asserting that a *rare* hit beats a common one.
+- **Endpoints and totality**, again: the `limit` clamp's low and high ends, the tie-break that keeps ranking
+  deterministic, the closed interval on a coverage threshold, `passes` being `>=` rather than `>`, `score_max`
+  counting query tokens that did *not* match, and a cache eviction that must evict rather than clear the whole table.
+- **Rendering details nobody asserted**: the audit timestamp's month offset and zero padding, the dictionary-order
+  fallback when branch and `via` counts tie, the single-line display budget for rejection reasons, the five-row
+  archive sample, and the `(no subject)` placeholder for a merge group.
+- **`/sleep` end to end**: an in-plan duplicate that must be dropped and counted, the plan-level `agent_self` gate,
+  a per-session budget that must still fit a message when it lands exactly on the boundary, both compatible read
+  paths for assistant event bodies, the merge leader chosen by `compareRecords`, the truncated-row line appearing
+  only when something was actually truncated, and `/memory verify` treating a `to`-only reference as a closed
+  interval.
+- **`/memory audit --verify` must survive a failing log read** and report the gap; a removed `try/catch` turned an
+  honest gap into a command error, which a test now prevents.
+
+### Two survivors documented rather than papered over
+
+- One is **unreachable under the contract**: a workspace-level backfill candidate cannot exist, because the only
+  `user_explicit` capture signals resolve to `user_profile`/`agent_self`, both of which land at profile scope. The
+  agent first wrote a test for it, watched it fail, and only then proved the branch unreachable — that test was
+  deleted rather than kept as decoration.
+- One is **equivalent**: a candidate that reaches `writeMemory` has already passed two same-origin fingerprint
+  gates, so the simplified counter cannot differ.
+
+### Notes
+
+- One new case pins a **compatibility read path** (assistant event `data` attached directly rather than under
+  `message`) that `docs/sleep.md` does not declare. It is reachable code — deleting the fallback silently loses echo
+  context — so the test is the proof it exists; whoever removes the fallback must remove the test too.
+- The lib suite now takes roughly a second longer because the new cache case exercises a realistic library size.
+
 ## 0.5.22 — 2026-10-04
 
 **Test hardening driven by mutation testing.** The adversarial audit's last useful gift was the observation that a

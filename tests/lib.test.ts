@@ -3555,3 +3555,237 @@ test('textsFor：en 的常驻块页脚必须保留「先核对事实」这条硬
   assert.match(textsFor(cfg).factsFooter, /先核对事实/)
 })
 
+// ---------------- 补盲（第二轮）：大函数的统计口径与渲染细节 ----------------
+// 与上一节同样的方法：下面每一条都对应一个实测「改了源码仍全绿」的变异（在临时副本里
+// 逐个变异 src/lib.ts 后跑全量测试）。本轮专打上一轮刻意跳过的大函数：
+// recallRecords / explainMatch / planPortraitUpdate / portraitHistory / renderSelfBlock /
+// formatAudit / formatBranchSummary / formatPendingQueue / formatSleepPlan。
+// 断言钉住**端点、全序兜底、字典序、补零与占位符**这类「差一点就错、错了还不报错」的细节。
+
+test('recallRecords：limit 夹到 [1, 50]（下限 1、上限 50 都必须钉住）', () => {
+  const many = Array.from({ length: 60 }, (_, index) => makeRecord({
+    id: `m_limit_${String(index).padStart(2, '0')}`,
+    kind: 'semantic',
+    text: `第 ${index} 条记忆。`,
+    importance: 0.5,
+  }))
+  // limit 配成 0 / 负数时仍要至少回一条：否则调用方会把「没召回」读成「库里没有」。
+  assert.equal(recallRecords(many, { query: '', limit: 0 }).length, 1)
+  assert.equal(recallRecords(many, { query: '', limit: -5 }).length, 1)
+  // 上限 50：库再大也不许一次把整库塞进上下文（宿主侧还会再夹，但 lib 层的硬上限同样要成立）。
+  assert.equal(recallRecords(many, { query: '', limit: 100 }).length, 50)
+  assert.equal(recallRecords(many, { query: '', limit: 50 }).length, 50)
+})
+
+test('recallRecords：同分时按 compareRecords 兜底（不得退回入参顺序）', () => {
+  // 两条只有 id 不同、分数完全相同的记录：缺了全序兜底时排序结果取决于入参顺序，
+  // 同一个库换个遍历顺序就换一个「最相关」的答案。
+  const later = makeRecord({ id: 'm_tie_zz', kind: 'semantic', text: '同分甲。', importance: 0.5 })
+  const earlier = makeRecord({ id: 'm_tie_aa', kind: 'semantic', text: '同分乙。', importance: 0.5 })
+  assert.equal(recallRecords([later, earlier], { query: '', limit: 2 })[0]!.record.id, 'm_tie_aa')
+  assert.deepEqual(
+    recallRecords([later, earlier], { query: '', limit: 2 }).map((hit) => hit.record.id),
+    recallRecords([earlier, later], { query: '', limit: 2 }).map((hit) => hit.record.id),
+  )
+})
+
+test('recallRecords：空查询的 score 就是 importance（回退档位不得被换成常量）', () => {
+  const hot = makeRecord({ id: 'm_empty_hot', kind: 'user_profile', text: '重要的一条。', importance: 0.9 })
+  const cold = makeRecord({ id: 'm_empty_cold', kind: 'user_profile', text: '次要的一条。', importance: 0.2 })
+  const hits = recallRecords([cold, hot], { query: '', limit: 2 })
+  assert.deepEqual(hits.map((hit) => hit.record.id), ['m_empty_hot', 'm_empty_cold'])
+  assert.equal(hits[0]!.score, 0.9)
+  assert.equal(hits[1]!.score, 0.2)
+})
+
+test('recallRecords：覆盖率恰好等于门槛时入选（minLexical 是闭区间）', () => {
+  // 查询 5 个 token、记录命中 2 个 ⇒ 覆盖率恰好 0.4。
+  const record = makeRecord({ id: 'm_edge_rec', kind: 'semantic', text: '构建与量子都在这里。' })
+  const query = '构建 量子 黑洞 引力 光学'
+  assert.equal(lexicalMatch(record, query), 0.4, '这一例要测的正是「恰好等于门槛」的取值')
+  assert.equal(recallRecords([record], { query, minLexical: 0.4 }).length, 1)
+  assert.equal(recallRecords([record], { query, minLexical: 0.41 }).length, 0)
+})
+
+test("recallRecords：mode='memory' 的默认门槛是 0.4（记忆侧覆盖 0.5 必须入选）", () => {
+  const record = makeRecord({ id: 'm_mem_rec', kind: 'semantic', text: 'alpha beta gamma delta' })
+  const query = 'alpha beta x y z'
+  assert.equal(memoryMatch(record, query, { minHits: 2 }), 0.5, '这一例要测的正是 0.5 这个门槛值')
+  assert.equal(recallRecords([record], { query, mode: 'memory' }).length, 1)
+  assert.equal(recallRecords([record], { query, mode: 'memory', minMatch: 0.5 }).length, 1)
+})
+
+test('explainMatch：df=0 的查询 token 按 N/(1+0) 计（idf 与 searchIdf 同口径）', () => {
+  const records = [
+    makeRecord({ id: 'm_idf_a', kind: 'semantic', text: 'alpha 构建。' }),
+    makeRecord({ id: 'm_idf_b', kind: 'semantic', text: 'beta 发布。' }),
+  ]
+  // searchLengthPenalty=0 ⇒ 长度归一化系数恒为 1，分数恰好是「命中 token 的 idf 之和 / 查询全部 token 的 idf 之和」。
+  const detail = explainMatch(records[0]!, 'alpha zeta', records, { ...cfg, searchLengthPenalty: 0 })
+  assert.deepEqual(detail.matched, ['alpha'])
+  const idfAlpha = searchIdf('alpha', records)
+  const idfZeta = searchIdf('zeta', records)
+  assert.ok(
+    Math.abs(detail.score - idfAlpha / (idfAlpha + idfZeta)) < 1e-12,
+    `explainMatch 的 idf 必须与 searchIdf 同口径：${detail.score} vs ${idfAlpha / (idfAlpha + idfZeta)}`,
+  )
+})
+
+test('explainMatch：passes 与阈值是「>=」关系（分数恰好等于阈值时为 true）', () => {
+  const records = [makeRecord({ id: 'm_pass', kind: 'semantic', text: '构建流程用 pnpm。' })]
+  const options = { ...cfg, searchLengthPenalty: 0 }
+  const base = explainMatch(records[0]!, '构建 量子', records, options)
+  assert.ok(base.score > 0 && base.score < 1, '这一例需要一个 0 与 1 之间的分数')
+  assert.equal(explainMatch(records[0]!, '构建 量子', records, { ...options, recallMinMatch: base.score }).passes, true)
+  assert.equal(explainMatch(records[0]!, '构建 量子', records, { ...options, recallMinMatch: base.score + 1e-9 }).passes, false)
+})
+
+test('explainMatch：score_max 是查询里全部 token 的 idf 之和（只命中一部分时分数必须小于 1）', () => {
+  const records = [makeRecord({ id: 'm_max', kind: 'semantic', text: '构建流程用 pnpm。' })]
+  const detail = explainMatch(records[0]!, '构建 pnpm 量子', records, { ...cfg, searchLengthPenalty: 0 })
+  assert.ok(detail.matched.includes('构建') && detail.matched.includes('pnpm'), '两个命中的 token 都要进 matched')
+  assert.equal(detail.matched.includes('量子'), false, '量子 不在记录里，不得进 matched')
+  // 分母漏掉未命中的 token ⇒ 分数会虚高成 1，阈值判定与排序一起失真。
+  assert.ok(detail.score > 0 && detail.score < 1, `score_max 必须含未命中 token 的 idf，实际 score=${detail.score}`)
+})
+
+test("recallRecords：mode='memory' 的 idf 必须按查询 token 的真实 df 加权（稀有命中胜常见命中）", () => {
+  const at = Date.now() - DAY
+  const rare = makeRecord({ id: 'm_df_zzz_rare', kind: 'semantic', text: 'quux beta', importance: 0.5, observedAt: at })
+  const common = makeRecord({ id: 'm_df_aaa_common', kind: 'semantic', text: 'alpha beta', importance: 0.5, observedAt: at })
+  const fillerA = makeRecord({ id: 'm_df_f1', kind: 'semantic', text: 'alpha zeta', importance: 0.5, observedAt: at })
+  const fillerB = makeRecord({ id: 'm_df_f2', kind: 'semantic', text: 'alpha zeta', importance: 0.5, observedAt: at })
+  // 两条候选各命中 2 个查询 token、重要度与时效相同：只有「命中更稀有的 token」才该赢。
+  // 若 memory 模式不统计 df（所有 token 都按 df=0 算 idf），idf 变成常数、两条同分，
+  // 兜底排序会把 id 更小的那条排到前面 —— 排序与门槛一起被静默改写。
+  const hits = recallRecords([rare, common, fillerA, fillerB], { query: 'quux alpha beta', mode: 'memory', limit: 4 }, at)
+  assert.equal(hits[0]!.record.id, 'm_df_zzz_rare')
+})
+
+test('tokenCacheSize：超出上限时逐条淘汰（不得整表清空，否则每次调用都重新分词全库）', () => {
+  clearTokenCache()
+  const store = benchStore(8500)
+  recallRecords(store, { query: '构建流程 产物', limit: 5 })
+  const size = tokenCacheSize()
+  // 整表清空后只剩「最后一次清空之后」的那几百条，扫描量一大就等于没缓存（实测过性能退化）。
+  assert.ok(size > 8000, `扫描 8500 条后应保留接近上限的条目（实测 ${size}）`)
+  clearTokenCache()
+})
+
+test('planPortraitUpdate：命名 subject 的正文门槛是 2 字符（恰好 2 字符必须放行）', () => {
+  const naming = (text: string) => planPortraitUpdate({
+    text,
+    facet: 'persona',
+    subject: portraitSubjectFor('persona', 'name'),
+    origin: 'user_explicit',
+    confidence: 1,
+  }, [], cfg)
+  assert.equal(naming('小忆').action, 'add', '「小忆」正好 2 字符，属于称呼的正常长度')
+  assert.equal(naming('忆').reason, 'too-short', '1 字符仍然拒绝')
+})
+
+test('planPortraitUpdate：置信度非有限时回落到 0.6（不得静默改成别的默认值）', () => {
+  const decide = (confidence: number) => planPortraitUpdate({
+    text: '我说话偏好直接，先给结论。',
+    facet: 'work',
+    subject: 'self.work.style',
+    origin: 'model_proposed',
+    confidence,
+  }, [], cfg)
+  assert.equal(decide(Number.NaN).confidence, 0.6)
+  assert.equal(decide(Number.POSITIVE_INFINITY).confidence, 0.6)
+  assert.equal(decide(0.9).confidence, 0.9, '合法值照常透传（确认不是把整条路径写死）')
+})
+
+test('portraitHistory：互为指向的环也要给出链（从最旧一条起走，不得返回空）', () => {
+  const older = selfRecord('环里的旧版：先给结论。', { id: 'm_cyc_old', observedAt: 1000 })
+  const newer = selfRecord('环里的新版：先给结论再补理由。', { id: 'm_cyc_new', observedAt: 2000 })
+  older.supersededBy = newer.id
+  newer.supersededBy = older.id
+  const revisions = portraitHistory([newer, older])
+  assert.equal(revisions.length, 1, '环里没有链头，必须退化到最旧一条而不是让整组消失')
+  assert.deepEqual(revisions[0]!.chain.map((record) => record.id), ['m_cyc_old', 'm_cyc_new'])
+})
+
+test('portraitHistory：观察时间相同的修订链按 id 升序（同刻也不得反转）', () => {
+  const a = selfRecord('第一版：先给结论。', { id: 'm_seq_a', observedAt: 1000 })
+  const b = selfRecord('第二版：先给结论再补理由。', { id: 'm_seq_b', observedAt: 1000 })
+  const c = selfRecord('第三版：先给结论再补理由与取舍。', { id: 'm_seq_c', observedAt: 1000 })
+  a.supersededBy = b.id
+  b.supersedes = [a.id]
+  b.supersededBy = c.id
+  c.supersedes = [b.id]
+  const revisions = portraitHistory([c, a, b])
+  assert.equal(revisions.length, 1)
+  assert.deepEqual(revisions[0]!.chain.map((record) => record.id), ['m_seq_a', 'm_seq_b', 'm_seq_c'])
+})
+
+test('portraitHistory：同一 subject 但 facet 不同不得串成一条链（分组键含 facet）', () => {
+  // subject 字符串相同、facet 不同：收敛决策按 facet 隔离（planPortraitUpdate），历史也必须按 facet 分组。
+  const persona = selfRecord('人格侧：我说话偏简短。', { id: 'm_facet_p', facet: 'persona', subject: 'self.persona.voice', observedAt: 1000 })
+  const work = selfRecord('工作侧：我说话偏简短。', { id: 'm_facet_w', facet: 'work', subject: 'self.persona.voice', observedAt: 2000 })
+  persona.supersededBy = work.id
+  work.supersedes = [persona.id]
+  assert.deepEqual(portraitHistory([persona, work]), [], '两个 facet 各只有一条，都不构成修订链')
+})
+
+test('renderSelfBlock：工作节的用户侧条目受 selfPortraitMaxItems 约束', () => {
+  const records = Array.from({ length: 4 }, (_, index) => makeRecord({
+    id: `m_cap_${index}`,
+    kind: 'agent_self',
+    subject: `self.work.k${index}`,
+    text: `工作约定第 ${index} 条。`,
+    origin: 'user_explicit',
+    confidence: 0.95,
+    pinned: true,
+  }))
+  // 预算够放下 4 条，但 selfPortraitMaxItems=2 时最多只能注入 2 条。
+  const block = renderSelfBlock(records, { ...cfg, selfPortraitMaxItems: 2 })
+  assert.equal(block.lines.length, 2, 'selfPortraitMaxItems=2 时最多注入 2 条用户确认的约定')
+  assert.equal(block.selected.length, 2)
+})
+
+test('formatPendingQueue：时间戳的月要 +1、月与时都要补零（用本地时间构造，与宿主时区无关）', () => {
+  // 本地时间构造 ⇒ 不论宿主时区，stampOf 都应原样渲染成 2027-01-05 03:04。
+  const at = new Date(2027, 0, 5, 3, 4).getTime()
+  const record = makeRecord({ id: 'm_stamp', kind: 'semantic', text: '时间戳样本。', status: 'pending', observedAt: at })
+  const line = formatPendingQueue([record], cfg).split('\n').find((item) => item.includes('m_stamp'))
+  assert.ok(line, '待确认队列必须渲染这一条')
+  assert.ok(line.includes('2027-01-05 03:04'), `时间戳必须是 2027-01-05 03:04，实际：${line}`)
+})
+
+test('formatAudit：单行字段的展示预算足够长（被拒原因不得被过早截断）', () => {
+  const reason = 'x'.repeat(600)
+  const text = formatAudit({ entries: [auditEntry({ reason })], records: [], cfg })
+  assert.ok(text.includes(reason), '300 token（≈750 字符）以内不得截断；收紧到 100 token 会让长原因看不全')
+})
+
+test('formatBranchSummary：条数相同时按分支名字典序（入参倒序也不得反转）', () => {
+  const records = [
+    makeRecord({ kind: 'semantic', text: 'b 分支上的约定。', branch: 'b-main' }),
+    makeRecord({ kind: 'semantic', text: 'a 分支上的约定。', branch: 'a-feat' }),
+  ]
+  // 入参是倒序：排序链里缺了字典序兜底时，稳定排序会原样保留倒序。
+  const lines = formatBranchSummary(records, null).split('\n').filter((line) => line.startsWith('  - '))
+  assert.deepEqual(lines, ['  - a-feat：1 条', '  - b-main：1 条'])
+})
+
+test('formatAudit：via 条数相同时按 via 名字典序（入参倒序也不得反转）', () => {
+  const text = formatAudit({ entries: [auditEntry({ via: 'zzz' }), auditEntry({ via: 'aaa' })], records: [], cfg })
+  const viaLine = text.split('\n').find((line) => line.startsWith('按 via 计数：'))
+  assert.equal(viaLine, '按 via 计数：aaa 1 · zzz 1')
+})
+
+test('formatSleepPlan：归档样本最多列 5 条（第 5 条不得被漏掉）', () => {
+  const plan = buildSleepPlan({ records: [], sources: [], cfg, now: 5 })
+  const ids = ['aaaa1111', 'bbbb2222', 'cccc3333', 'dddd4444', 'eeee5555', 'ffff6666', 'gggg7777']
+  const text = formatSleepPlan({ ...plan, archive: ids }, cfg)
+  assert.match(text, /归档 7 条：aaaa1111、bbbb2222、cccc3333、dddd4444、eeee5555 等 7 条/u)
+})
+
+test('formatSleepPlan：合并组无主题时给「(无主题)」占位（不得渲染成空标签）', () => {
+  const plan = buildSleepPlan({ records: [], sources: [], cfg, now: 5 })
+  const text = formatSleepPlan({ ...plan, merges: [{ ids: ['aaaa1111', 'bbbb2222'], subject: '', text: '合并正文' }] }, cfg)
+  assert.match(text, /^ {2}- \(无主题\)：2 条，保留 aaaa1111「合并正文」$/mu)
+})
+

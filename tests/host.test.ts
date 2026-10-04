@@ -6149,3 +6149,323 @@ test('host#129 变异测试补盲：/sleep 补录的落库类型与 scope 对齐
 //
 // 两处都**不是**「需要真实宿主 / 时间依赖」才杀不掉，而是「语义等价 / 分支不可达」——
 // 换句话说，即便再补测试也杀不掉；要真让它们可观察，得先改 `src/`，而那不在本轮写域内。
+
+// ================================================================ 第二轮变异测试补盲：上一轮刻意跳过的大函数
+//
+// 覆盖对象：`src/lib.ts` 的 `transcriptOf` / `buildSleepPlan` / `formatSleepPlan`，
+// 以及 `src/index.ts` 的 `/sleep` 接线、`/memory verify`、`/memory audit --verify`。
+// 方法严格沿用上一轮：把仓库复制到 $env:TEMP，每次只改一处 `src`，`tsc -p tsconfig.json` 重建后
+// 跑全量（lib/client/host/tools/module/protocol/docs 共 435 项），再把改动改回。
+// 本轮共试 **30 处**破坏：**18 处当场被既有测试杀掉**，另 **12 处全绿存活** —— 后者就是盲区。
+//
+// 本节为其中 **10 处**存活变异补用例（括号里是变异编号），并在副本上逐条实测两个方向：
+// **变异版红、未变异版绿**。另 2 处经查证属于**不可达 / 等价**，**没有**硬凑用例（原因写在文末）。
+//
+// 对应的变异（副本实测结论：变异版红 / 未变异版绿）：
+//   #130 B1  buildSleepPlan 摘掉计划内 `seen` 去重      → 同一句话在一份计划里只能补一条
+//   #131 B4  buildSleepPlan 摘掉 agent_self 候选闸门    → 计划层就必须排除自画像（§6）
+//   #132 T7  「只留用户消息」的 `<=` 改 `<`             → 恰好装得下时不得整组丢弃
+//   #133 T5  assistant 事件体不再回落读 `data` 本体     → 两种事件体读法都要读到回声上下文
+//   #134 B9  合并组不再按 compareRecords 选领头         → 高重要度那条必须当领头
+//   #135 F1  归档样例 `slice(0, 5)` 改 `slice(0, 3)`    → 第 6 条只进「等 N 条」计数
+//   #136 F2  补录标签「按时间升序」写成「按时间降序」   → 标签必须与真实顺序一致
+//   #137 F3  裁剪行 `> 0` 改 `>= 0`                     → 没被裁剪时不得凭空渲染
+//   #138 I1  verifyRecord 只给 `to` 时 `<=` 改 `<`      → 闭区间端点必须算命中
+//   #139 I2  audit --verify 读日志失败不再兜成缺口      → 读失败必须如实报缺口，不得抛
+//
+// 全部走端到端：`/sleep`（预览与 --apply）、`/memory verify`、`/memory audit --verify`，
+// 不直接调用 lib 纯函数 —— 这样断言的是宿主接线后的可观察行为。
+
+test('host#130 变异测试补盲：/sleep 计划内同指纹候选只留一条，其余计入重复跳过（B1）', async (t) => {
+  // 同一条用户消息在一个会话里出现两次：第二次的指纹与第一次相同，计划里绝不能排两条。
+  const duplicate = '记住：构建统一用 pnpm，产物输出到 dist 目录。'
+  const fake = makeFakeSessionQuery([{
+    id: 'sess-dup',
+    cwd: SLEEP_CWD,
+    createdAt: 1_000,
+    events: [sleepUserEvent(duplicate, 1), sleepUserEvent(duplicate, 2)],
+  }])
+  const harness = makeHarness({ sessionQuery: fake.query })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const preview = await harness.runCommand('', 'sleep')
+  assert.equal(preview.kind, 'success', preview.text)
+  assert.match(preview.text, /与库内指纹重复而跳过 1 条/u,
+    `同一份计划里第二条同指纹候选必须计入「跳过」，而不是排进补录：${preview.text}`)
+  const listed = preview.text.split('\n').filter((line) => line.startsWith('  - 记住：构建统一用 pnpm'))
+  assert.equal(listed.length, 1, `预览只能列出一条候选（同一条记忆不许排两次）：${preview.text}`)
+  assert.doesNotMatch(preview.text, /补录 2 条/u, '补录计数不得把重复候选算进去')
+})
+
+test('host#131 变异测试补盲：agent_self 候选进不了 /sleep 计划（计划层闸门，B4）', async (t) => {
+  // 「以后你要…」命中捕获信号表里优先级最高的 `agent-self-directive` ⇒ kind = agent_self。
+  // §6 要求 /sleep **计划里**就不产生自画像写入（人格/工作倾向属于模型自我认知）。
+  const directive = '记住：以后你要先问我再动手，不要自己改公共接口。'
+  const fake = makeFakeSessionQuery([{
+    id: 'sess-self',
+    cwd: SLEEP_CWD,
+    createdAt: 1_000,
+    events: [sleepUserEvent(directive, 1)],
+  }])
+  const harness = makeHarness({ sessionQuery: fake.query })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const preview = await harness.runCommand('', 'sleep')
+  assert.equal(preview.kind, 'success', preview.text)
+  assert.doesNotMatch(preview.text, /以后你要先问我/u,
+    `agent_self 候选在计划层就必须被排除，连预览都不该出现（§6）：${preview.text}`)
+  assert.match(preview.text, /无需改动/u, `除自画像外没有别的事可做 ⇒ 空计划：${preview.text}`)
+
+  const applied = await harness.runCommand('--apply', 'sleep')
+  assert.match(applied.text, /补录 0 条/u, `补录计数必须是 0：${applied.text}`)
+  assert.equal(rowsOf(harness).length, 0, '/sleep 不得写入任何条目（更没有自画像写入）')
+})
+
+test('host#132 变异测试补盲：单会话预算恰好装下用户消息时不得整组丢弃（T7）', async (t) => {
+  // 正文长度 = 单会话预算（clampText 上限 = 预算 / charsPerToken × charsPerToken = 100 字符）。
+  // 回声上下文装不下时，退化为「只留用户消息」是**闭区间**判定：恰好装得下就必须留下。
+  const budget = 100
+  const userText = `记住：${'甲'.repeat(97)}`
+  assert.equal(userText.length, budget, '前提：正文长度恰好等于单会话预算')
+  const fake = makeFakeSessionQuery([{
+    id: 'sess-fit',
+    cwd: SLEEP_CWD,
+    createdAt: 1_000,
+    events: [sleepAssistantEvent('好的，我记下了。', 1), sleepUserEvent(userText, 2)],
+  }])
+  const harness = makeHarness({
+    sessionQuery: fake.query,
+    config: { sleepMaxCharsPerSession: budget, sleepMaxCharsTotal: budget },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const preview = await harness.runCommand('', 'sleep')
+  assert.match(preview.text, /补录 1 条/u,
+    `上下文装不下时用户消息本身仍装得下：不得把整组丢掉：${preview.text}`)
+  assert.match(preview.text, /保留最近的 1 条消息，丢弃较早的 1 条/u,
+    `丢弃口径要如实（保留用户消息、丢弃 1 条上下文）：${preview.text}`)
+})
+
+test('host#133 变异测试补盲：assistant/message 事件体两种读法都要读到（T5）', async (t) => {
+  // 契约形状（docs/sleep.md §3）是 `data.message`；实现另外容忍「`data` 自己就是 assistant 消息」。
+  // 少读一条回声上下文不会让 /sleep 报错，只会静默改变回看规模与回声检测的输入 —— 因此要钉住。
+  const userText = '记住：构建统一用 pnpm，产物输出到 dist 目录。'
+  const assistantText = '好的，我会按你说的做。'
+  const messageCount = (text: string): number => Number(/回看 \d+ 个会话 · (\d+) 条消息/u.exec(text)?.[1] ?? '-1')
+
+  const wrapped = makeFakeSessionQuery([{
+    id: 'sess-wrap',
+    cwd: SLEEP_CWD,
+    createdAt: 1_000,
+    events: [sleepAssistantEvent(assistantText, 1), sleepUserEvent(userText, 2)],
+  }])
+  const contractShape = makeHarness({ sessionQuery: wrapped.query })
+  t.after(() => contractShape.dispose())
+  await contractShape.settle()
+  const wrappedCount = messageCount((await contractShape.runCommand('', 'sleep')).text)
+
+  const direct = makeFakeSessionQuery([{
+    id: 'sess-direct',
+    cwd: SLEEP_CWD,
+    createdAt: 1_000,
+    events: [
+      // 兼容读法：data 直接就是 assistant 消息（没有 data.message 这一层）
+      { type: 'assistant/message', seq: 1, time: 1_002, data: { role: 'assistant', content: [{ type: 'text', text: assistantText }] } },
+      sleepUserEvent(userText, 2),
+    ],
+  }])
+  const directShape = makeHarness({ sessionQuery: direct.query })
+  t.after(() => directShape.dispose())
+  await directShape.settle()
+  const directCount = messageCount((await directShape.runCommand('', 'sleep')).text)
+
+  assert.equal(wrappedCount, 2, `契约形状下 = 1 条用户消息 + 1 条回声上下文：${wrappedCount}`)
+  assert.equal(directCount, wrappedCount,
+    `data 直挂的 assistant 事件体也要读到，否则回声上下文静默丢失（${directCount} ≠ ${wrappedCount}）`)
+})
+
+test('host#134 变异测试补盲：/sleep 合并建议的领头者按 compareRecords 选（B9）', async (t) => {
+  // 两条同 kind/scope/subject 且高度包含的条目 ⇒ 一个合并组。
+  // 低重要度那条**先**入库（＝分组里的第一个），合并的领头者仍必须按 compareRecords 选高重要度那条。
+  const harness = makeHarness({ sessionQuery: makeFakeSessionQuery([]).query })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const low = await harness.memory().write({
+    kind: 'semantic', text: '构建产物统一放到 dist 目录里', subject: 'build.output', importance: 0.3, origin: 'observed',
+  })
+  const high = await harness.memory().write({
+    kind: 'semantic', text: '构建产物统一放到 dist 目录下，发布前先跑一遍测试', subject: 'build.output', importance: 0.9, origin: 'observed',
+  })
+  assert.equal(low.ok, true, `前提：低重要度条目写入成功（${String(low.error)}）`)
+  assert.equal(high.ok, true, `前提：高重要度条目写入成功（${String(high.error)}）`)
+  assert.equal(rowsOf(harness).length, 2, '前提：正文不同 ⇒ 指纹不同 ⇒ 两条共存，才会形成合并组')
+
+  const preview = (await harness.runCommand('', 'sleep')).text
+  const line = preview.split('\n').find((entry) => entry.includes('保留'))
+  assert.ok(line, `应当给出合并建议：${preview}`)
+  assert.match(line!, /2 条/u, `合并组应含 2 条：${line}`)
+  assert.ok(line!.includes('发布前先跑一遍测试'),
+    `领头者必须是高重要度那条（compareRecords 先按 importance 降序）：${line}`)
+  assert.ok(!line!.includes('目录里'),
+    `低重要度那条不得被当成领头：${line}`)
+})
+
+test('host#135 变异测试补盲：/sleep 归档样例只列前 5 条，其余用「等 N 条」计数（F1）', async (t) => {
+  const harness = makeHarness({
+    sessionQuery: makeFakeSessionQuery([]).query,
+    // 让每一条 active 记录都满足归档判定（低重要度 + 无使用时长门槛）
+    config: { archiveAfterDays: 0, archiveBelowImportance: 1 },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  for (let index = 1; index <= 6; index += 1) {
+    const written = await harness.memory().write({
+      kind: 'semantic', text: `过期探针第 ${index} 条：很久没有用到了`, importance: 0.1, origin: 'observed',
+    })
+    assert.equal(written.ok, true, `前提：第 ${index} 条过期条目写入成功（${String(written.error)}）`)
+  }
+
+  const preview = (await harness.runCommand('', 'sleep')).text
+  const match = /归档 6 条：(.+?) 等 6 条/u.exec(preview)
+  assert.ok(match, `6 条待归档必须给出样例与「等 6 条」：${preview}`)
+  assert.equal((match![1]!.match(/、/gu) ?? []).length, 4,
+    `样例只列前 5 条（4 个顿号），第 6 条只进「等 N 条」：${match![1]}`)
+})
+
+test('host#136 变异测试补盲：/sleep 补录按时间升序渲染，标签与真实顺序一致（F2）', async (t) => {
+  const early = {
+    type: 'user/message', seq: 1, time: 1_000,
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '记住：早会决定先跑测试再合并。' }] },
+  }
+  const late = {
+    type: 'user/message', seq: 2, time: 9_000,
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '记住：晚会决定把产物输出到 dist 目录。' }] },
+  }
+  const fake = makeFakeSessionQuery([
+    { id: 'sess-early', cwd: SLEEP_CWD, createdAt: 1_000, events: [early] },
+    { id: 'sess-late', cwd: SLEEP_CWD, createdAt: 9_000, events: [late] },
+  ])
+  const harness = makeHarness({ sessionQuery: fake.query })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const preview = (await harness.runCommand('', 'sleep')).text
+  assert.match(preview, /补录 2 条（按时间升序）：/u, `预览必须声明升序：${preview}`)
+  const earlyAt = preview.indexOf('早会决定先跑测试再合并')
+  const lateAt = preview.indexOf('晚会决定把产物输出到 dist 目录')
+  assert.ok(earlyAt >= 0 && lateAt >= 0, `两条候选都要出现在预览里：${preview}`)
+  assert.ok(earlyAt < lateAt, `时间早的必须排在前面：${preview}`)
+})
+
+test('host#137 变异测试补盲：/sleep 裁剪说明只在真被裁剪时出现（F3）', async (t) => {
+  // ① 真被裁剪：夹具里 2 条候选、上限 1 ⇒ 必须给出裁剪说明
+  const capped = sleepHarness({ config: { sleepMaxBackfill: 1 } })
+  t.after(() => capped.harness.dispose())
+  await capped.harness.settle()
+  const cappedText = (await capped.harness.runCommand('', 'sleep')).text
+  assert.match(cappedText, /裁剪：补录候选超出上限，本次少补录 1 条（见下方说明）。/u,
+    `被裁剪时必须如实说明少了多少条：${cappedText}`)
+
+  // ② 没被裁剪：不得凭空渲染「少补录 0 条」（那会让用户以为丢了东西）
+  const plain = sleepHarness()
+  t.after(() => plain.harness.dispose())
+  await plain.harness.settle()
+  const plainText = (await plain.harness.runCommand('', 'sleep')).text
+  assert.doesNotMatch(plainText, /裁剪：补录候选超出上限/u,
+    `没有候选被裁时不得出现裁剪行：${plainText}`)
+})
+
+test('host#138 变异测试补盲：/memory verify 只给 to 的引用按闭区间核对（I1）', async (t) => {
+  const text = '记住：构建统一用 pnpm，产物输出到 dist 目录。'
+  const events = [{
+    seq: 5, type: 'user/message', time: 1_000,
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text }] },
+  }]
+  const build = (): Harness => makeHarness({
+    sessionQuery: {
+      listSessions: async (): Promise<Json[]> => [],
+      readSession: async (_id: string): Promise<Json> => ({ session: { id: 'session-1', cwd: null }, events }),
+    },
+    config: { selfIntroEnabled: false, selfReflectEnabled: false },
+  })
+
+  // 闭区间：事件恰好落在 `to` 上 ⇒ 命中
+  const inclusive = build()
+  t.after(() => inclusive.dispose())
+  await inclusive.settle()
+  const hitRow = await inclusive.memory().write({
+    kind: 'semantic', text, origin: 'user_explicit', refs: [{ sessionId: 'session-1', to: 5 }],
+  })
+  const hit = (await inclusive.runCommand(`verify ${String(hitRow.id)}`)).text
+  assert.match(hit, /✅ 命中（覆盖率 1\.00）/u, `只给 to 时端点必须算在区间内（闭区间）：${hit}`)
+  assert.match(hit, /命中 1 \/ 未命中 0/u)
+
+  // 反面对照：`to` 再小 1 ⇒ 事件落在区间外，必须判未命中
+  const outside = build()
+  t.after(() => outside.dispose())
+  await outside.settle()
+  const missRow = await outside.memory().write({
+    kind: 'semantic', text, origin: 'user_explicit', refs: [{ sessionId: 'session-1', to: 4 }],
+  })
+  const miss = (await outside.runCommand(`verify ${String(missRow.id)}`)).text
+  assert.match(miss, /⚠️/u, `区间外的事件不得算命中：${miss}`)
+  assert.match(miss, /命中 0 \/ 未命中 1/u)
+})
+
+test('host#139 变异测试补盲：/memory audit --verify 读日志失败必须如实报缺口（I2）', async (t) => {
+  const harness = makeHarness({
+    sessionQuery: {
+      listSessions: async (): Promise<Json[]> => [],
+      readSession: async (): Promise<Json> => { throw new Error('disk on fire') },
+    },
+    config: { selfIntroEnabled: false, selfReflectEnabled: false },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  emitSeqEvent(harness, refsSession(), seqUserEvent('先推进 seq。', 5))
+  assert.equal(
+    (await writeToolInWorkspace(harness, { kind: 'semantic', text: '缺口探针：读日志失败时的注入行', subject: 'gap.read' }, WORKSPACE_CWD)).ok,
+    true,
+  )
+  String(harness.contexts[0]!.text({ agent: { session: { header: { cwd: WORKSPACE_CWD } } } }))
+
+  const out = await harness.runCommand('audit --verify')
+  assert.equal(out.kind, 'success', `读失败要如实报缺口，不能抛成命令错误：${out.text}`)
+  assert.match(out.text, /--verify：无法核对 —— 原因：读取会话 session-1 失败：disk on fire/u,
+    `必须点名是哪份日志、什么原因：${out.text}`)
+  assert.doesNotMatch(out.text, /--verify：核对 \d/u, '缺口不是「核对 0 行」')
+})
+
+// ---------------------------------------------------------------- 存活但**不补**的变异（如实说明）
+//
+// 这一轮还有 2 处破坏在副本里跑完全量仍旧全绿，经逐条查证属于「改坏了也观察不到」，
+// 不是测试缺口，因此**没有**为它们新增断言（硬凑一条只会是假用例）：
+//
+//   · B12 —— 把 `buildSleepPlan()` 里 workspace 级候选的
+//       `{ level: 'workspace', key: workspaceKey ?? '*' }` 改成恒 `key: '*'`。
+//     不可达的原因：`/sleep` 的补录候选必须过 `candidate.origin !== 'user_explicit' → continue`，
+//     而 `CAPTURE_SIGNALS` 里 origin = `user_explicit` 的信号**只有两个**：
+//       `agent-self-directive`（kind = agent_self，前一行已被排除）与
+//       `explicit-imperative`（kind = user_profile）；
+//     两者经 `defaultScopeFor()` 都落到 `'profile'`。也就是说「workspace 级补录候选」在
+//     契约与实现的共同约束下**根本到不了那个三元分支**（副本实测：`defaultScopeFor('user_profile')
+//     === 'profile'`、`defaultScopeFor('agent_self') === 'profile'`）。
+//     要让它可观察，得先让某个 `user_explicit` 信号产出 workspace 级 kind —— 那要改 `src/`，不在本轮写域内。
+//
+//   · I4 —— 把 `executeSleepPlan()` 的
+//       `if (result.ok && result.status === 'created') counts.added += 1`
+//     简化成 `if (result.ok) counts.added += 1`（把「指纹合并」也算成补录）。
+//     这是**等价变异**：`/sleep` 的补录候选在进入 `writeMemory` 之前，已经过了两道同源指纹闸门 ——
+//     `buildSleepPlan()` 用 `recordHash` 比对 `libraryHashes`，`sleepAlreadyPresent()` 又把同一指纹
+//     （外加「同 scope 同归一化正文」）再挡一次；而 `writeMemory()` 只有在 `findByHash(record.hash)`
+//     命中时才返回 `status: 'merged'`，它算出的 hash 与候选 hash 逐字段同源（kind/scope/subject/text）。
+//     也就是说：候选能走到 `writeMemory` ⇒ 库里一定没有同指纹记录 ⇒ `findByHash` 必不命中，
+//     非 agent_self 的写入只剩 `status: 'created'`（agent_self 在计划层已被排除、宿主侧还有一道闸）。
+//     唯一能观察到差异的路径被上面两道闸门切断。
+//     可达的那一半（库里已有同指纹 ⇒ 第二个回合补录 0 条、计数不动）由既有用例 **host#31** 钉住。
