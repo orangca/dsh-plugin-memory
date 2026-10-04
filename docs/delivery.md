@@ -44,10 +44,10 @@ README 的「Three paths」「Known limitations」、[`docs/protocol-v1.md`](pro
 | 零依赖词面检索升级 | 中文 bigram + 单字兜底、英文轻量词形归并、IDF 加权代替等权命中率、长度归一化让「短而精准」胜过长文堆砌；`memory_explain` 报命中 token 与各自贡献 | **0.5.17** | [`docs/semantic.md`](semantic.md)（M15-B） |
 | 服务面冻结：`ctx.memory` v1 → v1.3 | 第三方插件可依赖 `list` / `stats` / `recall` / `write` / `consolidate`，v1.3 起另有 `setEmbedder` / `capabilities` / `lastRecall`；版本用 `'1.x'` 谓词判断，永不用等号 | v1 **0.5.17**；v1.1 **0.5.18**；v1.2 **0.5.19**；v1.3 **0.5.20** | [`docs/protocol-v1.md`](protocol-v1.md) §1/§9/§10/§11 |
 | 外接嵌入器（可选） | 宿主通过服务面注入 `embed` 后才可能按语义打分：`recall({ mode: 'semantic' \| 'hybrid' })`；未注入时**逐字节**回落词面并在 `lastRecall()` 明说 `fallback: 'no-embedder'`；嵌入失败永不冒泡、永不丢记忆 | **0.5.20** | [`docs/embedder.md`](embedder.md)（M18） |
-| 工程门禁 + 变异体检 | 六道闸进 CI（Node 22.x / 24.x），另有常驻变异工具 `pnpm mutate` 回答「测试到底钉住了什么」 | 门禁 **0.5.15**；`mutate` **0.5.24** | [`CONTRIBUTING.md`](../CONTRIBUTING.md)、[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) |
+| 工程门禁 + 变异体检 | 六道闸进 CI（Node 22.x / 24.x），并有变异抽样（`pnpm mutate:ci`，8 条约 20 秒）；另有常驻变异工具 `pnpm mutate` 回答「测试到底钉住了什么」 | 门禁 **0.5.15**；`mutate` **0.5.24**；`mutate:ci` 进 CI **0.5.25** | [`CONTRIBUTING.md`](../CONTRIBUTING.md)、[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) |
 
-里程碑编号（M6 自画像、M8 `/sleep`、M9 refs、M10 审批门、M11 多语言、M12 分支、M13 审计、M15-A/B 反查与检索、
-M16–M18 协议 v1.1/1.2/1.3）见对应 `docs/*.md` 的标题。
+里程碑编号（M6 自画像、M7 初次称呼、M8 `/sleep`、M9 refs、M10 审批门、M11 多语言、M12 分支、M13 审计、
+M15-A/B 反查与检索、M15-C 协议 v1 冻结、M16–M18 协议 v1.1/1.2/1.3）见对应 `docs/*.md` 的标题。
 
 ## 3. 架构一页图
 
@@ -70,7 +70,7 @@ M16–M18 协议 v1.1/1.2/1.3）见对应 `docs/*.md` 的标题。
              $DSH_HOME/storages/<domainName>/          会话日志：一行 JSONL = 一个 zstd 帧
              ├── global.json   水位（schemaVersion、    tools/session-log.ts 逐帧解压
              │                 collectionVersion、lastSleepAt…）   /sleep 补录、/memory audit --verify、
-             └── memories/<id>.json  { version, record }            /memory trace 都读它
+             └── memories/<id>.json  { version, record }           /memory verify 都读它
 
    浏览器半边 src/client.ts → lib/client.js：
    注册进 keyed 的 plugins.row.config（key = dsh-plugin-memory#dsh-memory），把 30 个 volatile 字段渲染成表单
@@ -82,7 +82,7 @@ M16–M18 协议 v1.1/1.2/1.3）见对应 `docs/*.md` 的标题。
 | 纯函数层 | `src/lib.ts` | 无 `ctx`、无 I/O 的全部判定与渲染 | 单测的全部对象；变异体检的多数目标 |
 | 客户端半边 | `src/client.ts` → `lib/client.js` | 设置表单（30 个 volatile 字段） | 编译成 CommonJS 后再包成 `__ModuleLoader__.load({ id, factory })` |
 | 存储域 | `ctx.storageDomain.open({ name, version: 1, layout: 'per-record', tables: { memories } })` | 一条记录一个文件 + 一个全局水位 | 句柄只需 `global.get/set`、`table('memories').entries/put/delete`、`close`（协议 §2.2） |
-| 会话日志 | `ctx.get('sessionQuery')`；`tools/session-log.ts` | `/sleep` 补录、`--verify` 核对、`trace` 回指的精确读取来源 | DSH 一行一 zstd 帧，单帧解压只拿得到会话头（`CHANGELOG.md` 0.5.8） |
+| 会话日志 | `ctx.get('sessionQuery')`；`tools/session-log.ts` | `/sleep` 补录、`/memory audit --verify`、`/memory verify` 回原文核对的精确读取来源 | DSH 一行一 zstd 帧，单帧解压只拿得到会话头（`CHANGELOG.md` 0.5.8） |
 | 协议面 | `ctx.memory`（`protocolVersion = '1.3'`） | 第三方唯一可依赖的接缝 | 工具注册、命令输出、报告文件、设置表单、存储布局都是**内部实现**，可随 patch 变（协议 §2.4） |
 | 类型与接缝 | `src/types.ts`、`src/shims.d.ts` | 领域类型 + 实测验证过的 DSH 接缝子集 | npm 上的 `@deepseek-ai/*` 比运行中的 DSH 旧，按实测子集打类型 |
 
@@ -90,15 +90,15 @@ M16–M18 协议 v1.1/1.2/1.3）见对应 `docs/*.md` 的标题。
 
 | 路径 | 作用 |
 |---|---|
-| `src/` | 四个源文件：`index.ts`（宿主）、`lib.ts`（纯函数）、`client.ts`（界面）、`types.ts` + `shims.d.ts`（类型与接缝） |
+| `src/` | 五个源文件：`index.ts`（宿主）、`lib.ts`（纯函数）、`client.ts`（界面）、`types.ts`（类型）+ `shims.d.ts`（DSH 接缝声明） |
 | `lib/` | 构建产物，**刻意提交**：GitHub 安装不跑构建脚本，所以它必须与 `src/` 同提交（CI 用 `pnpm build && git diff --exit-code -- lib` 验） |
 | `tools/` | 零依赖开发工具：`mutate.ts`（变异体检）、`check-readmes.ts`（中英结构一致性）、`verify-self-contained.ts`（零运行期依赖 + 打包 + 发布物隐私）、`coverage-check.ts`（覆盖率门槛）、`session-log.ts`（会话日志读取）、`bench.ts` / `eval-recall.ts` / `deploy-dev.ts` / `build-client.ts` / `extract-asar.ts` / `scan-asar.ts` 等 |
-| `tests/` | 7 个套件（`lib` / `host` / `tools` / `protocol` / `docs` / `client` / `module`），全部跑在构建产物 `lib/*.js` 上 |
+| `tests/` | 7 个套件（`lib` / `host` / `tools` / `protocol` / `docs` / `client` / `module`）：5 个跑构建产物 `lib/*.js`；`tools` 跑 `tools/*.ts` 源码；`docs` 只读 `docs/*.md` 与 `src/*.ts` 文本 |
 | `docs/` | 契约与机制说明，**整目录进发布包**（0.5.18 起）；本页也在其中 |
 | `reports/` | 开发期运行自报（`reportPath` 打开时）的 JSON 快照，与评测记录；不是测试基线 |
-| `artifacts/` | 发布 tarball（当前 `dsh-plugin-memory-0.5.24.tgz`） |
+| `artifacts/` | 发布 tarball（当前 `dsh-plugin-memory-0.5.26.tgz`） |
 | `spike/` | 最早的宿主接缝探针与实验报告（M-1），保留作历史证据 |
-| `.github/workflows/ci.yml` | 六道闸 + 构建产物同步 + 打包清单断言，Node 22.x / 24.x 双矩阵 |
+| `.github/workflows/ci.yml` | 六道闸 + 变异抽样（`pnpm mutate:ci`，0.5.25 起）+ 构建产物同步 + 打包清单断言，Node 22.x / 24.x 双矩阵 |
 | `cordis.patch.yml` | 这个插件作为 bundle 贡献的补丁层 |
 
 ## 4. 协议面摘要：`ctx.memory` v1.3
@@ -129,8 +129,8 @@ if (memory.protocolVersion && !/^1\./u.test(memory.protocolVersion)) return
 **三条载荷级约定**（协议 §4.4，每条都有专门断言钉在 `tests/protocol.test.ts`）：
 
 1. **`pending` 不进任何注入路径**——常驻块、每轮召回、`recall()` 默认口径全都过滤
-   `status === 'active'`；只有显式 `status: 'pending' | 'invalid' | 'all'` 的审计查询、`/memory pending` 与
-   `memory_explain` 诊断能看到它。没有「这是模型自己的提议」的例外。
+   `status === 'active'`；注入路径一律看不到它，能看到的是无参 `list()`（原始视图）、显式 `status` 查询、
+   `/memory pending`、`/memory stats` 与 `memory_explain` 诊断。没有「这是模型自己的提议」的例外。
 2. **`refs` 不进指纹**——同 kind / scope / subject / text 而来源不同的两次写入仍是**一条**记录（第二次
    `status: 'merged'`），引用被合并进去。否则同一件事会因为「从哪来」不同而算两条，去重与 `/sleep` 幂等一起坏掉。
 3. **`branch` 进指纹**——但只在记录真的带非空标签时（`...(branch ? [branch] : [])`）。于是「到处都成立的约定」
@@ -152,10 +152,11 @@ if (memory.protocolVersion && !/^1\./u.test(memory.protocolVersion)) return
 | ④ `check:readmes` | 中英两份 README 的**六项结构一致**：`## ` 小节数量与共有锚点顺序、代码围栏成对、表格首列键集合、表单字段数、`/memory` + `/sleep` 命令集合、顶部互链 | `pnpm check:readmes`（`pnpm test` 末尾也会跑一次） | `0` = 全部对齐；`1` = 有漂移并逐条点名 |
 | ⑤ `verify:self-contained` | 四件事：`dependencies` 为空、`src/`+`tools/` 的裸导入只来自 devDependencies / 内置模块 / 客户端外部模块、`npm pack` 实际产物的必需成员齐全、**发布物隐私扫描**（本机用户名、盘符与 POSIX 家目录绝对路径、UNC、`~/`、真实 `$DSH_HOME`、常见凭证形状）。身份类判据在 CI 里不可用（用户名是 `runner`/`root`）时**显式降为 skip 并说明「没有扫」**，绝不把「跳过」写成「干净」 | `pnpm verify:self-contained` | `0` = 通过或**显式**跳过；`1` = 有失败项；跳过 ≠ 通过 |
 | ⑥ 覆盖率门槛 | 只看两个产物的行覆盖率：`lib/lib.js` 与 `lib/index.js`。门槛按取数口径**分开**：报告口径（`--report`，即 `pnpm coverage:check` 用的那套，实测 99.06% / 85.55%）门槛为 **97 / 83**；自算口径（`--coverage-dir`，实测 100.00% / 96.76%）门槛为 **98 / 94**。两套数字不可混用 | `mkdir -p .tmp` → `pnpm coverage > .tmp/coverage.txt 2>&1` → `pnpm coverage:check` | `0` = 两个文件都达标；`1` = 低于门槛、**或输入缺失**（「量不到」不当作「通过」） |
-| ＋ 变异体检 | 不是发布闸门，但决定「测试钉住了什么」：`tools/mutate.ts` 里的 **92 条**常驻变异（阈值边界、护栏反转、默认值、缓存淘汰、排序兜底、指纹字段增删，以及客户端表单模型与 `memory_explain` 的分支）逐条改坏一份**临时副本**（`node_modules` 用链接指回，原件一行不改），重建后跑全量；`killed` = 测试发现了，`survived` = 盲区，`build-error` = 编译期就被拦下（单列，不冤杀也不当存活） | 摸底 `pnpm mutate`（确定性抽 8 条）→ 复查 `pnpm mutate --only <id>` → 发布前 `pnpm mutate:full`（`--limit 0`，跑全目录，约 6 分钟）→ 机器可读 `pnpm mutate:ci`（stdout 是纯 JSON） | `0` = 全部被杀死（或编译期拦下）；`1` = **存在存活**（体检不合格的信号）；`2` = 环境问题（node/tsc 缺失、副本建不起来、目录过期）。参数还有 `--seed`（可复现）、`--keep`（保留副本）、`--list`（只看目录） |
+| ＋ 变异体检 | 不在 CONTRIBUTING 发布清单的六道闸内，但已作为抽样步骤进 CI（`pnpm mutate:ci`，存活 ⇒ 退出码 1、CI 红）——它决定「测试钉住了什么」：`tools/mutate.ts` 里的 **92 条**常驻变异（阈值边界、护栏反转、默认值、缓存淘汰、排序兜底、指纹字段增删，以及客户端表单模型与 `memory_explain` 的分支）逐条改坏一份**临时副本**（`node_modules` 用链接指回，原件一行不改），重建后跑全量；`killed` = 测试发现了，`survived` = 盲区，`build-error` = 编译期就被拦下（单列，不冤杀也不当存活） | 摸底 `pnpm mutate`（确定性抽 8 条）→ 复查 `pnpm mutate --only <id>` → 发布前 `pnpm mutate:full`（`--limit 0`，跑全目录，约 6 分钟）→ 机器可读 `pnpm mutate:ci`（stdout 是纯 JSON） | `0` = 全部被杀死（或编译期拦下）；`1` = **存在存活**（体检不合格的信号）；`2` = 环境问题（node/tsc 缺失、副本建不起来、目录过期）。参数还有 `--seed`（可复现）、`--keep`（保留副本）、`--list`（只看目录） |
 
-CI（`.github/workflows/ci.yml`）在 Node 22.x 与 24.x 两个矩阵上依次跑：typecheck → lint → test → check:readmes →
-verify:self-contained → 覆盖率门槛，然后额外验两件与发布直接相关的事：**构建产物与源码同步**
+CI（`.github/workflows/ci.yml`）在 Node 22.x 与 24.x 两个矩阵上依次跑：typecheck → lint → test →
+变异抽样（`pnpm mutate:ci`）→ check:readmes → verify:self-contained → 覆盖率门槛，
+然后额外验两件与发布直接相关的事：**构建产物与源码同步**
 （`pnpm build && git diff --exit-code -- lib`）与**打包清单含插件管理器要的成员**（`lib/index.js`、`lib/client.js`、
 `cordis.patch.yml`、`package.json`）。
 
@@ -181,8 +182,8 @@ verify:self-contained → 覆盖率门槛，然后额外验两件与发布直接
 | 变异第二轮 | `CHANGELOG.md` 0.5.23 | 435 → 467 |
 | 变异第三轮 | `CHANGELOG.md` 0.5.24 | 467 → **498** |
 
-**0.5.24 交付时**的 498 项构成如下（逐文件数 `test(` 即可核对；仓库在开发中会继续增长，最新的真实数字以
-`node --test` 的实际输出为准）：
+**0.5.24 交付时**的 498 项构成如下（逐文件数**行首**的 `^test(`（正则加 `m` 锚），或直接读 `node --test` 输出的 `ℹ tests N`；
+仓库在开发中会继续增长，最新的真实数字以 `node --test` 的实际输出为准）：
 
 | 套件 | `tests/lib.test.ts` | `host` | `tools` | `protocol` | `docs` | `client` | `module` | 合计 |
 |---|---|---|---|---|---|---|---|---|
@@ -207,13 +208,14 @@ node --test tests/lib.test.ts tests/client.test.ts tests/host.test.ts tests/tool
 | 第二轮 | 0.5.23 | 检索 + 自画像（lib） | 38 | 15 | **23** | 23（lib 206 → 228） |
 | | | `/sleep` + 审计端到端（host） | 30 | 18 | **12** | 10（host 139 → 149） |
 | 第三轮 | 0.5.24 | 纯函数层（lib） | 40 | 16 | **23** | 23（lib 228 → 243） |
-| | | 宿主（host） | 41 | 40 | **1** | 10 条新用例（host 149 → 159） |
+| | | 宿主（host） | 41 | 40 | **1** | 0（1 处登记为等价；另有 10 条新用例杀死 28 处，host 149 → 159） |
 
 逐轮相加：**试 313 处破坏，170 处当场被既有测试杀死，139 处存活**（个别条目在各轮表格里未单列，
 本页照表引用、不做加总修正）。其中 **5 处被登记为「不可达 / 等价」而不是硬凑用例**——第一轮宿主 2 处、
 第二轮宿主 2 处、第三轮宿主 1 处；理由写在 `tests/host.test.ts` 的注释里（例如：工作区级补录候选在契约下不可能存在；
 进入 `writeMemory` 的候选已过两道同源指纹闸门，简化计数器在可达输入上不可观察），`CHANGELOG.md` 0.5.22 §「Two
-survivors…」、0.5.23 §「Two survivors documented…」、0.5.24「One survivor is documented…」各有一节说明。
+survivors…」、0.5.23 §「Two survivors documented…」、0.5.24「One survivor is documented…」各有一处说明
+（0.5.23 是小节标题，0.5.22 与 0.5.24 是加粗条目）。
 `tools/mutate.ts`（0.5.24）把这套方法固化成常驻工具，并在第一次运行时又找到 **2 个真实盲区**：
 `pickMergeGroups` 的硬编码 `0.85` 兜底与 `DEFAULTS.mergeSimilarity`（0.7）不一致；以及**没有任何测试断言
 `Config` schema 的默认值**——两者都已闭环（后者升级为「每个键的默认值必须等于 `DEFAULTS`」+ 键数钉死的系统性检查）。
@@ -242,7 +244,8 @@ survivors…」、0.5.23 §「Two survivors documented…」、0.5.24「One surv
 | 检索是词面的，语义是可选项 | 默认路径是中文 bigram + 拉丁词形归并 + IDF + 长度归一化的**词面**检索；只有宿主**显式注入** `embed` 并打开 `embedderRecallMode` 才可能按语义/混合打分 | README「Known limitations」；`docs/embedder.md` §0 |
 | 命令输出只有中文 | `language` 只切**模型可见**文本（注入块、提示、R2、7 个工具描述）；`/memory …`、`/sleep`、`stats` 等命令输出一律中文，本轮范围外 | `docs/i18n.md` §1/§4；README 的语言覆盖表 |
 | 向量缓存不跨重启 | 向量缓存是进程内 LRU（`embedderCacheMax`，默认 2000）；`stats().embedder` 的计数与 `stats().writes` 一样**只增不减、重启归零** | `src/index.ts` 的向量缓存与嵌入器计数器注释；协议 §3.2 |
-| `list()` / `recall()` 默认是**未过滤的原始视图** | 无参 `list()` 返回插入序的全部状态（含 `pending` / `invalid` / `archived`）的**活对象**；无参 `recall()` 也只看它自己的池。想要「模型实际看到什么」必须显式传 `status: 'active'`（以及 `branch: 'current'`） | 协议 §3.1/§3.3；`CHANGELOG.md` 0.5.17/0.5.18 |
+| `list()` 无参 = **全部状态的原始视图** | 无参 `list()` 返回插入序的全部状态（含 `pending` / `invalid` / `archived`）的**活对象** | 协议 §3.1；`CHANGELOG.md` 0.5.18 |
+| `recall()` 缺省池 = **active** | 缺省只收 `active`（`includeArchived: true` 时再含 `archived`），`pending` / `invalid` / `archived` 默认永不返回；`status: 'active'` 对它是**缺省**、显式传是空操作；要看原始视图须显式 `status: 'all'`。想要「模型实际看到什么」的必要参数是 `branch: 'current'` | 协议 §3.3；`CHANGELOG.md` 0.5.17/0.5.18 |
 | `ok: true` 不等于「已落盘」 | 它只表示「过了闸门并在**内存**里生效」；持久化看 `write()` 结果的 `persisted`（v1.1）或 `stats().opened` / `stats().writes` | 协议 §3.4 |
 | 审计的「尝试」视图不持久 | `/memory audit` 的内存尝试环容量由 `auditMax`（默认 50）决定，**重启即失**；只有记录派生部分是持久的 | `docs/audit.md` §1 |
 | 压缩固化取决于部署 | 代码监听 `compaction/summary`；没挂载压缩插件的 profile 根本不会产生该事件 | README「Known limitations」 |
@@ -253,7 +256,7 @@ survivors…」、0.5.23 §「Two survivors documented…」、0.5.24「One surv
 | 注入远端嵌入器会把正文送出本机 | 插件自己**不联网、不带模型**；它只把记忆正文交给被注入的 `embed`。远端 embedder ⇒ 正文离开本机——这个决定与后果属于宿主 / 用户 | `SECURITY.md`；协议 §11 隐私段 |
 | 导入文件要可信 | `/memory import` 会逐字段校验并把来源降级为 `observed`、强制 `pinned: false`，但它读的是你给的路径 | `SECURITY.md`；README 命令表 |
 
-## 8. 发布历史（0.5.9 → 0.5.24）
+## 8. 发布历史（0.5.9 → 0.5.26）
 
 版本号只按 **patch** 递增（`0.5.x → 0.5.x+1`），纯文档提交不升版本；协议版本与包版本相互独立。
 起点之前：`0.4.2` 是首个公开提交（宿主半边、双通道注入、7 工具、16 条 `/memory` 命令、34 个单测），
@@ -277,6 +280,10 @@ survivors…」、0.5.23 §「Two survivors documented…」、0.5.24「One surv
 | 0.5.22 | 变异测试驱动的测试加固（第一轮）：64 + 100 处破坏，80 处盲区 |
 | 0.5.23 | 变异测试第二轮：专打上一轮刻意跳过的大函数（38 + 30 处破坏，35 处盲区） |
 | 0.5.24 | `pnpm mutate` 工具化 + 发布检查清单 + 变异第三轮（40 + 41 处破坏）；套件 467 → **498** |
+| 0.5.25 | 客户端半边覆盖 3 → 16 条用例 + 交付总览 `docs/delivery.md` + 变异抽样 `pnpm mutate:ci` 进 CI（套件 498 → 524） |
+| 0.5.26 | 变异目录 29 → 92、`--json` 恢复纯 JSON、修掉变异工具用绝对路径跑错树的缺陷（套件 524 → 528） |
+
+逐行依据：[`CHANGELOG.md`](../CHANGELOG.md) 对应小节；版本号用 `git tag` 复核。
 
 ## 9. 去哪看细节
 
@@ -287,5 +294,5 @@ survivors…」、0.5.23 §「Two survivors documented…」、0.5.24「One surv
 | 每一版到底改了什么 | [`CHANGELOG.md`](../CHANGELOG.md) |
 | 怎么发一版（顺序、推送失败的三种真相、变异体检怎么读） | [`CONTRIBUTING.md`](../CONTRIBUTING.md) |
 | 安全边界与威胁模型 | [`SECURITY.md`](../SECURITY.md) |
-| 各能力的接口契约 | `docs/refs.md`、`docs/write-policy.md`、`docs/i18n.md`、`docs/branch.md`、`docs/audit.md`、`docs/trace.md`、`docs/semantic.md`、`docs/sleep.md`、`docs/self-portrait.md`、`docs/embedder.md`、`docs/protocol-v1.1-changes.md`、`docs/protocol-v1.2-changes.md` |
+| 各能力的接口契约 | [`refs.md`](refs.md)、[`write-policy.md`](write-policy.md)、[`i18n.md`](i18n.md)、[`branch.md`](branch.md)、[`audit.md`](audit.md)、[`trace.md`](trace.md)、[`semantic.md`](semantic.md)、[`sleep.md`](sleep.md)、[`self-portrait.md`](self-portrait.md)、[`embedder.md`](embedder.md)、[`protocol-v1.1-changes.md`](protocol-v1.1-changes.md)、[`protocol-v1.2-changes.md`](protocol-v1.2-changes.md) |
 | 这个插件建立在哪些 DSH 机制上（面向插件作者） | [`docs/dsh-mechanisms.md`](dsh-mechanisms.md) |

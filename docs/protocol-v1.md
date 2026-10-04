@@ -683,8 +683,10 @@ and none is worked around in `src/` here.
 
 **Kept as declared behaviour (not defects, but callers must know)**:
 
-2. **`list()` and `recall()` are an unfiltered raw view by default.** Both read `state.records.values()` directly,
-   while every injection path goes through `branchVisible(...)`. With `branchAware: true` a third party can
+2. **`list()` and `recall()` are an unfiltered raw view by default.** `list()` reads `state.records.values()` directly
+   (every status), while `recall()`'s pool rule admits only `active` rows — plus `archived` when
+   `includeArchived: true` — so `pending` / `invalid` / `archived` never come back from a default `recall()`;
+   every injection path additionally goes through `branchVisible(...)`. With `branchAware: true` a third party can
    therefore see records tagged for another branch through `ctx.memory` even though those records are correctly
    withheld from the prompt. **Decision: keep the default raw** (the service is the admin/audit view; filtering by
    default would stop a third party from auditing the whole store). v1.1 adds the opt-in instead of changing the
