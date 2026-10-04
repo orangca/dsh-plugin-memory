@@ -1362,7 +1362,10 @@ export function shouldArchive(record: MemoryRecord, cfg: MemoryConfig, now: numb
 
 /** 合并分组：同 kind + 同 scope + 同 subject 且文本相似度 ≥ 阈值。 */
 export function pickMergeGroups(records: Iterable<MemoryRecord>, cfg: MemoryConfig): MemoryRecord[][] {
-  const threshold = cfg.mergeSimilarity ?? 0.85
+  // 兜底必须与 `DEFAULTS.mergeSimilarity` 一致。这里曾写死 0.85（而 DEFAULTS 是 0.7）——
+  // 变异测试证明"把 0.85 改成 0.7"没有任何测试察觉，说明这个不一致一直没人盯着。
+  // 内部调用方总是传完整 cfg，所以这个改动对外不可见；但兜底值写错会埋雷，故统一到 DEFAULTS。
+  const threshold = cfg.mergeSimilarity ?? DEFAULTS.mergeSimilarity
   const buckets = new Map<string, MemoryRecord[]>()
   for (const record of listActive(records)) {
     if (record.kind === 'project_gist' || record.kind === 'agent_self') continue // 这两类有自己的刷新/晋升规则

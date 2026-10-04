@@ -50,6 +50,7 @@ import {
   containment,
   cosineSimilarity,
   decideModelWrite,
+  defaultScopeFor,
   deriveOriginFromMessages,
   deriveSubject,
   detectWorkspaceMarkers,
@@ -3789,3 +3790,276 @@ test('formatSleepPlan：合并组无主题时给「(无主题)」占位（不得
   assert.match(text, /^ {2}- \(无主题\)：2 条，保留 aaaa1111「合并正文」$/mu)
 })
 
+// ---------------- 补盲（三）：检索字段口径、捕获信号矩阵与来源判定 ----------------
+// 第三轮变异（每次只改 src/lib.ts 一处 → tsc 重建 → 跑**全量**）里「全量仍绿」的点集中在这三块：
+// 检索 token 集合由哪些字段构成、信号表每一行的类型/来源/分值从哪来、以及来源判定的边界。
+// 这些破坏都能在真实运行里静默改变行为（命中面变宽/变窄、条目被记成用户侧、配额留下错的那条），
+// 但既有用例一条都没红 —— 下面的用例逐条把它钉住。
+
+test('检索字段口径：subject 与 tags 进 token 集合，且字段之间必须有分隔（拼接不得造出新 token）', () => {
+  clearTokenCache()
+  // subject 参与检索：正文里没有 editor/theme，命中只能来自主题键。
+  const themed = makeRecord({ kind: 'semantic', text: '这个键只在主题里。', subject: 'editor.theme' })
+  assert.equal(lexicalMatch(themed, 'editor.theme'), 1)
+  assert.ok(memoryMatch(themed, '我记一下 editor.theme') > 0)
+
+  // tags 参与检索：两个标签各自可查（join('') 会拼成 releasepnpm，两个都查不到）。
+  const tagged = makeRecord({ kind: 'procedural', text: '这个流程写在别处。', tags: ['release', 'pnpm'] })
+  assert.equal(lexicalMatch(tagged, 'release'), 1)
+  assert.equal(lexicalMatch(tagged, 'pnpm'), 1)
+
+  // 字段之间必须有分隔：正文与 subject 相邻却没有空格时会拼成 alphabeta，两个原词一起消失。
+  const boundary = makeRecord({ kind: 'semantic', text: 'alpha', subject: 'beta' })
+  assert.equal(lexicalMatch(boundary, 'alpha'), 1)
+  assert.equal(lexicalMatch(boundary, 'beta'), 1)
+  clearTokenCache()
+})
+
+test('检索字段口径：field/value 不进 token 集合（结构化字段不得扩大检索面）', () => {
+  clearTokenCache()
+  const record = makeRecord({
+    kind: 'user_profile',
+    text: '主题偏好记在结构字段里。',
+    subject: 'editor.theme',
+    field: 'theme',
+    value: 'dark',
+  })
+  // 正控：subject 照常参与（editor 只在 subject 里）。
+  assert.equal(lexicalMatch(record, 'editor'), 1)
+  // field/value 只在冲突/结构判定里用：正文与 subject 都不含 dark，命中必须是 0。
+  assert.equal(lexicalMatch(record, 'dark'), 0)
+  assert.equal(memoryMatch(record, 'dark'), 0)
+  clearTokenCache()
+})
+
+test('tokenCacheKey：无指纹记录的回退键必须含 subject/tags（只差分词的记录不得共用一次分词结果）', () => {
+  clearTokenCache()
+  const alphaSubject = { ...makeRecord({ kind: 'semantic', text: '同一句正文。', subject: 'alpha' }), hash: '' }
+  const betaSubject = { ...makeRecord({ kind: 'semantic', text: '同一句正文。', subject: 'beta' }), hash: '' }
+  assert.equal(lexicalMatch(alphaSubject, 'alpha'), 1)
+  // 回退键若只剩正文，第二次调用会读到上一条的分词集合 ⇒ beta 也「命中」alpha。
+  assert.equal(lexicalMatch(betaSubject, 'alpha'), 0)
+  assert.equal(lexicalMatch(betaSubject, 'beta'), 1)
+
+  const tagged = { ...makeRecord({ kind: 'semantic', text: '同一句正文。', tags: ['gamma'] }), hash: '' }
+  const untagged = { ...makeRecord({ kind: 'semantic', text: '同一句正文。', tags: [] }), hash: '' }
+  assert.equal(lexicalMatch(tagged, 'gamma'), 1)
+  // 同上：无标签那条不得读到带 gamma 标签那条的分词。
+  assert.equal(lexicalMatch(untagged, 'gamma'), 0)
+  clearTokenCache()
+})
+
+test('clearTokenCache：确实清空缓存（可观测计数归零，测试与基准不得读到上一位调用者的分词）', () => {
+  clearTokenCache()
+  assert.equal(tokenCacheSize(), 0)
+  const record = makeRecord({ kind: 'semantic', text: '缓存条目在这里。' })
+  assert.equal(lexicalMatch(record, '缓存'), 1)
+  assert.ok(tokenCacheSize() > 0, '扫描后应真的有缓存条目')
+  clearTokenCache()
+  assert.equal(tokenCacheSize(), 0)
+})
+
+/** 信号表每一行的期望值（设计稿 §5.2）：id / kind / origin / confidence / importance。 */
+const CAPTURE_MATRIX = [
+  { phrase: '以后你要先给结论再解释。', id: 'agent-self-directive', kind: 'agent_self', origin: 'user_explicit', confidence: 0.9, importance: 0.9 },
+  { phrase: '你搞错了，这里应该用 workspace 作用域。', id: 'agent-self-correction', kind: 'agent_self', origin: 'user_correction', confidence: 0.85, importance: 0.8 },
+  { phrase: '记住：以后都用 pnpm 管理依赖。', id: 'explicit-imperative', kind: 'user_profile', origin: 'user_explicit', confidence: 0.9, importance: 0.85 },
+  { phrase: '不对，改成用 workspace 作用域。', id: 'correction', kind: 'user_profile', origin: 'user_correction', confidence: 0.8, importance: 0.75 },
+  { phrase: '就定这个方案吧。', id: 'decision', kind: 'semantic', origin: 'observed', confidence: 0.7, importance: 0.6 },
+  { phrase: '我的系统是 Windows，装的是 pnpm。', id: 'environment', kind: 'user_profile', origin: 'observed', confidence: 0.8, importance: 0.5 },
+  { phrase: '我更喜欢用 pnpm 管依赖。', id: 'preference', kind: 'user_profile', origin: 'observed', confidence: 0.75, importance: 0.6 },
+] as const
+
+test('CAPTURE_SIGNALS 矩阵：7 行信号的 id/类型/来源/置信度/重要度逐行钉住（任一行串了都会被下游放大）', () => {
+  for (const row of CAPTURE_MATRIX) {
+    const result = extractCandidates(row.phrase, cfg)
+    assert.equal(result.candidates.length, 1, `${row.id}：${row.phrase} 应恰好抽出一条候选`)
+    const candidate = result.candidates[0]!
+    assert.deepEqual(candidate.tags, [row.id], `${row.phrase} 的命中信号`)
+    assert.equal(candidate.kind, row.kind, `${row.id} 的 kind`)
+    assert.equal(candidate.origin, row.origin, `${row.id} 的 origin`)
+    assert.equal(candidate.confidence, row.confidence, `${row.id} 的 confidence`)
+    assert.equal(candidate.importance, row.importance, `${row.id} 的 importance`)
+  }
+})
+
+/**
+ * 每一行信号的**全部说法**（id → 例句）。删掉任何一个说法，都会让那句「用户明说」静默落成
+ * no-signal / model_proposed —— 行为变化是真的，但只是「少认了一个词」，不专门枚举就永远查不出来。
+ * 例句都与该行一一对应（不含更靠前的信号行的说法）。
+ */
+const CAPTURE_PHRASES: ReadonlyArray<readonly [string, string]> = [
+  ['agent-self-directive', '以后你要先给结论。'],
+  ['agent-self-directive', '你要先给结论再解释。'],
+  ['agent-self-directive', '你必须先给结论。'],
+  ['agent-self-directive', '别再那样写代码了。'],
+  ['agent-self-directive', '不要再这样跳过测试。'],
+  ['agent-self-directive', '下次先给结论再解释。'],
+  ['agent-self-directive', '从现在起你要先给结论。'],
+  ['agent-self-directive', '你以后不要跳过测试。'],
+  ['agent-self-correction', '你搞错了构建顺序。'],
+  ['agent-self-correction', '你弄错了这个参数。'],
+  ['agent-self-correction', '你写错了配置键。'],
+  ['agent-self-correction', '你漏了一个边界。'],
+  ['agent-self-correction', '上次你说过用 pnpm。'],
+  ['explicit-imperative', '记住：以后都用 pnpm。'],
+  ['explicit-imperative', '记一下这个发布流程。'],
+  ['explicit-imperative', '记下这个构建约定。'],
+  ['explicit-imperative', '帮我记这个默认端口。'],
+  ['explicit-imperative', '以后都用 pnpm 管理依赖。'],
+  ['explicit-imperative', '以后也别用 npm 了。'],
+  ['explicit-imperative', 'remember to run all tests'],
+  ['correction', '不对，这个顺序反了。'],
+  ['correction', '不是这个配置文件。'],
+  ['correction', '改成用 workspace 作用域。'],
+  ['correction', '应该是 workspace 作用域。'],
+  ['correction', '其实是文档里的表述。'],
+  ['decision', '就定这个方案吧。'],
+  ['decision', '采用方案 A 落地。'],
+  ['decision', '最终选 workspace 作用域。'],
+  ['decision', '结论是用 pnpm 管理依赖。'],
+  ['decision', '决定用 workspace 作用域。'],
+  ['decision', '就用这个方案吧。'],
+  ['environment', '我的系统是 Windows。'],
+  ['environment', '我的版本是 22.11。'],
+  ['environment', '我的路径在 D 盘。'],
+  ['environment', '我的环境是 pwsh 7。'],
+  ['environment', '我用的是 pnpm 11。'],
+  ['environment', '我机器上跑的是 Node 22。'],
+  ['preference', '我更喜欢深色主题。'],
+  ['preference', '我偏好中文回答。'],
+  ['preference', '我习惯先看测试。'],
+  ['preference', '我一般在早上写代码。'],
+  ['preference', '我喜欢短函数写法。'],
+  ['preference', '我们项目用 pnpm。'],
+  ['preference', '请不要在这个项目里用 npm。'],
+  ['preference', '我不喜欢过度抽象。'],
+]
+
+test('CAPTURE_SIGNALS 词表：7 行信号的每个说法都各自命中（少认一个说法同样是行为变化，必须红）', () => {
+  for (const [id, phrase] of CAPTURE_PHRASES) {
+    const result = extractCandidates(phrase, cfg)
+    assert.equal(result.candidates.length, 1, `「${phrase}」应命中 ${id}`)
+    assert.deepEqual(result.candidates[0]!.tags, [id], `「${phrase}」的命中信号`)
+  }
+})
+
+test('CAPTURE_SIGNALS：顺序即优先级 —— 一句同时命中多行时取先匹配的那行', () => {
+  // 「记住：以后你要先给结论」同时命中 explicit-imperative（记住）与 agent-self-directive（以后你）。
+  const directive = extractCandidates('记住：以后你要先给结论再解释。', cfg)
+  assert.equal(directive.candidates.length, 1)
+  assert.deepEqual(directive.candidates[0]!.tags, ['agent-self-directive'])
+  assert.equal(directive.candidates[0]!.kind, 'agent_self')
+
+  // 「记住：以后都用 pnpm，我更喜欢这样」同时命中 explicit-imperative 与末行的 preference。
+  const imperative = extractCandidates('记住：以后都用 pnpm，我更喜欢这样。', cfg)
+  assert.equal(imperative.candidates.length, 1)
+  assert.deepEqual(imperative.candidates[0]!.tags, ['explicit-imperative'])
+  assert.equal(imperative.candidates[0]!.kind, 'user_profile')
+})
+
+test('extractCandidates：配额裁剪先比置信度再比重要度（重要度更高的不得顶掉置信度更高的）', () => {
+  // environment（0.8 / 0.5）与 preference（0.75 / 0.6）的两级顺序正好相反：
+  // 配额只剩一条时保留的必须是置信度更高的 environment。
+  const result = extractCandidates([
+    '我的系统是 Windows，装的是 pnpm。',
+    '我更喜欢用 pnpm 管依赖。',
+  ].join('\n'), { ...cfg, captureMaxPerTurn: 1 })
+  assert.equal(result.candidates.length, 1)
+  assert.match(result.candidates[0]!.text, /Windows/)
+  assert.equal(result.skipped['over-turn-quota'], 1)
+})
+
+test('extractCandidates：captureMaxPerTurn=0 是「本回合不回放捕获」（0 是合法值，不得被 || 兜成默认 3）', () => {
+  const result = extractCandidates('记住：以后都用 pnpm。', { ...cfg, captureMaxPerTurn: 0 })
+  assert.equal(result.candidates.length, 0)
+  assert.equal(result.skipped['over-turn-quota'], 1)
+})
+
+test('extractCandidates：同一回合逐字重复的句子只留一条（第二条计 duplicate-in-turn）', () => {
+  const result = extractCandidates('记住：以后都用 pnpm。\n记住：以后都用 pnpm。', cfg)
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.skipped['duplicate-in-turn'], 1)
+})
+
+test('deriveOriginFromMessages：结构缺失/坏输入一律 model_proposed（缺 source ≠ 用户真说过；单条消息也要扫到）', () => {
+  // 宿主只保证 role/content 可用时，source 缺失是常态：把「缺结构」当「用户真说过」，
+  // 模型转述就能拿到用户侧身份（冲突时永不被推翻）。
+  assert.equal(deriveOriginFromMessages([{ role: 'user', content: [{ type: 'text', text: '记住：以后都用 pnpm' }] }]), 'model_proposed')
+  assert.equal(deriveOriginFromMessages([{ role: 'user', source: null, content: '记住：以后都用 pnpm' }]), 'model_proposed')
+  // 单条用户消息（下标 0）必须被扫到：倒序扫描不得跳过首元素。
+  assert.equal(deriveOriginFromMessages([{ role: 'user', source: { kind: 'user' }, content: '记住：以后都用 pnpm' }]), 'user_explicit')
+  // 坏输入不得抬成 user_explicit。
+  for (const bad of [undefined, null, {}, '记住：以后都用 pnpm', 42]) {
+    assert.equal(deriveOriginFromMessages(bad), 'model_proposed', `坏输入：${String(bad)}`)
+  }
+})
+
+test('EXPLICIT_SIGNAL_RE：显式祈使词表逐词都判 user_explicit（一个都不许少）', () => {
+  const phrases = [
+    '记住：以后都用 pnpm',
+    '记一下这个约定',
+    '帮我记下发布流程',
+    '以后都用 workspace 作用域',
+    '以后也别用 npm',
+    '从现在起先给结论',
+    '别再手写 CHANGELOG',
+    '不要再用 npm 了',
+    '下次要跑全量测试',
+    'remember to run all tests',
+    'always use pnpm',
+    'never commit to main',
+  ]
+  for (const phrase of phrases) {
+    assert.equal(EXPLICIT_SIGNAL_RE.test(phrase), true, `正则必须认「${phrase}」`)
+    assert.equal(
+      deriveOriginFromMessages([{ role: 'user', source: { kind: 'user' }, content: phrase }]),
+      'user_explicit',
+      `「${phrase}」必须判成用户明说`,
+    )
+  }
+  // 反控：普通陈述不得被当成用户明说。
+  assert.equal(EXPLICIT_SIGNAL_RE.test('这个文件是干什么的'), false)
+  assert.equal(deriveOriginFromMessages([{ role: 'user', source: { kind: 'user' }, content: '今天天气不错' }]), 'model_proposed')
+})
+
+test('defaultScopeFor：六种 kind 全覆盖 —— 只有 user_profile / agent_self 是 profile 级（episodic 不得抬成 profile）', () => {
+  assert.equal(defaultScopeFor('user_profile'), 'profile')
+  assert.equal(defaultScopeFor('agent_self'), 'profile')
+  for (const kind of ['project_gist', 'episodic', 'semantic', 'procedural'] as const) {
+    assert.equal(defaultScopeFor(kind), 'workspace', `${kind} 的默认作用域是 workspace 级`)
+  }
+})
+
+test('makeRecord：缺省结构字段（subject/field/value）一律 null，tags 一律空数组（不得用空串/占位标签冒充）', () => {
+  const record = makeRecord({ kind: 'semantic', text: '缺省字段样本。' })
+  assert.equal(record.subject, null)
+  assert.equal(record.field, null)
+  assert.equal(record.value, null)
+  assert.deepEqual(record.tags, [])
+  // 给了就原样保留（不做静默转换）。
+  const given = makeRecord({ kind: 'user_profile', text: '带字段样本。', subject: 'editor.theme', field: 'theme', value: 'dark' })
+  assert.equal(given.subject, 'editor.theme')
+  assert.equal(given.field, 'theme')
+  assert.equal(given.value, 'dark')
+})
+
+
+// ---------------------------------------------------------------- 合并阈值兜底（变异测试补盲）
+
+test('pickMergeGroups：缺省 mergeSimilarity 时兜底必须等于 DEFAULTS.mergeSimilarity', () => {
+  // 变异测试发现：把这里的兜底从 0.85 改成 0.7 没有任何测试察觉 —— 因为它恰好与 DEFAULTS 一致，
+  // 而没人钉住"兜底值本身"。这里用一条相似度落在两个候选值之间的记录把兜底钉死。
+  const a = makeRecord({ kind: 'semantic', text: '构建流程用 pnpm，产物在 dist 目录里', subject: 'build.flow' })
+  const b = makeRecord({ kind: 'semantic', text: '构建流程使用 pnpm，产物放到 dist 目录', subject: 'build.flow' })
+  // 部分 cfg（缺 mergeSimilarity）⇒ 走兜底；完整 cfg ⇒ 走显式值。两者必须给出同一个判定。
+  const partial = { ...DEFAULTS, mergeSimilarity: undefined } as unknown as typeof DEFAULTS
+  const explicit = { ...DEFAULTS, mergeSimilarity: DEFAULTS.mergeSimilarity }
+  assert.deepEqual(
+    pickMergeGroups([a, b], partial).length,
+    pickMergeGroups([a, b], explicit).length,
+    '缺省 mergeSimilarity 的兜底必须与 DEFAULTS.mergeSimilarity 等价（兜底写错会静默改变合并行为）',
+  )
+  // 阈值本身的意义：抬到 0.999 时这两条不该再合并（证明上面不是"永远都合并"的空断言）
+  assert.equal(pickMergeGroups([a, b], { ...DEFAULTS, mergeSimilarity: 0.999 }).length, 0, '阈值足够高时不得合并')
+})

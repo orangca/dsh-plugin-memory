@@ -17,7 +17,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
-import { apply as applyRaw } from '../lib/index.js'
+import { apply as applyRaw, Config } from '../lib/index.js'
+import { DEFAULTS } from '../lib/lib.js'
 // 仅 v1.1 用例使用：假 git 目录（`<dir>/.git/HEAD`，零 shell）与发布集清单。
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -2339,4 +2340,35 @@ test('protocol#38 非有限 maxInjectedTokens/charsPerToken 回落默认：注�
   const zeros = await buildBudgetProbe({ maxInjectedTokens: 0, charsPerToken: 0 })
   assert.equal(zeros.block, defaults.block, 'maxInjectedTokens:0 / charsPerToken:0 回落默认 ⇒ 与默认逐字节相同')
   assert.ok(blockLines(zeros.block).length > 0, '0 不是「关闭注入」：回落默认后照常注入（既有语义不变）')
+})
+
+// ---------------------------------------------------------------- 配置面与 DEFAULTS 一致性（变异测试补盲）
+
+test('配置面：Schema 里每个键的默认值必须逐键等于 DEFAULTS（含 recallTopK=8）', () => {
+  // 变异测试发现「把 recallTopK 的 Schema 默认值从 8 改成 5」没有任何测试察觉。
+  // 这类漂移是系统性的，所以这里不做单点断言，而是**逐键比对**：
+  // Schema 里有默认值、DEFAULTS 里也有该键 ⇒ 两者必须相等。
+  const parsed = Config!({}) as unknown as Record<string, unknown>
+  const readValue = (value: unknown): unknown =>
+    value !== null && typeof value === 'object' && typeof (value as { get?: unknown }).get === 'function'
+      ? (value as { get: () => unknown }).get()
+      : value
+  const schemaKeys = Object.keys(parsed)
+  const shared = schemaKeys.filter((key) => Object.hasOwn(DEFAULTS, key))
+  const mismatched: string[] = []
+  for (const key of shared) {
+    const actual = readValue(parsed[key])
+    const expected = (DEFAULTS as unknown as Record<string, unknown>)[key]
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      mismatched.push(`${key}: Schema=${JSON.stringify(actual)} DEFAULTS=${JSON.stringify(expected)}`)
+    }
+  }
+  assert.deepEqual(mismatched, [], 'Schema 默认值与 DEFAULTS 必须逐键一致（不一致会让 patch 行与文档两套真相）')
+
+  // 防"静默删键"：Schema 暴露的键数是被钉住的（新增键要同步本行与 README 配置表）
+  assert.equal(schemaKeys.length, 42, 'Schema 键数变化时必须同步本测试与两份 README 的配置表')
+  assert.equal(shared.length, 42, 'Schema 里的每个键都必须在 DEFAULTS 里有对应默认值')
+  // 抽查两个高频旋钮（回归锚点）
+  assert.equal(readValue(parsed.recallTopK), 8, 'recallTopK 的 Schema 默认值必须是 8')
+  assert.equal(readValue(parsed.maxInjectedTokens), DEFAULTS.maxInjectedTokens, '常驻注入硬上限的默认值必须与 DEFAULTS 一致')
 })

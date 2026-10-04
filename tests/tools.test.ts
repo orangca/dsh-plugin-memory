@@ -645,3 +645,203 @@ test('隐私扫描：本仓真实发布内容在新判据下依然干净（回�
   assert.equal(result.scanned, files.length, '所有真实发布内容都要真的被扫过（含 source map）')
   assert.deepEqual(result.unavailable, [], '身份判据是注入的，这里不该有「没有扫」的判据')
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 变异测试工具（tools/mutate.ts）
+//
+// 为什么测它：这个工具是「测试自己够不够硬」的裁判，它一旦骗自己（把没跑成当被杀死、
+// 把目录过期当已变异、把副本污染当结果），整套体检数字就全是假的。所以这里钉住三件事：
+//   · 目录不许过期（每条 find 必须在真实文件里逐字节存在且只出现一次）；
+//   · 抽样必须可复现（同种子同批）；
+//   · 端到端用**玩具仓库**验证判定与退出码 —— 不跑真实仓库（那样一次几十秒，测试会变成负担）。
+//
+// 整段追加在文件末尾：既有用例的断言一条都没改（ESM 的 import 声明会提升，写在后面同样生效）。
+
+import { applyMutation, mutationCatalogue, parseArgs, runMutationTesting, sampleMutations } from '../tools/mutate.ts'
+import type { Mutation } from '../tools/mutate.ts'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
+
+test('applyMutation：精确替换第一处；多行 find 也命中；找不到 find 必须抛错', () => {
+  const base = (over: Partial<Mutation>): Mutation => ({
+    id: 'probe',
+    file: 'src/probe.ts',
+    find: 'foo',
+    replace: 'bar',
+    note: '探针',
+    ...over,
+  })
+
+  assert.equal(applyMutation('foo foo foo', base({})), 'bar foo foo', '只替换第一处')
+  assert.equal(applyMutation('前缀 foo 后缀', base({})), '前缀 bar 后缀')
+  assert.equal(applyMutation('x\ny z\n', base({ find: 'x\ny', replace: 'X\nY' })), 'X\nY z\n', '多行 find 也要能命中')
+  assert.equal(applyMutation('没变', base({ find: '没变', replace: '没变' })), '没变')
+
+  // 找不到 find ⇒ 抛错，绝不静默返回原文当「已变异」（那样跑出来的全绿是没改过代码的成绩单）
+  assert.throws(() => applyMutation('别的文本', base({ id: 'missing-entry' })), /missing-entry/u, '报错要点名是哪条变异')
+  assert.throws(() => applyMutation('别的文本', base({ id: 'missing-entry', file: 'src/lib.ts' })), /src\/lib\.ts/u, '报错要能定位到文件')
+})
+
+test('mutationCatalogue：id 唯一、note 非空；每条 find 在真实仓库文件里恰好出现一次（防目录过期）', () => {
+  // 在变异副本里跑测试时，`DSH_MUTATE_SOURCE_REPO` 指向**未变异**的原仓库：
+  // 否则任何一条变异都会先把这条断言弄红 —— 于是所有变异都被误判成「被杀死」，
+  // 裁判自己把观测搅浑。正常跑测试时它不存在，就用当前仓库。
+  const repoRoot = process.env.DSH_MUTATE_SOURCE_REPO ?? join(dirname(fileURLToPath(import.meta.url)), '..')
+  const catalogue = mutationCatalogue()
+
+  assert.ok(catalogue.length >= 20 && catalogue.length <= 30, `目录应在 20–30 条之间，实际 ${catalogue.length} 条`)
+  assert.equal(new Set(catalogue.map((mutation) => mutation.id)).size, catalogue.length, 'id 必须唯一（--only 靠它点名）')
+
+  for (const mutation of catalogue) {
+    assert.ok(mutation.note.trim().length > 0, `变异 ${mutation.id} 的 note 不能为空（存活项要靠它解释）`)
+    assert.notEqual(mutation.find, mutation.replace, `变异 ${mutation.id} 的替换必须真的改变内容`)
+    const text = readFileSync(join(repoRoot, mutation.file), 'utf8')
+    const occurrences = text.split(mutation.find).length - 1
+    assert.equal(
+      occurrences,
+      1,
+      `变异 ${mutation.id} 的 find 应在 ${mutation.file} 里恰好出现一次（实际 ${occurrences} 次）—— 目录过期要立刻发现`,
+    )
+  }
+})
+
+test('parseArgs：默认值、--limit（含 0 与非法值）、--seed、--only、--list、--json、--keep', () => {
+  assert.deepEqual(
+    parseArgs([]),
+    { limit: 8, seed: 20261004, only: null, list: false, json: false, keep: false },
+    '默认抽样 8 条、种子固定（可复现）',
+  )
+  assert.equal(parseArgs(['--limit', '3']).limit, 3)
+  assert.equal(parseArgs(['--limit', '0']).limit, 0, '0 = 不抽样、跑整个目录（不是默认值）')
+  assert.equal(parseArgs(['--limit', 'abc']).limit, 8, '非法值回落默认，绝不把 NaN 当「跑 0 条」')
+  assert.equal(parseArgs(['--limit', '-2']).limit, 8, '负数非法')
+  assert.equal(parseArgs(['--limit', '2.5']).limit, 8, '小数非法')
+  assert.equal(parseArgs(['--limit']).limit, 8, '缺值同样回落默认')
+  assert.equal(parseArgs(['--seed', '7']).seed, 7)
+  assert.equal(parseArgs(['--seed', 'oops']).seed, 20261004, '种子非法时回落固定默认值')
+  assert.equal(parseArgs(['--only', 'recall-limit-floor']).only, 'recall-limit-floor')
+  assert.equal(parseArgs(['--only']).only, null, '--only 缺值＝没指定')
+  assert.equal(parseArgs(['--list']).list, true)
+  assert.equal(parseArgs(['--json']).json, true)
+  assert.equal(parseArgs(['--keep']).keep, true)
+  // 未知参数忽略（与仓库既有 tools/*.ts 一致），且不妨碍它后面的参数
+  assert.equal(parseArgs(['--unknown', '--limit', '4']).limit, 4)
+})
+
+test('sampleMutations：同 (limit, seed) 抽到同一批；换种子换一批；limit 0 或超过目录 ⇒ 整份目录', () => {
+  const catalogue = mutationCatalogue()
+  const first = sampleMutations(catalogue, 6, 20261004).map((mutation) => mutation.id)
+  const again = sampleMutations(catalogue, 6, 20261004).map((mutation) => mutation.id)
+  const other = sampleMutations(catalogue, 6, 1).map((mutation) => mutation.id)
+
+  assert.equal(first.length, 6)
+  assert.deepEqual(first, again, '同一条命令每次必须抽到同一批（报告数字才可复现）')
+  assert.notDeepEqual(other, first, '换种子应当换一批，而不是照抄目录前 6 条')
+  assert.deepEqual(
+    sampleMutations(catalogue, 0, 1).map((mutation) => mutation.id),
+    catalogue.map((mutation) => mutation.id),
+    'limit 0 = 整份目录',
+  )
+  assert.equal(sampleMutations(catalogue, catalogue.length + 5, 1).length, catalogue.length)
+})
+
+/** 造一个纯 JS 的玩具仓库：一个 src + 一个会红/会绿的假测试（这里只验证「改一处 → 跑测试 → 判定」链路）。 */
+function makeToyRepo(root: string): string {
+  mkdirSync(join(root, 'src'), { recursive: true })
+  mkdirSync(join(root, 'tests'), { recursive: true })
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'dsh-mutate-toy', version: '0.0.0', type: 'module' }), 'utf8')
+  const source = join(root, 'src', 'value.js')
+  writeFileSync(
+    source,
+    [
+      'export function add(a, b) {',
+      '  return a + b',
+      '}',
+      '',
+      'export const UNUSED = 1',
+      '',
+      'export function double(x) {',
+      '  return x * 2',
+      '}',
+      '',
+    ].join('\n'),
+    'utf8',
+  )
+  writeFileSync(
+    join(root, 'tests', 'toy.test.js'),
+    [
+      "import { test } from 'node:test'",
+      "import assert from 'node:assert/strict'",
+      "import { add, double } from '../src/value.js'",
+      '',
+      "test('add', () => { assert.equal(add(1, 1), 2) })",
+      "test('double', () => { assert.equal(double(3), 6) })",
+      '',
+    ].join('\n'),
+    'utf8',
+  )
+  return source
+}
+
+test('runMutationTesting：玩具仓库端到端 —— 必被杀死 / 必存活 / 退出码 / 不碰原仓库 / 收尾清理', () => {
+  const outer = mkdtempSync(join(tmpdir(), 'dsh-mutate-e2e-'))
+  try {
+    const repo = join(outer, 'toy')
+    const sourcePath = makeToyRepo(repo)
+    const original = readFileSync(sourcePath, 'utf8')
+    const workRoot = join(outer, 'work')
+    const testCommand = { command: process.execPath, args: ['--test', 'tests/toy.test.js'] }
+    const killed: Mutation = {
+      id: 'toy-killed',
+      file: 'src/value.js',
+      find: '  return a + b',
+      replace: '  return a - b',
+      note: '加法改成减法：假测试必须红',
+    }
+    const survived: Mutation = {
+      id: 'toy-survived',
+      file: 'src/value.js',
+      find: 'export const UNUSED = 1',
+      replace: 'export const UNUSED = 2',
+      note: '没人引用的常量：假测试照样全绿',
+    }
+
+    // ① 一条必被杀死 + 一条必存活：判定、计数、退出码都要对
+    const both = runMutationTesting({ repo, mutations: [killed, survived], build: null, test: testCommand, workRoot })
+    assert.equal(both.error, null, `不该有环境问题：${both.error}`)
+    assert.deepEqual(both.outcomes.map((outcome) => outcome.verdict), ['killed', 'survived'])
+    assert.equal(both.tried, 2)
+    assert.equal(both.killed, 1)
+    assert.equal(both.survived, 1)
+    assert.equal(both.buildErrors, 0)
+    assert.notEqual(both.exitCode, 0, '存在存活 ⇒ 非零（体检不合格的信号）')
+    assert.equal(both.workdir, null, '默认不保留副本')
+    assert.ok(both.outcomes[0]!.detail.length > 0, '被杀死的那条要带上失败证据')
+    assert.ok(both.outcomes[1]!.detail.includes('全绿'), `存活的那条要说明「测试仍全绿」：${both.outcomes[1]!.detail}`)
+    assert.deepEqual(readdirSync(workRoot), [], '跑完必须把副本清掉（只留空的工作目录）')
+
+    // ② 只跑「必被杀死」的那条：全部被杀死 ⇒ 退出码 0
+    const allKilled = runMutationTesting({ repo, mutations: [killed], build: null, test: testCommand, workRoot })
+    assert.equal(allKilled.killed, 1)
+    assert.equal(allKilled.survived, 0)
+    assert.equal(allKilled.exitCode, 0, '全部被杀死 ⇒ 0')
+    assert.deepEqual(readdirSync(workRoot), [], '这一次同样要清干净')
+
+    // ③ 绝不改原仓库（工具只在副本里改文件）
+    assert.equal(readFileSync(sourcePath, 'utf8'), original, '原仓库的源文件必须逐字节不变')
+
+    // ④ --keep：保留副本以便排查，而且仍然不碰原仓库
+    const kept = runMutationTesting({ repo, mutations: [survived], build: null, test: testCommand, workRoot, keep: true })
+    assert.equal(kept.kept, true)
+    assert.ok(kept.workdir !== null && existsSync(kept.workdir), '--keep 时副本要留在硬盘上')
+    // 副本根里除了每条的副本目录，还有这条命令的日志（1-test.log）：按「含有源文件」筛出副本。
+    const keptCopies = readdirSync(kept.workdir).filter((name) => existsSync(join(kept.workdir!, name, 'src', 'value.js')))
+    assert.equal(keptCopies.length, 1, '--keep 时这条变异的副本应当留着（正好一份）')
+    const keptSource = join(kept.workdir, keptCopies[0]!, 'src', 'value.js')
+    assert.ok(existsSync(keptSource), `保留的副本里要有源文件：${keptSource}`)
+    assert.ok(readFileSync(keptSource, 'utf8').includes('UNUSED = 2'), '副本里应当真的是变异后的文件')
+    assert.equal(readFileSync(sourcePath, 'utf8'), original, '保留副本也不能碰原仓库')
+    rmSync(kept.workdir, { recursive: true, force: true })
+  } finally {
+    rmSync(outer, { recursive: true, force: true })
+  }
+})

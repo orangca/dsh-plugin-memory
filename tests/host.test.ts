@@ -6469,3 +6469,366 @@ test('host#139 变异测试补盲：/memory audit --verify 读日志失败必须
 //     非 agent_self 的写入只剩 `status: 'created'`（agent_self 在计划层已被排除、宿主侧还有一道闸）。
 //     唯一能观察到差异的路径被上面两道闸门切断。
 //     可达的那一半（库里已有同指纹 ⇒ 第二个回合补录 0 条、计数不动）由既有用例 **host#31** 钉住。
+
+// ================================================================ 第三轮变异测试（端到端）
+//
+// 靶区（前两轮没打的）：整合三件套（合并 / 冲突失效 / 衰减归档 + 规则式摘要）的相互作用与幂等性、
+// `/memory import` 的端到端白名单与指纹去重、`memory_maintain` / `/memory consolidate` 的统计口径
+// （last 是本次、totals 是累计），以及治理命令 / 定时 / 启动三条路径与整合的一致性。
+// 每一条用例都对应一处「在原仓库里改坏了、但既有全量仍然全绿」的变异（逐条对应见文末备注）。
+//
+// 夹具约定：`memory().list()` 返回的是**库内活对象**（协议 v1.1 §1 的冻结行为），
+// 因此改写 `observedAt` / `useCount` 与既有用例（如 `seedFourStatuses`）同一手法；数值都取「今天」，
+// 避免顺手被衰减归档判定卷进去。
+
+/**
+ * 一对「同 kind/scope/subject、正文高度包含」的条目 —— 整合时必成一个合并组（高重要度者为领头）。
+ *
+ * 两条的 `observedAt` / `useCount` / `confidence` 刻意错开，用来钉住「领头者聚合了被吸收条目的哪些字段」。
+ */
+const seedMergePair = async (harness: Harness): Promise<{ leadId: string; extraId: string; extraObservedAt: number }> => {
+  const now = Date.now()
+  const write = async (text: string, importance: number, confidence: number): Promise<string> => {
+    const result = await harness.memory().write({
+      kind: 'semantic', text, subject: 'merge.probe', origin: 'observed', importance, confidence,
+    })
+    assert.equal(result.ok, true, `前提：合并组条目写入成功（${String(result.error)}）`)
+    return String(result.id)
+  }
+  const leadId = await write('构建流程统一用 pnpm 并且产物输出到 dist 目录', 0.9, 0.5)
+  const extraId = await write('构建流程统一用 pnpm 并且产物输出到 dist 目录下', 0.3, 0.8)
+  const rows = harness.memory().list()
+  const lead = rows.find((row) => row.id === leadId)!
+  const extra = rows.find((row) => row.id === extraId)!
+  lead.observedAt = now - 60_000
+  lead.useCount = 2
+  const extraObservedAt = now - 1_000
+  extra.observedAt = extraObservedAt
+  extra.useCount = 3
+  return { leadId, extraId, extraObservedAt }
+}
+
+/** 一年前、重要度极低的条目 —— 衰减归档的必然目标（播种手法与 host#87 相同）。 */
+const seedArchivable = async (harness: Harness): Promise<string> => {
+  const result = await harness.memory().write({
+    kind: 'semantic', text: '一年前定下的临时约定：这条已经衰减到该归档的程度。',
+    subject: 'decay.probe', origin: 'observed', importance: 0.05,
+  })
+  assert.equal(result.ok, true, `前提：可归档条目写入成功（${String(result.error)}）`)
+  const row = harness.memory().list().find((entry) => entry.id === result.id)!
+  row.observedAt = Date.now() - 400 * 86_400_000
+  row.lastUsedAt = null
+  return String(result.id)
+}
+
+/**
+ * 一对「同 (kind, scope, subject, field) 但 value 不同、正文不相近」的条目 —— 冲突判定的目标。
+ *
+ * `olderIsUserSide = true` 时把**较旧的败者**标成用户侧来源（用户早就说过、后来模型又观察到一条），
+ * 这正是唯一被禁止的自动推翻。返回 id 时顺序固定：`winnerId` 是较新的那条。
+ */
+const seedConflictPair = async (
+  harness: Harness,
+  subject: string,
+  texts: readonly [string, string],
+  olderIsUserSide: boolean,
+): Promise<{ winnerId: string; loserId: string }> => {
+  const now = Date.now()
+  const write = async (text: string, value: string, origin: 'observed' | 'user_explicit', observedAt: number): Promise<string> => {
+    const result = await harness.memory().write({
+      kind: 'semantic', text, subject, field: 'mode', value, origin, importance: 0.5,
+    })
+    assert.equal(result.ok, true, `前提：冲突条目写入成功（${String(result.error)}）`)
+    harness.memory().list().find((entry) => entry.id === result.id)!.observedAt = observedAt
+    return String(result.id)
+  }
+  const loserId = await write(texts[1], 'b', olderIsUserSide ? 'user_explicit' : 'observed', now - 60_000)
+  const winnerId = await write(texts[0], 'a', 'observed', now - 1_000)
+  return { winnerId, loserId }
+}
+
+test('host#140 变异测试补盲：整合的合并聚合与落盘、计数口径、以及第二次幂等（B1–B8）', async (t) => {
+  const harness = makeHarness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const pair = await seedMergePair(harness)
+  const decayId = await seedArchivable(harness)
+
+  const first = await harness.runCommand('consolidate')
+  assert.equal(first.kind, 'success', first.text)
+  assert.match(first.text, /整合完成：合并 1，冲突失效 0，归档 1，摘要 0，耗时 \d+ms/u,
+    `本次三种结果都要如实计数：${first.text}`)
+
+  const rows = harness.memory().list()
+  const lead = rows.find((row) => row.id === pair.leadId)!
+  const extra = rows.find((row) => row.id === pair.extraId)!
+  assert.equal(extra.status, 'archived', '被吸收的重复条目归档（不删除）')
+  assert.equal(rows.find((row) => row.id === decayId)!.status, 'archived', '衰减到该归档的条目归档')
+  assert.equal(lead.status, 'active', '领头者仍是 active')
+  assert.equal(lead.useCount, 5, '领头者必须聚合被吸收条目的 useCount（2+3）')
+  assert.equal(lead.confidence, 0.8, 'confidence 取两者较大值')
+  assert.equal(lead.observedAt, pair.extraObservedAt, 'observedAt 取两者较大值')
+  assert.equal(extra.useCount, 3, '被吸收条目自身不再被改写')
+
+  // 落盘：领头者被聚合后必须写回领域表（新建时 1 次 + 整合回写 1 次）
+  const leadPuts = harness.domain.puts.filter((put) => put.key === pair.leadId).length
+  assert.equal(leadPuts, 2, `聚合后的新值必须落到盘上（put 次数=${leadPuts}）`)
+
+  const actions = (harness.reportState().audit as Json).actions as Json
+  assert.equal(Number(actions.merged), 1, '整合吸收按 merged 推一条审计（与 summary 同口径）')
+  assert.equal(Number(actions.archived), 1, '衰减归档按 archived 推一条审计')
+
+  // 幂等：第二次没有可整合的东西，必须逐项报 0；累计计数保持第一次的值
+  const second = await harness.runCommand('consolidate')
+  assert.match(second.text, /整合完成：合并 0，冲突失效 0，归档 0，摘要 0/u,
+    `第二次不得再动任何条目：${second.text}`)
+  const totals = harness.reportState().consolidate as Json
+  assert.equal(Number(totals.runs), 2, '两次 consolidate 各计入一次 runs')
+  assert.equal(Number(totals.merged), 1, 'totals 是累计：第二次的 0 不能覆盖第一次的 1')
+})
+
+test('host#141 变异测试补盲：冲突只失效该失效的，模型侧不得推翻用户侧（B6）', async (t) => {
+  const harness = makeHarness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const trueConflict = await seedConflictPair(harness, 'conflict.probe', [
+    '构建流程走 gulp 并且产物落在 out 目录。',
+    '数据库迁移统一用 goose，连接串从环境变量读。',
+  ], false)
+  const blocked = await seedConflictPair(harness, 'blocked.probe', [
+    '时区统一按 Asia/Shanghai 处理并写进日志。',
+    '发布流程统一走 npm publish，并且打上 git tag。',
+  ], true)
+
+  const out = await harness.runCommand('consolidate')
+  assert.match(out.text, /整合完成：合并 0，冲突失效 1，归档 0，摘要 0/u,
+    `只有非用户侧的那一组该失效；被拦下的那组不能计数：${out.text}`)
+
+  const rows = harness.memory().list()
+  const row = (id: string): Json => rows.find((entry) => entry.id === id)!
+
+  const loser = row(trueConflict.loserId)
+  assert.equal(loser.status, 'invalid', '较旧的败者置 invalid（可恢复、不删除）')
+  assert.equal(typeof loser.invalidAt, 'number', '失效必须记下 invalidAt')
+  assert.ok(Number(loser.invalidAt) > 0, 'invalidAt 必须是真实时间戳')
+  assert.deepEqual(row(trueConflict.winnerId).supersedes, [trueConflict.loserId], '胜者必须记下它推翻了谁')
+
+  const userSide = row(blocked.loserId)
+  assert.equal(userSide.status, 'active', '模型侧的观察不得推翻用户侧条目')
+  assert.equal(userSide.invalidAt, null, '被拦下的冲突不得写 invalidAt')
+  assert.deepEqual(row(blocked.winnerId).supersedes, [], '被拦下的冲突不得留下推翻链')
+  assert.equal(row(blocked.winnerId).status, 'active')
+
+  const actions = (harness.reportState().audit as Json).actions as Json
+  assert.equal(Number(actions.invalidated), 1, '被拦下的冲突不推 invalidated')
+})
+
+test('host#142 变异测试补盲：同主题超阈值时整合生成带 .summary 主题的规则式摘要（B10 / C6）', async (t) => {
+  const harness = makeHarness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 同一 subject 下 6 条**正文互不相近**的条目（不相近 ⇒ 不会被合并吃掉，桶里仍是 6 条）
+  const texts = [
+    '发布前先跑完整的单元测试套件',
+    '数据库迁移统一使用 goose 工具',
+    '日志输出为 JSON 格式并按天轮转',
+    '接口错误码集中定义在 errors 模块',
+    '前端资源统一走 CDN 并开启长缓存',
+    '后台任务全部通过队列异步执行',
+  ]
+  for (const text of texts) {
+    const written = await harness.memory().write({ kind: 'semantic', text, subject: 'summary.probe', origin: 'observed', importance: 0.9 })
+    assert.equal(written.ok, true, `前提：摘要桶条目写入成功（${String(written.error)}）`)
+  }
+
+  const out = await harness.runCommand('consolidate')
+  assert.match(out.text, /摘要 1/u, `6 条同主题（默认 summarizeAbove=5）必须合成 1 条摘要：${out.text}`)
+
+  const summaries = harness.memory().list()
+    .filter((row) => (Array.isArray(row.tags) ? row.tags : []).includes('summary'))
+  assert.equal(summaries.length, 1, '摘要条目必须带 summary 标签 —— 那是「不再参与后续整合」的标记')
+  const summary = summaries[0]!
+  assert.equal(summary.subject, 'summary.probe.summary', '摘要主题必须带 .summary 后缀')
+  assert.match(String(summary.text), /关于 summary\.probe 的既有记录（6 条）/u, `摘要正文要能自证来源与规模：${String(summary.text)}`)
+})
+
+test('host#143 变异测试补盲：memory_maintain 的 last 是本次、totals 是累计且不串字段（C1–C5）', async (t) => {
+  const harness = makeHarness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  await seedMergePair(harness)
+
+  const raw = JSON.parse(String(await harness.tool('memory_maintain').execute({}))) as Json
+  assert.equal(raw.ok, true)
+  const last = raw.last as Json
+  assert.ok(last, '必须回报**本次**整合的摘要（不是 null，也不是上一次的）')
+  assert.equal(last.reason, 'manual', '手动工具的 reason 必须是 manual')
+  assert.equal(last.merged, 1, '本次合并 1 条')
+  assert.equal(last.invalidated, 0)
+  assert.equal(last.archived, 0)
+  assert.equal(last.summarized, 0)
+
+  const totals = raw.totals as Json
+  assert.equal(totals.runs, 1)
+  assert.equal(totals.merged, 1)
+  assert.equal(totals.archived, 0)
+  assert.equal(totals.invalidated, 0, 'totals 按字段对号入座，不能串到 merged')
+  assert.equal(totals.summarized, 0)
+})
+
+test('host#144 变异测试补盲：/memory import 的指纹去重与计数分流（A9 / A10）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const file = join(harness.tempDir, 'import-twice.json')
+  writeFileSync(file, JSON.stringify({
+    schemaVersion: 1,
+    items: [
+      { kind: 'semantic', text: '构建流程统一使用 pnpm 并把产物输出到 dist 目录', importance: 0.8 },
+      { kind: 'procedural', text: '发布前先跑一遍完整的单元测试套件', importance: 0.7 },
+    ],
+  }))
+
+  const first = await harness.runCommand(`import ${file}`)
+  assert.match(first.text, /新建 2 条，跳过\/合并 0 条/u, `首次导入全部新建：${first.text}`)
+
+  // 同指纹再导一次：writeMemory 走合并路径 ⇒ 既不是「新建」，也必须计入「跳过/合并」
+  const second = await harness.runCommand(`import ${file}`)
+  assert.match(second.text, /新建 0 条，跳过\/合并 2 条/u,
+    `再次导入同指纹必须如实报「跳过/合并」，而不是当成新建：${second.text}`)
+  assert.equal(harness.memory().list().length, 2, '重复导入不得留下第二条同指纹记录')
+})
+
+test('host#145 变异测试补盲：/memory import 只认导出信封（{items}），裸数组不被当条目列表（A12）', async (t) => {
+  const harness = makeHarness()
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 导出写的是 `{ schemaVersion, exportedAt, domain, items }`（见 exportRecords）；裸数组不是导出文档。
+  const file = join(harness.tempDir, 'bare-array.json')
+  writeFileSync(file, JSON.stringify([{ kind: 'semantic', text: '裸数组里的条目不该被导入长期记忆' }]))
+
+  const out = await harness.runCommand(`import ${file}`)
+  assert.equal(out.kind, 'success', out.text)
+  assert.match(out.text, /新建 0 条/u, `不是导出文档就一条都不该新建：${out.text}`)
+  assert.equal(harness.memory().list().length, 0, '裸数组不得被当成条目列表导入')
+})
+
+test('host#146 变异测试补盲：定时路径与手动整合同源，且受 consolidateEnabled 控制（D3）', async (t) => {
+  const realSetInterval = globalThis.setInterval
+  const timers: Array<() => void> = []
+  // 只捕获回调、不真的等 30 分钟：把全局 setInterval 换成记录器（作用域限定在 makeHarness 期间）
+  const capture = (): void => {
+    globalThis.setInterval = ((callback: () => void) => {
+      timers.push(callback)
+      return { unref: (): void => {} } as unknown as ReturnType<typeof setInterval>
+    }) as unknown as typeof setInterval
+  }
+  let disabled: Harness | null = null
+  let enabled: Harness | null = null
+  try {
+    // 水位都设成「刚刚整合过」：排除启动补跑，只留定时器回调这一条路径
+    capture()
+    disabled = makeHarness({
+      globalValue: { schemaVersion: 1, lastConsolidatedAt: Date.now() },
+      config: { consolidateEnabled: false },
+    })
+    capture()
+    enabled = makeHarness({
+      globalValue: { schemaVersion: 1, lastConsolidatedAt: Date.now() },
+      config: { consolidateEnabled: true },
+    })
+  } finally {
+    globalThis.setInterval = realSetInterval
+  }
+  t.after(async () => {
+    await disabled?.dispose()
+    await enabled?.dispose()
+  })
+
+  assert.equal(timers.length, 2, '每台实例各注册一个整合定时器')
+  await enabled.settle()
+  await disabled.settle()
+  assert.equal(Number((disabled.reportState().consolidate as Json).runs), 0, '前提：关闭状态下启动也不补跑')
+
+  timers[0]!() // 关闭的那台
+  timers[1]!() // 打开的那台
+  await enabled.settle()
+  await disabled.settle()
+
+  assert.equal(Number((disabled.reportState().consolidate as Json).runs), 0,
+    'consolidateEnabled=false 时到点必须什么都不做')
+  const onState = enabled.reportState().consolidate as Json
+  assert.equal(Number(onState.runs), 1, '到点必须真的整合一次')
+  assert.equal((onState.last as Json).reason, 'interval', '定时路径必须与手动路径区分（reason=interval）')
+})
+
+test('host#147 变异测试补盲：水位过期时的启动补跑走 startup 路径（D1）', async (t) => {
+  const harness = makeHarness({
+    globalValue: { schemaVersion: 1, lastConsolidatedAt: Date.now() - 3_600_000 },
+    config: { consolidateIntervalMinutes: 30 },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const state = harness.reportState().consolidate as Json
+  assert.equal(Number(state.runs), 1, '水位过期 → 启动补跑一次整合')
+  assert.equal((state.last as Json).reason, 'startup', '启动补跑必须与手动 / 定时路径区分（reason=startup）')
+})
+
+test('host#148 变异测试补盲：整合重入锁 —— 重叠的第二次被跳过并计数（B12 / B13）', async (t) => {
+  const harness = makeHarness({ config: { consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  await seedMergePair(harness)
+
+  // 让第一次整合卡在「归档被吸收条目」的回写上：此刻它正在跑，重入锁已置位
+  harness.domain.gatePuts = true
+  const first = harness.runCommand('consolidate')
+  await harness.settle()
+  const second = await harness.runCommand('consolidate')
+  assert.equal(second.kind, 'success', second.text)
+  harness.domain.releasePuts()
+  await first
+  await harness.settle()
+
+  const state = harness.reportState().consolidate as Json
+  assert.equal(Number(state.runs), 1, '重叠的那一次不得真的跑第二轮整合')
+  assert.equal(Number(state.skipped), 1, '被重入锁挡下的那次必须计数（否则「整合好像没跑」无从解释）')
+  assert.equal(harness.memory().list().filter((row) => row.status === 'archived').length, 1, '不得重复归档/重复吸收')
+})
+
+test('host#149 变异测试补盲：预算显式写成 null（＝未设置）时回落到默认，而不是 0（B11）', async (t) => {
+  // `cfg = { ...DEFAULTS, ...unwrapConfig(config) }`：配置里的 null 会覆盖 DEFAULTS，
+  // 因此「预算」这类可选项必须靠 `?? 默认值` 兜底。兜底一旦写成 0，整合会立刻 break ——
+  // 一次「什么都没做」的静默整合，比报错更难发现。
+  const harness = makeHarness({ config: { consolidateEnabled: false, consolidateMaxRecords: null } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  await seedMergePair(harness)
+
+  const out = await harness.runCommand('consolidate')
+  assert.match(out.text, /整合完成：合并 1，冲突失效 0，归档 0，摘要 0/u,
+    `显式 null 预算必须回落到默认值（否则整轮整合被 0 预算掐死）：${out.text}`)
+  assert.equal(harness.memory().list().filter((row) => row.status === 'archived').length, 1, '被吸收条目照常归档')
+})
+
+// ---------------------------------------------------------------- 第三轮存活但**不补**的变异（如实说明）
+//
+// 这一轮另有 1 处破坏在副本里跑完全量（含本轮新增用例）仍旧全绿，经逐条查证属于
+// 「改坏了也观察不到」，不是测试缺口，因此**没有**为它新增断言：
+//
+//   · B9 —— 把整合第 4 步的 `if (result.ok) summary.summarized += 1` 改成无条件自增。
+//     要让两者出现差异，`writeMemory` 必须对一条**规则生成的 observed 摘要**返回 `ok:false`；
+//     而 `writeMemory` 里所有 `ok:false` 分支在这条路径上都不可达：
+//       · 审批门与回声门、`rejectedHashes`（`/memory reject` 登记的指纹）都只对
+//         `origin === 'model_proposed'` 生效（`decideModelWrite` 对非模型来源直接 'apply'），而摘要是 `observed`；
+//       · `rejected_invalid`（空正文）不可能：kind/scope/subject/text 全由 `composeSubjectSummary` 生成且非空；
+//       · 同指纹第二次只会走 `status:'merged'`（`ok` 仍为 true）；
+//       · 只剩 `rejected_sensitive` —— 摘要正文取自已经通过同一套扫描入库的条目，要靠跨条目的
+//         `；` 拼接恰好拼出一个敏感模式才可能命中，那是人为构造而非真实调用路径。
+//     换句话说这是一处**等价变异**（在可达输入上不可观察），故不补。

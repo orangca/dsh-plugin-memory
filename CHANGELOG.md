@@ -3,6 +3,54 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.24 — 2026-10-04
+
+Four tracks at once: the mutation testing that found the last two rounds' blind spots became a standing tool, the
+release process that tripped us three times became written rules, and two more mutation rounds went after the areas
+nobody had aimed at.
+
+### Added
+
+- **`pnpm mutate`** — mutation testing as a repeatable check (`tools/mutate.ts`, zero dependencies). It breaks the
+  implementation in a small plausible way, runs the whole suite in a scratch copy, and reports what survived:
+  `killed` means the suite noticed, `survived` means a blind spot. A curated 29-entry catalogue, deterministic
+  sampling (`--limit` / `--seed`), `--only <id>` to re-check a single mutation, `--keep` to inspect the copy, and
+  exit codes that mean something (0 = everything killed, 1 = survivors, 2 = environment problem). `pnpm mutate:full`
+  runs the whole catalogue in ~67 s.
+- **`CONTRIBUTING.md` now documents the release checklist** — patch-only version bumps, the six gates, verifying
+  `lib/` is in sync with `src/`, **creating the tag locally before pushing anything**, and finishing by checking
+  three-way consistency (main's local/remote SHA, the tag's target, the installed profile version).
+- **A table of the three push failures we actually hit**, because the first two looked identical and were not:
+  a reset can be GitHub's push protection rejecting the commit (surfaced by forcing HTTP/1.1), a 443 timeout is a
+  real network outage, and `src refspec does not match any` means the tag was never created locally. It also records
+  that this repository pins `http.version=HTTP/1.1`, precisely so a rejection cannot hide behind a transport error.
+- **The mutation tool found two real blind spots in its first run**, and both are now closed:
+  - `pickMergeGroups` fell back to a hard-coded `0.85` while `DEFAULTS.mergeSimilarity` is `0.7` — changing one to
+    the other changed behaviour with nothing objecting. The fallback now uses `DEFAULTS` (internal callers always
+    pass a complete config, so nothing user-visible changes) and a test pins it.
+  - **No test asserted the `Config` schema's default values at all.** There is now a systemic check that every key
+    the schema exposes has a default equal to `DEFAULTS`, which kills a whole class of drift rather than the one
+    instance — plus a pin on the schema's key count, so silently dropping a key fails too. Both former escapees are
+    in the catalogue and are killed.
+
+### Changed (tests only, apart from the fallback above)
+
+- Third mutation round, pure layer: 40 breaks tried, 16 killed by existing tests, **23 survivors → 23 killed** with
+  14 new cases (lib 228 → 243). Targets: which fields feed the search token set (`subject`/`tags` in, `field`/`value`
+  out, separators required), the capture-signal matrix (all seven rows, every wording, priority order, quota
+  ordering), `deriveOriginFromMessages` refusing to trust structurally broken input, `defaultScopeFor`'s full enum,
+  and `makeRecord`'s structural defaults.
+- Third mutation round, host: 41 breaks tried, 40 killed — **28 of them by 10 new cases** (host 149 → 159).
+  Targets: the consolidation trio's interactions (merge leader aggregation and write-back, the conflict gate that
+  must not let the model overturn user-side rows, rule-based summaries, idempotency, the re-entrancy lock, the
+  budget fallback), `/memory import`'s whitelist end to end (forged origins downgraded, numbers clamped, invalid
+  rows skipped and counted, fingerprint dedupe), and the startup/interval paths.
+- One survivor is documented rather than papered over: an unconditional counter increment in the summary step is
+  equivalent on any reachable input, because every failure branch that could make it differ is gated on
+  `model_proposed` and summaries are `observed`. The reasoning is in the test file.
+
+Suite: **467 → 498**.
+
 ## 0.5.23 — 2026-10-04
 
 **Mutation testing, round two** — aimed at the four large functions round one deliberately skipped because their
