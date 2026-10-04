@@ -3,6 +3,57 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.27 — 2026-10-04
+
+**Simplification: fewer settings, fewer commands, same capabilities.** The user asked for less configuration, less
+manual intervention and fewer commands. The rule applied throughout: **capability is not removed, only moved out of
+sight.** No command implementation was deleted, no default value changed, and the schema is untouched.
+
+### Settings: the form went from 30 fields to 8
+
+Kept on the settings page: the store name, automatic capture, injection mode, the write approval gate, model-visible
+language, the self-portrait switch, branch awareness, and the idle-review switch (it spends tokens, so it stays
+visible and switchable).
+
+The other 22 knobs (`maxInjectedTokens`, `maxItemTokens`, `recallTopK`, `captureMaxPerTurn`, both consolidation keys,
+the seven self-portrait tuning keys, the three first-run keys, `sleepSessions`, `sleepMaxBackfill`, `refsEnabled`,
+`refsMax`, `pendingMax`, `auditMax`) now live on the patch row only. **They are still `volatile`**, so patch-row edits
+keep applying without a restart — the invariant changed from "form fields ≡ volatile fields" to "form fields ⊆
+volatile fields", which a test now pins along with the exact eight. The bilingual dictionaries shrank from 81 keys
+each to 33, so no dead strings are left behind.
+
+### Commands: a daily six plus `/memory admin`
+
+`/memory help` now lists six entries and one line pointing at `admin`: `/memory` (an overview: store, counts, pending,
+a one-line self-portrait, language), `/memory search`, `/memory forget`, `/memory self`, `/sleep`, `/memory help`.
+The other twenty subcommands (`list`, `show`, `stats`, `pending`, `approve`, `reject-pending`, `export`, `import`,
+`clear`, `consolidate`, `branch`, `trace`, `verify`, `audit`, `pin`, `archive`, `restore`, `confirm`, `reject`,
+`refresh`) are reachable at `/memory admin <sub>` with their arguments unchanged.
+
+**Every old spelling still works** — `/memory pending`, `/memory approve <id>`, `/memory audit --verify`, `/memory
+trace …` route to the same handlers, so nothing breaks for existing users, scripts or tests. They are simply no
+longer listed anywhere, which is what makes the visible surface smaller. Every user-facing hint was repointed
+(an approval message now says `/memory admin approve <id>`; `trace` says `/memory admin trace …`).
+
+### Not done, deliberately
+
+- No commands deleted: the user explicitly declined the aggressive option, so capability stays.
+- Idle auto-review is **not** enabled by default. It would spend tokens unattended, and that is the user's call to
+  make, so `/sleep` remains manual.
+- No default value changed anywhere; this release only moves the visible surface.
+
+### Maintenance the trim forced
+
+- Four catalogue entries in `tools/mutate.ts` referenced client code the trim removed, which broke the
+  "every `find` string still exists exactly once" assertion. They now point at surviving lines and were re-verified
+  as killed one by one.
+- One entry (`cli-checkbox-checked`) was **removed with a comment**: the form no longer has a `kind: 'boolean'`
+  field, so the checkbox branch is unreachable from the form and no assertion can observe it being broken. Keeping it
+  would have made the health check report a permanent false survivor. The branch itself stays, and the comment says
+  to restore the entry together with a test if a boolean field ever returns.
+
+Suite: **528 → 534**.
+
 ## 0.5.26 — 2026-10-04
 
 Cleanup round: the mutation catalogue now covers everything the last three rounds found, the machine-readable output

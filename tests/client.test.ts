@@ -379,84 +379,36 @@ function makeClientFixture(): ClientFixture {
 // 这些是**客户端半边自己的契约**（不是从被测代码推出来的），所以能真正钉住字段目录、
 // 分组归属与 options；Schema 一侧再用 lib/index.js 的 Config.dict 交叉核对（不可解析时退化为字面量断言）。
 
-/** 客户端字段的界面顺序（src/client.ts 的 FIELDS）。 */
+/** 客户端字段的界面顺序（src/client.ts 的 FIELDS；精简后 8 个，见 docs/simplify.md §1）。 */
 const CLIENT_FIELD_ORDER: readonly string[] = [
   'domainName',
-  'maxInjectedTokens',
-  'maxItemTokens',
-  'selfPortraitMaxTokens',
-  'selfPortraitEnabled',
-  'selfPersonaMaxTokens',
-  'selfPortraitMergeThreshold',
-  'selfReflectEnabled',
-  'selfReflectEveryTurns',
-  'selfReflectMinTurn',
-  'selfReflectMaxPerSession',
-  'selfIntroEnabled',
-  'selfIntroMinTurn',
-  'selfIntroMaxAsks',
-  'recallMode',
-  'recallTopK',
   'captureMode',
-  'captureMaxPerTurn',
-  'consolidateEnabled',
-  'consolidateIntervalMinutes',
-  'sleepEnabled',
-  'sleepSessions',
-  'sleepMaxBackfill',
-  'refsEnabled',
-  'refsMax',
-  'branchAware',
+  'recallMode',
   'writePolicy',
-  'pendingMax',
   'language',
-  'auditMax',
+  'selfPortraitEnabled',
+  'branchAware',
+  'sleepEnabled',
 ]
 
-/** 每个字段归属的分组（与 FIELDS 逐条对应）。 */
+/** 每个字段归属的分组（与 FIELDS 逐条对应；分组收敛到 4 组）。 */
 const CLIENT_FIELD_GROUPS: Record<string, string> = {
   domainName: 'groupStore',
-  maxInjectedTokens: 'groupRecall',
-  maxItemTokens: 'groupRecall',
-  selfPortraitMaxTokens: 'groupRecall',
-  selfPortraitEnabled: 'groupRecall',
-  selfPersonaMaxTokens: 'groupRecall',
-  selfPortraitMergeThreshold: 'groupRecall',
-  selfReflectEnabled: 'groupRecall',
-  selfReflectEveryTurns: 'groupRecall',
-  selfReflectMinTurn: 'groupRecall',
-  selfReflectMaxPerSession: 'groupRecall',
-  selfIntroEnabled: 'groupRecall',
-  selfIntroMinTurn: 'groupRecall',
-  selfIntroMaxAsks: 'groupRecall',
-  recallMode: 'groupRecall',
-  recallTopK: 'groupRecall',
-  captureMode: 'groupCapture',
-  captureMaxPerTurn: 'groupCapture',
-  consolidateEnabled: 'groupConsolidate',
-  consolidateIntervalMinutes: 'groupConsolidate',
-  sleepEnabled: 'groupSleep',
-  sleepSessions: 'groupSleep',
-  sleepMaxBackfill: 'groupSleep',
-  refsEnabled: 'groupRecall',
-  refsMax: 'groupRecall',
-  branchAware: 'groupRecall',
+  captureMode: 'groupStore',
+  recallMode: 'groupStore',
   writePolicy: 'groupWrite',
-  pendingMax: 'groupWrite',
   language: 'groupLanguage',
-  auditMax: 'groupAudit',
+  selfPortraitEnabled: 'groupLanguage',
+  branchAware: 'groupOther',
+  sleepEnabled: 'groupOther',
 }
 
 /** 分组在卡片里的出现顺序（按 FIELDS 首次出现；同组只渲染一次）。 */
 const CLIENT_GROUP_ORDER: readonly string[] = [
   'groupStore',
-  'groupRecall',
-  'groupCapture',
-  'groupConsolidate',
-  'groupSleep',
   'groupWrite',
   'groupLanguage',
-  'groupAudit',
+  'groupOther',
 ]
 
 /** 枚举字段的界面 options：必须与 Host Schema 的 union 逐项一致。 */
@@ -470,38 +422,16 @@ const CLIENT_ENUM_OPTIONS: Record<string, readonly string[]> = {
 /** 字段的界面种类：text / number / 0-1 表达的布尔 / 复选框布尔 / 枚举。 */
 type FieldKind = 'text' | 'number' | 'bool01' | 'boolean' | 'enum'
 
-/** 每个字段的界面种类（与 FIELDS 的 kind + bool01 对应）。 */
+/** 每个字段的界面种类（与 FIELDS 的 kind + bool01 对应；精简后只剩这 8 个）。 */
 const CLIENT_FIELD_KINDS: Record<string, FieldKind> = {
   domainName: 'text',
-  maxInjectedTokens: 'number',
-  maxItemTokens: 'number',
-  selfPortraitMaxTokens: 'number',
-  selfPortraitEnabled: 'bool01',
-  selfPersonaMaxTokens: 'number',
-  selfPortraitMergeThreshold: 'number',
-  selfReflectEnabled: 'bool01',
-  selfReflectEveryTurns: 'number',
-  selfReflectMinTurn: 'number',
-  selfReflectMaxPerSession: 'number',
-  selfIntroEnabled: 'bool01',
-  selfIntroMinTurn: 'number',
-  selfIntroMaxAsks: 'number',
-  recallMode: 'enum',
-  recallTopK: 'number',
   captureMode: 'enum',
-  captureMaxPerTurn: 'number',
-  consolidateEnabled: 'boolean',
-  consolidateIntervalMinutes: 'number',
-  sleepEnabled: 'bool01',
-  sleepSessions: 'number',
-  sleepMaxBackfill: 'number',
-  refsEnabled: 'bool01',
-  refsMax: 'number',
-  branchAware: 'bool01',
+  recallMode: 'enum',
   writePolicy: 'enum',
-  pendingMax: 'number',
   language: 'enum',
-  auditMax: 'number',
+  selfPortraitEnabled: 'bool01',
+  branchAware: 'bool01',
+  sleepEnabled: 'bool01',
 }
 
 /** 每种界面种类在 Host Schema 里对应的类型。 */
@@ -603,36 +533,13 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
   assert.deepEqual(byName('domainName').parse('dsh_memory_v2'), { kind: 'set', value: 'dsh_memory_v2' })
   assert.deepEqual(byName('domainName').parse('   '), { kind: 'clear' })
 
-  // 数字字段：非法草稿标为 invalid，空草稿清除覆盖
-  assert.deepEqual(byName('maxInjectedTokens').parse('200'), { kind: 'set', value: 200 })
-  assert.equal(byName('maxInjectedTokens').parse('abc'), undefined)
-  assert.deepEqual(byName('maxInjectedTokens').parse(''), { kind: 'clear' })
-
   // 枚举字段：仅接受白名单值
   assert.deepEqual(byName('recallMode').parse('dry'), { kind: 'set', value: 'dry' })
   assert.equal(byName('recallMode').parse('bogus'), undefined)
 
-  // 布尔字段：只接受 true/false
-  assert.deepEqual(byName('consolidateEnabled').parse('true'), { kind: 'set', value: true })
-  assert.equal(byName('consolidateEnabled').parse('yes'), undefined)
-
-  // 自画像 v2（0.5.4）：契约 3.1 的 7 个新键逐个都要有规格
-  const portraitV2Fields = [
-    'selfPortraitEnabled',
-    'selfPersonaMaxTokens',
-    'selfPortraitMergeThreshold',
-    'selfReflectEnabled',
-    'selfReflectEveryTurns',
-    'selfReflectMinTurn',
-    'selfReflectMaxPerSession',
-  ] as const
-  for (const name of portraitV2Fields) {
-    assert.ok(specs.some((spec) => spec.field === name), `缺少自画像 v2 字段规格: ${name}`)
-  }
-
-  // 其中两个开关在 Host 侧是 boolean：界面用 0/1，但**写回的必须是真布尔**
+  // 保留的 3 个布尔字段在 Host 侧是 boolean：界面用 0/1，但**写回的必须是真布尔**
   // （schemastery 的 Schema.boolean() 对 0/1 数字会抛 `expected boolean but got 0`）
-  for (const name of ['selfPortraitEnabled', 'selfReflectEnabled'] as const) {
+  for (const name of ['selfPortraitEnabled', 'branchAware', 'sleepEnabled'] as const) {
     assert.deepEqual(byName(name).parse('1'), { kind: 'set', value: true }, `${name}: 1 = 开`)
     assert.deepEqual(byName(name).parse('0'), { kind: 'set', value: false }, `${name}: 0 = 关`)
     assert.equal(byName(name).parse('2'), undefined, `${name}: 只接受 0/1`)
@@ -643,31 +550,7 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
     assert.equal(byName(name).format(undefined), '')
   }
 
-  // M7 新增：初次设定的布尔键同样按 0/1 表达、写回真布尔
-  assert.deepEqual(byName('selfIntroEnabled').parse('1'), { kind: 'set', value: true })
-  assert.deepEqual(byName('selfIntroEnabled').parse('0'), { kind: 'set', value: false })
-  assert.equal(byName('selfIntroEnabled').parse('2'), undefined)
-  assert.deepEqual(byName('selfIntroEnabled').parse(''), { kind: 'clear' })
-  assert.equal(byName('selfIntroEnabled').format(true), '1')
-  assert.equal(byName('selfIntroEnabled').format(undefined), '')
-
-  // M8：/sleep 的布尔键同样按 0/1 表达、写回真布尔
-  assert.deepEqual(byName('sleepEnabled').parse('1'), { kind: 'set', value: true })
-  assert.deepEqual(byName('sleepEnabled').parse('0'), { kind: 'set', value: false })
-  assert.equal(byName('sleepEnabled').parse('2'), undefined)
-  assert.deepEqual(byName('sleepEnabled').parse(''), { kind: 'clear' })
-  assert.equal(byName('sleepEnabled').format(true), '1')
-  assert.equal(byName('sleepEnabled').format(undefined), '')
-
-  // M9：可核验引用的布尔键同样按 0/1 表达、写回真布尔
-  assert.deepEqual(byName('refsEnabled').parse('1'), { kind: 'set', value: true })
-  assert.deepEqual(byName('refsEnabled').parse('0'), { kind: 'set', value: false })
-  assert.equal(byName('refsEnabled').parse('2'), undefined)
-  assert.deepEqual(byName('refsEnabled').parse(''), { kind: 'clear' })
-  assert.equal(byName('refsEnabled').format(true), '1')
-  assert.equal(byName('refsEnabled').format(undefined), '')
-
-  // M10：写入审批门 —— 枚举字段只认三档，数字字段是队列上限
+  // M10：写入审批门 —— 枚举字段只认三档
   assert.deepEqual(byName('writePolicy').parse('ask'), { kind: 'set', value: 'ask' })
   assert.deepEqual(byName('writePolicy').parse('off'), { kind: 'set', value: 'off' })
   assert.deepEqual(byName('writePolicy').parse('auto'), { kind: 'set', value: 'auto' })
@@ -680,51 +563,10 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
   assert.equal(byName('language').parse('english'), undefined, 'language 只认 zh/en')
   assert.deepEqual(byName('language').parse(''), { kind: 'clear' })
 
-  // 其余 5 个键是普通数字字段（默认值见契约 3.1：80 / 0.6 / 12 / 4 / 3）
-  for (const name of [
-    'selfPersonaMaxTokens',
-    'selfPortraitMergeThreshold',
-    'selfReflectEveryTurns',
-    'selfReflectMinTurn',
-    'selfReflectMaxPerSession',
-    'selfIntroMinTurn',
-    'selfIntroMaxAsks',
-    'sleepSessions',
-    'sleepMaxBackfill',
-    'refsMax',
-    'pendingMax',
-  ] as const) {
-    assert.deepEqual(byName(name).parse('7'), { kind: 'set', value: 7 }, `${name} 应为数字字段`)
-    assert.equal(byName(name).parse('abc'), undefined, `${name}: 非法草稿应为 invalid`)
-    assert.deepEqual(byName(name).parse(''), { kind: 'clear' }, `${name}: 空草稿 = 清除覆盖`)
-  }
-
-  // M12：分支感知开关（布尔，界面 0/1、写回真布尔）
-  assert.deepEqual(byName('branchAware').parse('1'), { kind: 'set', value: true })
-  assert.deepEqual(byName('branchAware').parse('0'), { kind: 'set', value: false })
-  assert.equal(byName('branchAware').parse('2'), undefined)
-  assert.deepEqual(byName('branchAware').parse(''), { kind: 'clear' })
-  assert.equal(byName('branchAware').format(true), '1')
-  assert.equal(byName('branchAware').format(undefined), '')
-
-  // M13：审计环容量是普通数字字段
-  assert.deepEqual(byName('auditMax').parse('7'), { kind: 'set', value: 7 })
-  assert.equal(byName('auditMax').parse('abc'), undefined)
-  assert.deepEqual(byName('auditMax').parse(''), { kind: 'clear' })
-
-  // 30 个字段都要有规格，且与 Host 侧 volatile 字段一一对应
-  assert.equal(specs.length, 30)
-  for (const name of [
-    'selfIntroEnabled', 'selfIntroMinTurn', 'selfIntroMaxAsks',
-    'sleepEnabled', 'sleepSessions', 'sleepMaxBackfill',
-    'refsEnabled', 'refsMax',
-    'writePolicy', 'pendingMax',
-    'language',
-    'branchAware',
-    'auditMax',
-  ] as const) {
-    assert.ok(specs.some((spec) => spec.field === name), `设置页缺少 ${name}`)
-  }
+  // 精简（docs/simplify.md §1）：表单恰好这 8 个字段，顺序见字面量表；
+  // 被移出表单的 22 个键不再有规格（它们仍 volatile、仍可 patch 行设置）。
+  assert.equal(specs.length, 8)
+  assert.deepEqual(specs.map((spec) => spec.field), [...CLIENT_FIELD_ORDER], '字段目录与界面顺序')
 })
 
 // ---------------------------------------------------------------- 变异驱动补测
@@ -732,16 +574,17 @@ test('字段转换规格：domainName 是文本字段，解析非空草稿不得
 // 每条用例都对得上一次「改 src/client.ts 一处 → 重建 → 跑本文件 → 改回」的体检；
 // 下面的断言就是为了让这些单点改动由绿变红（原生中文文案与上面保持一致）。
 
-test('客户端字段目录：30 个字段、顺序与分组固定，且与 Host volatile 集合一致', async () => {
+test('客户端字段目录：恰好 8 个字段、顺序与分组固定，且都落在 Host volatile 集合里（子集）', async () => {
   const fx = makeClientFixture()
   const names = fx.specs.map((spec) => spec.field)
-  assert.equal(names.length, 30, '设置页应有 30 个字段')
+  assert.equal(names.length, 8, '设置页恰好 8 个字段（docs/simplify.md §1）')
   assert.equal(new Set(names).size, names.length, '字段名不得重复')
   assert.deepEqual(names, [...CLIENT_FIELD_ORDER], '字段顺序是界面契约，不得重排')
 
   const root = fx.render() as RecordedElement
   const sections = sectionEntries(root)
   assert.deepEqual(sections.map((section) => section.group), [...CLIENT_GROUP_ORDER], '分组顺序固定，且同组只渲染一次')
+  assert.equal(sections.length, 4, '分组收敛到 4 组')
   for (const section of sections) {
     assert.equal(section.element.type, 'section')
     assert.equal(section.element.props.key, section.group)
@@ -756,12 +599,18 @@ test('客户端字段目录：30 个字段、顺序与分组固定，且与 Host
     assert.ok(CLIENT_GROUP_ORDER.includes(CLIENT_FIELD_GROUPS[name] ?? ''), `${name} 的期望分组未知`)
   }
 
-  // 与 Host 侧 volatile 字段集合对齐（schemastery 不可解析时只跑上面的字面量断言）
+  // 与 Host 侧 volatile 集合的关系是**子集**（不再是相等）：被移出表单的 22 个键仍然
+  // volatile、仍可 patch 行热生效；但表单字段必须都在里面，否则表单改了存不进去。
+  // （schemastery 不可解析时只跑上面的字面量断言）
   const host = (await import('../lib/index.js')) as { Config?: unknown }
   const dict = (host.Config as { dict?: Record<string, { meta?: { volatile?: boolean } }> } | undefined)?.dict
   if (dict) {
     const volatile = Object.keys(dict).filter((key) => dict[key]?.meta?.volatile === true)
-    assert.deepEqual([...names].sort(), [...volatile].sort(), '客户端字段集合必须等于 Host 侧 volatile 字段集合')
+    const volatileSet = new Set(volatile)
+    for (const name of names) {
+      assert.ok(volatileSet.has(name), `表单字段 ${name} 必须仍在 Host 侧 volatile 集合里（子集关系）`)
+    }
+    assert.ok(volatile.length >= names.length, 'volatile 集合不得小于表单字段数（精简只动暴露面）')
   }
 })
 
@@ -828,16 +677,16 @@ test('枚举字段：界面 options 与 Host Schema 的 union 完全一致（含
   }
 })
 
-test('字段种类：文本/数字/0-1 布尔/布尔/枚举归属固定，且与 Host Schema 类型一致', async () => {
+test('字段种类：文本/0-1 布尔/枚举归属固定，且与 Host Schema 类型一致（表单里不再有普通数字与复选框字段）', async () => {
   const fx = makeClientFixture()
   for (const name of CLIENT_FIELD_ORDER) {
     assert.equal(fieldKindOf(fx.specByName(name)), CLIENT_FIELD_KINDS[name], `${name} 的界面种类`)
   }
   const kinds = Object.values(CLIENT_FIELD_KINDS)
   assert.equal(kinds.filter((kind) => kind === 'text').length, 1)
-  assert.equal(kinds.filter((kind) => kind === 'number').length, 18)
-  assert.equal(kinds.filter((kind) => kind === 'bool01').length, 6)
-  assert.equal(kinds.filter((kind) => kind === 'boolean').length, 1)
+  assert.equal(kinds.filter((kind) => kind === 'number').length, 0)
+  assert.equal(kinds.filter((kind) => kind === 'bool01').length, 3)
+  assert.equal(kinds.filter((kind) => kind === 'boolean').length, 0)
   assert.equal(kinds.filter((kind) => kind === 'enum').length, 4)
 
   const host = (await import('../lib/index.js')) as { Config?: unknown }
@@ -870,10 +719,10 @@ test('全字段 parse/format：空草稿=清除、非法草稿=undefined、set �
   }
 })
 
-test('类型边界：bool01 只认 0/1、布尔只认 true/false、数字不夹取、枚举大小写敏感', () => {
+test('类型边界：bool01 只认 0/1、枚举大小写敏感、文本字段去空白', () => {
   const fx = makeClientFixture()
   const bool01Fields = CLIENT_FIELD_ORDER.filter((name) => CLIENT_FIELD_KINDS[name] === 'bool01')
-  assert.equal(bool01Fields.length, 6)
+  assert.equal(bool01Fields.length, 3)
   for (const name of bool01Fields) {
     const spec = fx.specByName(name)
     for (const draft of ['0', '1', '2', '-1', '1.5', 'true', 'yes']) {
@@ -883,22 +732,6 @@ test('类型边界：bool01 只认 0/1、布尔只认 true/false、数字不夹�
     assert.equal(typeof (spec.parse('1') as { value: unknown }).value, 'boolean', `${name}: 落盘必须是真布尔`)
   }
 
-  const booleanSpec = fx.specByName('consolidateEnabled')
-  assert.deepEqual(booleanSpec.parse('true'), { kind: 'set', value: true })
-  assert.deepEqual(booleanSpec.parse('false'), { kind: 'set', value: false })
-  assert.equal(booleanSpec.parse('TRUE'), undefined)
-  assert.equal(booleanSpec.parse('1'), undefined)
-  assert.equal(booleanSpec.format(true), 'true')
-  assert.equal(booleanSpec.format(false), 'false')
-
-  assert.deepEqual(fx.specByName('selfPortraitMergeThreshold').parse('0.6'), { kind: 'set', value: 0.6 })
-  for (const draft of ['0', '-1', '100']) {
-    assert.deepEqual(
-      fx.specByName('auditMax').parse(draft),
-      { kind: 'set', value: Number(draft) },
-      `auditMax: ${draft} 由 Host 判范围，界面不得夹取或回落默认值`,
-    )
-  }
   assert.deepEqual(fx.specByName('domainName').parse('  dsh_memory_v2  '), { kind: 'set', value: 'dsh_memory_v2' })
 
   for (const name of Object.keys(CLIENT_ENUM_OPTIONS)) {
@@ -950,7 +783,7 @@ test('渲染：数字/文本控件的 label/hint/numeric/invalidLabel/id 与视�
     assert.equal(control.props.disabled, false)
   }
 
-  const name = 'maxInjectedTokens'
+  const name = 'domainName'
   fx.model.views.set(name, { text: '9', overridden: true, invalid: true })
   const control = fx.controls().get(name)
   assert.ok(control)
@@ -970,35 +803,38 @@ test('渲染：数字/文本控件的 label/hint/numeric/invalidLabel/id 与视�
 test('渲染：state 里缺某个字段视图时按空视图兜底，不继承别的字段', () => {
   const fx = makeClientFixture()
   const sparse: Record<string, unknown> = { ...fx.injected.hooks.memoryCard.getSnapshot() }
-  delete sparse['auditMax']
-  const control = fx.controls(sparse).get('auditMax')
+  delete sparse['domainName']
+  const control = fx.controls(sparse).get('domainName')
   assert.ok(control)
   assert.equal(control.props.text, '')
   assert.equal(control.props.overridden, false)
   assert.equal(control.props.invalid, false)
 })
 
-test('渲染：布尔字段的复选框只认 "true"，勾选写回 "true"/"false"', () => {
+test('渲染：表单里不再有复选框字段（kind=boolean 已全部移出），布尔键一律走 0/1 数字控件', () => {
   const fx = makeClientFixture()
-  const name = 'consolidateEnabled'
-  const findCheckbox = (): RecordedElement => {
-    const control = fx.controls().get(name)
-    assert.ok(control, '布尔字段必须有控件')
-    const input = ((control.props.children ?? []) as RecordedElement[]).find((child) => child.type === 'input')
-    assert.ok(input, '布尔字段必须渲染 checkbox')
-    assert.equal(input.props.type, 'checkbox')
-    return input
+  // 精简（docs/simplify.md §1）后 8 个字段里没有 kind:'boolean'：三个布尔键都按契约用 0/1 表达，
+  // 因此整棵渲染树里不得出现 <input type="checkbox"> —— 这是字段种类表在渲染层的钉子。
+  const inputs: string[] = []
+  const walk = (node: unknown): void => {
+    if (node === null || typeof node !== 'object') return
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item)
+      return
+    }
+    const element = node as RecordedElement
+    if (element.type === 'input') {
+      assert.notEqual(element.props.type, 'checkbox', '表单里不得再渲染复选框：乐观布尔字段已移出表单')
+      inputs.push(String(element.props.type))
+    }
+    walk(element.props.children)
   }
-  fx.model.views.set(name, { text: 'true', overridden: false, invalid: false })
-  assert.equal(findCheckbox().props.checked, true)
-  fx.model.views.set(name, { text: 'false', overridden: false, invalid: false })
-  assert.equal(findCheckbox().props.checked, false)
-  fx.model.views.set(name, { text: '', overridden: false, invalid: false })
-  assert.equal(findCheckbox().props.checked, false, '空草稿不得显示为勾选')
-  ;(findCheckbox().props.onChange as (event: { target: { checked: boolean } }) => void)({ target: { checked: true } })
-  assert.deepEqual(fx.model.edits.at(-1), [name, 'true'])
-  ;(findCheckbox().props.onChange as (event: { target: { checked: boolean } }) => void)({ target: { checked: false } })
-  assert.deepEqual(fx.model.edits.at(-1), [name, 'false'])
+  walk(fx.render())
+  assert.deepEqual(inputs, [], '精简后没有任何原生 input：布尔键都走 SettingsValueField 的 0/1 输入')
+
+  for (const name of CLIENT_FIELD_ORDER.filter((item) => CLIENT_FIELD_KINDS[item] === 'bool01')) {
+    assert.equal(fx.controls().get(name)?.type, fx.primitives.SettingsValueField, `${name} 必须走 SettingsValueField`)
+  }
 })
 
 test('渲染：枚举字段的 select 值与草稿一致，onChange 写回所选值', () => {
@@ -1052,7 +888,7 @@ test('装配：scope=NS、投影含全部字段、inject 暴露 hooks.memoryCard
   assert.equal(typeof store.subscribe(() => {}), 'function', 'subscribe 必须返回退订函数')
 
   const snapshot = store.getSnapshot()
-  assert.equal(Object.keys(snapshot).length, Object.keys(fx.model.shell()).length + 30, '投影 = shell 字段 + 30 个控件视图')
+  assert.equal(Object.keys(snapshot).length, Object.keys(fx.model.shell()).length + 8, '投影 = shell 字段 + 8 个控件视图')
   for (const name of CLIENT_FIELD_ORDER) {
     assert.ok(Object.hasOwn(snapshot, name), `投影缺少 ${name}`)
     assert.deepEqual(snapshot[name], fx.model.field(name))

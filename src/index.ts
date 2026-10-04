@@ -233,7 +233,7 @@ interface MemoryExplainArgs {
   apply?: boolean
 }
 
-/** `MemoryStatus` + 命令层的 `all`（`/memory list --archived` 与 memory_list 共用）。 */
+/** `MemoryStatus` + 命令层的 `all`（`/memory admin list --archived` 与 memory_list 共用）。 */
 type MemoryStatus = MemoryRecord['status'] | 'all'
 
 // ---------------------------------------------------------------- 内部状态
@@ -249,9 +249,9 @@ interface MemoryWrites {
    * 与上面四个计数（写入动作）不是一回事，所以不混进 `rejected`。
    */
   pending: number
-  /** M10：`/memory approve` 成功把它置为 active 的次数。 */
+  /** M10：`/memory admin approve` 成功把它置为 active 的次数。 */
   approved: number
-  /** M10：`/memory reject` 置为 invalid 的次数（保留审计痕迹，不物理删除）。 */
+  /** M10：`/memory admin reject` 置为 invalid 的次数（保留审计痕迹，不物理删除）。 */
   pendingRejected: number
 }
 
@@ -396,9 +396,9 @@ interface SeqState {
 interface RefsState {
   /** 写入路径成功附着引用的次数。 */
   attached: number
-  /** `/memory verify` 判定命中的引用条数。 */
+  /** `/memory admin verify` 判定命中的引用条数。 */
   verified: number
-  /** `/memory verify` 判定未命中（含会话/事件不存在）的引用条数。 */
+  /** `/memory admin verify` 判定未命中（含会话/事件不存在）的引用条数。 */
   mismatched: number
   lastError: string | null
 }
@@ -671,15 +671,20 @@ interface MemoryListOptions {
 type CommandHandler = (args: string[]) => DshCommandResult | Promise<DshCommandResult>
 
 interface MemoryCommandHandlers extends Record<string, CommandHandler> {
+  /**
+   * M28（契约 docs/simplify.md §2）：`/memory`（无参数）＝**概览** ——
+   * 库名、条数、待确认数、自画像一行摘要、当前语言，末尾指向日常命令与 `admin`。只读。
+   */
+  overview(): DshCommandResult
   list(args: string[]): DshCommandResult
-  /** M12：分支视图（`/memory branch [--all]`，只读）。 */
+  /** M12：分支视图（`/memory admin branch [--all]`，只读）。 */
   branch(args: string[]): DshCommandResult
   show(args: string[]): DshCommandResult
-  /** M9：核对引用的只读命令（`/memory verify <id>`）。 */
+  /** M9：核对引用的只读命令（`/memory admin verify <id>`）。 */
   verify(args: string[]): Promise<DshCommandResult>
-  /** M15-A：来源反查的只读命令（`/memory trace <sessionId 前缀> [#<seq>]`，契约 docs/trace.md）。 */
+  /** M15-A：来源反查的只读命令（`/memory admin trace <sessionId 前缀> [#<seq>]`，契约 docs/trace.md）。 */
   trace(args: string[]): DshCommandResult
-  /** M10：待确认队列的查看（`/memory pending`，只读）。 */
+  /** M10：待确认队列的查看（`/memory admin pending`，只读）。 */
   pending(): DshCommandResult
   forget(args: string[]): Promise<DshCommandResult>
   restore(args: string[]): Promise<DshCommandResult>
@@ -690,23 +695,28 @@ interface MemoryCommandHandlers extends Record<string, CommandHandler> {
   refresh(args: string[]): Promise<DshCommandResult>
   confirm(args: string[]): Promise<DshCommandResult>
   reject(args: string[]): Promise<DshCommandResult>
-  /** M10：批准一条待确认写入（`/memory approve <id 前缀>`，唯一的 pending → active 出口）。 */
+  /** M10：批准一条待确认写入（`/memory admin approve <id 前缀>`，唯一的 pending → active 出口）。 */
   approve(args: string[]): Promise<DshCommandResult>
-  /** M10：拒绝一条待确认写入（`/memory reject-pending <id 前缀>`）。 */
+  /** M10：拒绝一条待确认写入（`/memory admin reject-pending <id 前缀>`）。 */
   rejectPending(args: string[]): Promise<DshCommandResult>
   /**
-   * 命令行的 kebab-case 键（`/memory reject-pending …` 直接按 `parts[0]` 查表）。
-   * 与 `rejectPending` 指向同一个实现：既有 `/memory reject` 语义不变，队列出口另起一个明确的名字。
+   * 命令行的 kebab-case 键（`/memory admin reject-pending …` 直接按子命令名查表）。
+   * 与 `rejectPending` 指向同一个实现：既有 `reject` 语义不变，队列出口另起一个明确的名字。
    */
   'reject-pending'(args: string[]): Promise<DshCommandResult>
   clear(args: string[]): Promise<DshCommandResult>
   import(args: string[]): Promise<DshCommandResult>
-  /** M13：审计视图（`/memory audit [--limit N] [--verify]`，只读）。 */
+  /** M13：审计视图（`/memory admin audit [--limit N] [--verify]`，只读）。 */
   audit(args: string[]): Promise<DshCommandResult>
   stats(): DshCommandResult
   consolidate(): Promise<DshCommandResult>
   /** `/memory self …`：查看/设定/查看修订链/重置自画像（契约 4.3）。 */
   self(args: string[]): Promise<DshCommandResult>
+  /**
+   * M28（契约 §2）：`/memory admin <子命令>` —— 治理与诊断命令的统一入口。
+   * 不带子命令时列出全部子命令与一句话说明；子命令名与参数原样交给下面同一批处理器。
+   */
+  admin(args: string[]): Promise<DshCommandResult>
   help(): DshCommandResult
 }
 
@@ -952,7 +962,7 @@ const ORIGIN_RANK: Record<MemoryOrigin, number> = { observed: 0, model_proposed:
 
 // ---------------------------------------------------------------- 白名单与硬上限
 //
-// 命令层（`/memory clear --kind=`）与数据层（`/memory import`）都要按枚举校验，
+// 命令层（`/memory admin clear --kind=`）与数据层（`/memory admin import`）都要按枚举校验，
 // 两处各写一份必然漂移 —— 这里放唯一真源，配 `isMemoryKind` / `isScopeLevel` 类型守卫
 // （守卫返回类型谓词，避免调用方再写 `as MemoryKind` 这种逃逸）。
 
@@ -981,6 +991,46 @@ const WIRE_MAX_ITEMS = 50
 
 /** `/sleep` 回看的会话数硬上限（契约 §2：`--sessions=N` 的上限是 20，且不受配置调高影响）。 */
 const SLEEP_MAX_SESSIONS = 20
+
+/**
+ * M28（契约 docs/simplify.md §2）：`/memory admin <子命令>` 收纳的命令表 —— `[用法, 一句话说明]`，
+ * 顺序即 `/memory admin` 的列出顺序。
+ *
+ * 命令行键就是用法串的第一个词（`ADMIN_SUBS`），而**这些键在 `handlers` 里就是既有处理器** ——
+ * 因此 `/memory admin <子命令>` 与顶层的旧写法（隐藏别名）走的是同一份实现，绝不复制两份。
+ * 参数语义完全沿用现状（例如 `audit --verify`、`branch --all`、`trace <前缀>#<seq>`）。
+ */
+const ADMIN_COMMANDS: ReadonlyArray<readonly [string, string]> = [
+  ['list [--kind=<kind>] [--archived]', '列出记忆（不含待确认写入）'],
+  ['show <id 前缀>', '看一条记录的完整字段与出处'],
+  ['stats', '运行时诊断：条数、写入计数、注入、自画像、梳理'],
+  ['pending', '查看待确认队列'],
+  ['approve <id 前缀>', '批准一条待确认写入（pending → active 的唯一出口）'],
+  ['reject-pending <id 前缀>', '拒绝一条待确认写入（保留审计痕迹）'],
+  ['export [path]', '导出全部记忆到 JSON 文件'],
+  ['import <path>', '从导出文件导入'],
+  ['clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes', '永久删除（不可恢复）'],
+  ['consolidate', '立刻跑一次库内整合'],
+  ['branch [--all]', '分支视图：当前分支、带标签条数与清单'],
+  ['trace <sessionId 前缀> [#<seq>]', '来源反查：列出引用指向该会话的记录'],
+  ['verify <id 前缀>', '回到引用指向的事件核对正文'],
+  ['audit [--limit N] [--verify]', '审计视图：尝试环 + 注入核对'],
+  ['pin <id 前缀>', '固定 / 取消固定（固定条目免疫衰减）'],
+  ['archive <id 前缀>', '归档（不再注入，但仍可检索）'],
+  ['restore <id 前缀>', '恢复为 active'],
+  ['confirm <id 前缀>', '把模型自评升级为用户确认'],
+  ['reject <id 前缀>', '拒绝一条自我观察（登记指纹）'],
+  ['refresh <id 前缀>', '刷新观测时间、衰减重新计时'],
+]
+
+/** `/memory admin` 的子命令名（用法串的第一个词）；顶层隐藏别名与它同一批键。 */
+const ADMIN_SUBS: readonly string[] = ADMIN_COMMANDS.map(([usage]) => usage.split(/\s+/u)[0]!)
+
+/** `/memory admin`（不带子命令）的列出文本：全部子命令 + 一句话说明。 */
+const adminUsageText = (): string => [
+  '用法：/memory admin <子命令>',
+  ...ADMIN_COMMANDS.map(([usage, note]) => `  ${usage.padEnd(66)}${note}`),
+].join('\n')
 
 /**
  * 归一化宿主下发的配置。
@@ -1434,7 +1484,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     return record
   }
 
-  /** 用户命令路径的单点引用（`/memory pin|archive|restore|refresh|confirm|reject` 走这里）。 */
+  /** 用户命令路径的单点引用（`/memory admin pin|archive|restore|refresh|confirm|reject` 走这里）。 */
   const commandRefs = (): MemoryRef[] => pendingRefs({ refVia: 'command' })
 
   // ---------------- M13：写入审计（尝试环，契约 docs/audit.md §3.1） ----------------
@@ -1492,7 +1542,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   const refsForRecord = (input: WriteMemoryInput): MemoryRef[] | undefined =>
     cfg.refsEnabled === false ? undefined : input.refs
 
-  /** refs 的汇总视图（`/memory stats` 与 `memory_stats` 共用，含「无引用记录」条数）。 */
+  /** refs 的汇总视图（`/memory admin stats` 与 `memory_stats` 共用，含「无引用记录」条数）。 */
   const refsSummary = (): RefsState & { withoutRefs: number } => ({
     attached: state.refs.attached,
     verified: state.refs.verified,
@@ -1504,7 +1554,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   // ---------------- M12：git 分支感知（契约 docs/branch.md §4） ----------------
   //
   // 宿主侧只做三件事：解析当前分支（零 shell、5 秒 TTL 缓存）、在**取记录集合的那一处**统一过滤、
-  // 以及把「当前分支是什么」暴露给用户（`/memory branch`、stats 行、`memory_explain`）。
+  // 以及把「当前分支是什么」暴露给用户（`/memory admin branch`、stats 行、`memory_explain`）。
   // 过滤只影响带标签的记录（fail-closed）：无标签记录在任何情况下都照常注入（§5）。
 
   /** 分支缓存的短 TTL（契约 §4.1）：避免每个 step 都读盘，同时不至于切分支后长时间失准。 */
@@ -1577,7 +1627,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     return [...state.records.values()].filter((record) => names.has(branchOf(record)))
   }
 
-  /** 库内带标签的条数（不区分状态：`/memory branch` 与 stats 都要说清「标签有多少」）。 */
+  /** 库内带标签的条数（不区分状态：`/memory admin branch` 与 stats 都要说清「标签有多少」）。 */
   const taggedCount = (): number => [...state.records.values()].filter((record) => branchOf(record) !== null).length
 
   // ---------------- M18（协议 v1.3）：外接嵌入器（契约 docs/embedder.md） ----------------
@@ -2031,7 +2081,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     return { branch: null, notice: null }
   }
 
-  /** stats 行的分支口径（`/memory stats` 与 `memory_stats` 共用，契约 §4.5）。 */
+  /** stats 行的分支口径（`/memory admin stats` 与 `memory_stats` 共用，契约 §4.5）。 */
   const branchStatsLine = (): string => {
     const current = currentBranch() ?? 'unknown'
     return `分支：${current}｜带标签 ${taggedCount()} 条（branchAware=${cfg.branchAware !== false}）`
@@ -2050,14 +2100,14 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   }
 
   /**
-   * `/memory verify <id>`：回到引用指向的事件，核对「记录正文在不在那里」。**只读**。
+   * `/memory admin verify <id>`：回到引用指向的事件，核对「记录正文在不在那里」。**只读**。
    *
    * 比对用信息量 token 覆盖率（阈值 `cfg.recallMinMatch`）而不是逐字相等：
    * PII 脱敏、用户改口、日志重排都会让逐字判定误报。覆盖率 = 记录正文的信息量 token
    * 中有多少能在引用区间的事件文本里找到。
    */
   const verifyRecord = async (idPrefix: string): Promise<DshCommandResult> => {
-    if (!idPrefix) return { kind: 'error', text: '用法：/memory verify <id 前缀>' }
+    if (!idPrefix) return { kind: 'error', text: '用法：/memory admin verify <id 前缀>' }
     const record = [...state.records.values()].find((candidate) => candidate.id.startsWith(idPrefix))
     if (!record) return { kind: 'error', text: `未找到匹配 "${idPrefix}" 的记忆。` }
     const refs = refsOf(record)
@@ -2071,7 +2121,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     if (!sq || typeof sq.readSession !== 'function') {
       return {
         kind: 'error',
-        text: '当前宿主没有 sessionQuery 服务，`/memory verify` 需要它按引用回到会话日志核对；'
+        text: '当前宿主没有 sessionQuery 服务，`/memory admin verify` 需要它按引用回到会话日志核对；'
           + '这条命令只读，记忆本身不受影响。',
       }
     }
@@ -2132,7 +2182,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   }
 
   /**
-   * M15-A：`/memory trace <sessionId 前缀> [#<seq>]`（契约 docs/trace.md）——**来源反查**：
+   * M15-A：`/memory admin trace <sessionId 前缀> [#<seq>]`（契约 docs/trace.md）——**来源反查**：
    * 从一次会话（或某个事件序号）出发，列出引用指向它的记录。
    *
    * 四条纪律：
@@ -2143,7 +2193,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
    *   · 只读渲染只用既有 helper（`refsOf` / `formatRefs` / `clampText`），不碰纯函数层。
    */
   const traceRecords = (args: string[]): DshCommandResult => {
-    const usage = '用法：/memory trace <sessionId 前缀> [#<seq>]（#<seq> 也可写成 --at <seq>）'
+    const usage = '用法：/memory admin trace <sessionId 前缀> [#<seq>]（#<seq> 也可写成 --at <seq>）'
     let prefix = ''
     let seq: number | null = null
     let seqSpecs = 0
@@ -2253,7 +2303,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         lines.push(`- ${record.id.slice(0, 8)} · ${kind} · ${record.status} · ${record.origin} · ${refFieldOf(record)} · ${preview}`)
       }
     }
-    lines.push('用 /memory show <id> 看全文，/memory verify <id> 回到原文核对。')
+    lines.push('用 /memory admin show <id> 看全文，/memory admin verify <id> 回到原文核对。')
     return { kind: 'success', text: lines.join('\n') }
   }
 
@@ -2451,7 +2501,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     if (decision === 'queue') {
       // 「用户明确拒绝过的自我观察不再重复产生」这条闸门同样要在**入队前**生效：
       // 否则被拒绝的模型猜想会一次次回到队列里，用户每拒绝一次就再看到一次（骚扰），
-      // 而 `/memory reject-pending` 登记的指纹也就形同虚设。
+      // 而 `/memory admin reject-pending` 登记的指纹也就形同虚设。
       const queuedText = text
       const queuedHash = recordHash({
         kind: input.kind as MemoryKind,
@@ -2485,7 +2535,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         return {
           ok: false,
           error: `already_exists: 库里已有同一条记忆（${activeTwin.id.slice(0, 8)}，同指纹），未入队、也未新建；`
-            + '需要更新它请直接用 /memory confirm / pin / refresh。',
+            + '需要更新它请直接用 /memory admin confirm / pin / refresh。',
         }
       }
       const pendingTwin = listPending(state.records.values()).find((record) => record.hash === pendingHash)
@@ -2497,7 +2547,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         return {
           ok: false,
           error: `already_pending: 待确认队列里已有同一条（${pendingTwin.id.slice(0, 8)}，同指纹），未重复入队；`
-            + '用 /memory pending 查看，再 /memory approve 或 /memory reject-pending 处理它。',
+            + '用 /memory admin pending 查看，再 /memory admin approve 或 /memory admin reject-pending 处理它。',
         }
       }
       const pendingCount = listPending(state.records.values()).length
@@ -2508,7 +2558,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         flush()
         return {
           ok: false,
-          error: `pending_queue_full: 待确认队列已满（${pendingCount}/${max}），请先 /memory pending 处理`,
+          error: `pending_queue_full: 待确认队列已满（${pendingCount}/${max}），请先 /memory admin pending 处理`,
         }
       }
       const queued = makeRecord({
@@ -2576,7 +2626,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     }
     // M9：新建的条目带上本次写入的引用（指纹不受影响，§5）。
     attachRefs(record, incomingRefs)
-    // 用户明确拒绝过的自我观察不再重复产生（/memory reject 会登记指纹）
+    // 用户明确拒绝过的自我观察不再重复产生（/memory admin reject 会登记指纹）
     if (origin === 'model_proposed' && state.rejectedHashes.has(record.hash)) {
       state.writes.rejected += 1
       auditPush('rejected', { kind: record.kind, origin, reason: 'rejected_by_user' })
@@ -3306,7 +3356,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   const consolidate = async (reason: string): Promise<void> => {
     const began = Date.now()
     if (!state.opened) return
-    // 重入锁：定时器与 /memory consolidate（或 memory_maintain）可能重叠，
+    // 重入锁：定时器与 /memory admin consolidate（或 memory_maintain）可能重叠，
     // 并发跑会出现「同一批记录被合并两次」这类逻辑交错。
     if (state.consolidating) {
       state.consolidate.skipped = (state.consolidate.skipped ?? 0) + 1
@@ -3621,7 +3671,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           tag.notice,
           result.pending === true
             ? '已提议，尚未生效：writePolicy=ask 时模型来源的写入进待确认队列，'
-              + `只有用户能用 /memory approve ${String(result.id)} 让它生效（模型无法自我批准）。`
+              + `只有用户能用 /memory admin approve ${String(result.id)} 让它生效（模型无法自我批准）。`
             : null,
         ].filter((text): text is string => typeof text === 'string' && text.length > 0)
         const view = tag.branch !== null ? { ...result, branch: tag.branch } : result
@@ -3655,7 +3705,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           id: record.id, kind: record.kind, scope: record.scope, origin: record.origin,
           text: record.text, pinned: record.pinned, score: Number(score.toFixed(3)),
           observedAt: new Date(record.observedAt).toISOString(),
-          // M9 收尾：模型召回时也要能直接看到出处（`/memory verify <id>` 可回到原文核对）。
+          // M9 收尾：模型召回时也要能直接看到出处（`/memory admin verify <id>` 可回到原文核对）。
           // 无引用时给空串而不是省略字段 —— 工具输出形状保持稳定，模型不必处理两种形状。
           refs: refsToString(refsOf(record)),
         })))
@@ -3679,7 +3729,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         const status = args?.status ?? 'active'
         const rows = branchVisible(state.records.values(), exec?.agent?.session?.header?.cwd)
           .filter((record) => (status === 'all' ? true : record.status === status))
-          // M10：`pending` 只有 `/memory pending` 与 `memory_explain` 能看到（契约 §4.3）。
+          // M10：`pending` 只有 `/memory admin pending` 与 `memory_explain` 能看到（契约 §4.3）。
           // 这里必须显式排除：`status:'all'` 会把待确认记录顺带列出来，而 `list()` 服务面又是
           // 外部消费者最常用的入口 —— 一条未批准的模型猜想不该出现在任何普通列表里。
           .filter((record) => record.status !== 'pending')
@@ -3719,8 +3769,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
               ok: false,
               error: 'pending_requires_decision',
               id: target.id,
-              hint: `这是一条待确认写入：用 /memory approve ${target.id} 让它生效，`
-                + `或 /memory reject-pending ${target.id} 拒绝（保留审计）。`,
+              hint: `这是一条待确认写入：用 /memory admin approve ${target.id} 让它生效，`
+                + `或 /memory admin reject-pending ${target.id} 拒绝（保留审计）。`,
             })
           }
           // 落盘失败必须如实回报：否则「已删除」的条目重启后会复活。
@@ -3754,7 +3804,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       execute: async () => {
         state.toolCalls.memory_stats = (state.toolCalls.memory_stats ?? 0) + 1
-        // 结构化字段与 `/memory stats` 的文本同步（契约 §5.4 / refs §4.5）：模型不必去解析那几行中文。
+        // 结构化字段与 `/memory admin stats` 的文本同步（契约 §5.4 / refs §4.5）：模型不必去解析那几行中文。
         // M10：`writePolicy` / `pending` / `pendingMax` 同样进结构化字段 —— 模型要能自查「我写的记忆为什么没生效」。
         return json({
           ...handlers.stats(),
@@ -3765,8 +3815,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           writePolicy: normalizeWritePolicy(cfg.writePolicy),
           pending: pendingPool().length,
           pendingMax: Number.isFinite(cfg.pendingMax) ? cfg.pendingMax : DEFAULTS.pendingMax,
-          pendingPath: '模型写入进入待确认队列；只有用户能用 /memory approve <id 前缀> 让它生效（模型无法自我批准）。',
-          // M13：审计的结构化字段（与 stats 文本那行同口径；详细看 /memory audit）
+          pendingPath: '模型写入进入待确认队列；只有用户能用 /memory admin approve <id 前缀> 让它生效（模型无法自我批准）。',
+          // M13：审计的结构化字段（与 stats 文本那行同口径；详细看 /memory admin audit）
           audit: {
             entries: state.audit.length,
             records: state.records.size,
@@ -3890,7 +3940,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         const notices = [
           pendingCount > 0
             ? `已提议 ${pendingCount} 条，尚未生效：writePolicy=ask 时模型来源的写入进待确认队列，`
-              + '只有用户能用 /memory approve <id> 让它生效（模型无法自我批准）。'
+              + '只有用户能用 /memory admin approve <id> 让它生效（模型无法自我批准）。'
             : null,
           unpersistedCount > 0
             ? `其中 ${unpersistedCount} 条未落盘（${state.openError ?? '未知错误'}），重启后不会存在。`
@@ -3920,24 +3970,26 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     `${record.id.slice(0, 8)}  ${record.kind.padEnd(13)} ${record.scope.level.padEnd(9)}${record.pinned ? '★' : ' '} ${record.text}`
 
   /**
-   * M10：**除 `/memory approve` 之外没有任何路径能把 `pending` 改成 `active`**（契约 §5）。
+   * M10：**除 `/memory admin approve` 之外没有任何路径能把 `pending` 改成 `active`**（契约 §5）。
    * 因此所有「按 id 前缀改状态」的治理命令（restore / pin / archive / confirm / refresh…）在动手前
-   * 都要在这里被拦下并指路 —— 否则一个 `/memory restore <id>` 就等于绕过审批门。
+   * 都要在这里被拦下并指路 —— 否则一个 `/memory admin restore <id>` 就等于绕过审批门。
    */
-  const pendingGuard = (record: MemoryRecord, action: string): DshCommandResult | null =>
-    record.status === 'pending'
-      ? {
-        kind: 'error',
-        text: `这条是待确认写入（pending），/memory ${action} 不适用于它：`
-          + `先用 /memory approve ${record.id} 批准，或 /memory reject-pending ${record.id} 拒绝。`,
-      }
-      : null
+  const pendingGuard = (record: MemoryRecord, action: string): DshCommandResult | null => {
+    if (record.status !== 'pending') return null
+    // 指路要用**该命令当前的真实路径**：forget 是日常命令，其余治理命令都在 `/memory admin` 下。
+    const path = ADMIN_SUBS.includes(action) ? `/memory admin ${action}` : `/memory ${action}`
+    return {
+      kind: 'error',
+      text: `这条是待确认写入（pending），${path} 不适用于它：`
+        + `先用 /memory admin approve ${record.id} 批准，或 /memory admin reject-pending ${record.id} 拒绝。`,
+    }
+  }
 
   // ---------------- M10：待确认队列的用户侧出口（契约 §4.2） ----------------
   //
   // **这是把 `pending` 变成 `active` 的唯一路径**，且只能由用户敲命令触发：
   // 没有任何工具能改状态（`memory_*` 工具里不存在 approve/reject），模型也无法自我批准。
-  // 拒绝是置 `invalid` 而不是删除 —— 审计与 `/memory verify` 仍能看到它曾经存在（§5）。
+  // 拒绝是置 `invalid` 而不是删除 —— 审计与 `/memory admin verify` 仍能看到它曾经存在（§5）。
 
   /** 待确认记录池（含 id 前缀匹配）：approve/reject 只在这个池子里找，绝不碰其它状态。 */
   const pendingPool = (): MemoryRecord[] => listPending(state.records.values())
@@ -3947,13 +3999,13 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
    * 前缀不唯一 → 明确报错并列出候选；找不到 → 明确报错（都不猜、不取第一条）。
    */
   const resolvePending = (idPrefix: string, action: string): { record: MemoryRecord } | { error: string } => {
-    if (!idPrefix) return { error: `用法：/memory ${action} <id 前缀>（用 /memory pending 查看待确认写入）` }
+    if (!idPrefix) return { error: `用法：/memory admin ${action} <id 前缀>（用 /memory admin pending 查看待确认写入）` }
     const pool = pendingPool()
     const matched = pool.filter((record) => record.id.startsWith(idPrefix))
     if (matched.length === 0) {
       return {
-        error: `待确认队列里没有匹配 "${idPrefix}" 的写入（当前 ${pool.length} 条；用 /memory pending 查看）。`
-          + '（已批准/已拒绝的记录不在队列里：/memory approve 与 /memory reject 只处理 pending。）',
+        error: `待确认队列里没有匹配 "${idPrefix}" 的写入（当前 ${pool.length} 条；用 /memory admin pending 查看）。`
+          + '（已批准/已拒绝的记录不在队列里：approve 与 reject 只处理 pending。）',
       }
     }
     if (matched.length > 1) {
@@ -3976,7 +4028,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     return file
   }
 
-  // ---------------- M13：`/memory audit`（只读；契约 docs/audit.md §3.2） ----------------
+  // ---------------- M13：`/memory admin audit`（只读；契约 docs/audit.md §3.2） ----------------
   //
   // 命令**只读**：不写记录、不改状态、不动任何计数器（连审计环自己都不推 —— 审计读取不该被审计，
   // 否则一次 `--verify` 会改变下一次 `--verify` 的输入）。渲染交给 lib 的 `formatAudit`（上游已冻结）。
@@ -3991,7 +4043,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   }
 
   /**
-   * 解析 `/memory audit [--limit N] [--verify]`。
+   * 解析 `/memory admin audit [--limit N] [--verify]`。
    *
    * `--limit=N` 与 `--limit N` 两种写法都认；`--limit` 后面紧跟另一个开关时**不吞掉**它
    * （否则 `--limit --verify` 会把 --verify 吃掉）。未知参数忽略，与其它子命令同一口径。
@@ -4025,7 +4077,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     gap: string | null
   }
 
-  /** 一条会话事件里可核对的文本（与 `/memory verify` 同一抽取口径，另补 system/message）。 */
+  /** 一条会话事件里可核对的文本（与 `/memory admin verify` 同一抽取口径，另补 system/message）。 */
   const auditEventText = (event: DshSessionEvent): string => {
     const direct = refEventText(event)
     if (direct.length > 0) return direct
@@ -4073,6 +4125,35 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
   }
 
   const handlers: MemoryCommandHandlers = {
+    /**
+     * M28（契约 docs/simplify.md §2）：`/memory`（无参数）＝**概览**。
+     *
+     * 只回答「我的记忆现在是什么状态」四个问题（库名 / 条数 / 待确认 / 自画像 / 语言），
+     * 再指路到日常命令与 `/memory admin`。**纯只读**：不写盘、不改任何计数器、不 markUsed。
+     */
+    overview(): DshCommandResult {
+      const active = listActive(state.records.values())
+      const portrait = [...state.records.values()]
+        .filter((record) => record.kind === 'agent_self' && record.status === 'active')
+        .sort(compareRecords)
+      const facetCount = (facet: SelfFacet): number => portrait.filter((record) => facetOf(record) === facet).length
+      // 一行摘要：两个 facet 的条数 + 最近一条正文（clampText 保证它绝不含换行）。
+      const portraitLine = portrait.length === 0
+        ? '自画像：（空）'
+        : `自画像：人格 ${facetCount('persona')} 条 / 工作倾向 ${facetCount('work')} 条；最近：`
+          + clampText(portrait[0]!.text, cfg.maxItemTokens ?? DEFAULTS.maxItemTokens, cfg.charsPerToken ?? DEFAULTS.charsPerToken)
+      return {
+        kind: 'success',
+        text: [
+          `记忆库：${cfg.domainName}`,
+          `记录数：${state.records.size}（active ${active.length}）`,
+          `待确认：${pendingPool().length} 条`,
+          portraitLine,
+          `语言：language=${normalizeLanguage(cfg.language)}`,
+          '（日常命令：/memory search <查询> ｜ /memory forget <id 前缀> ｜ /memory self ｜ /memory admin <子命令> ｜ /memory help）',
+        ].join('\n'),
+      }
+    },
     list(args: string[]): DshCommandResult {
       const kind = args.find((part) => part.startsWith('--kind='))?.slice(7)
       const includeArchived = args.includes('--archived')
@@ -4080,11 +4161,11 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         .filter((record) => record.status === 'active' || (includeArchived && record.status === 'archived'))
         .filter((record) => (kind ? record.kind === kind : true))
         .sort(compareRecords)
-      if (rows.length === 0) return { kind: 'success', text: includeArchived ? '长期记忆为空。' : '没有 active 记忆（试试 /memory list --archived）。' }
+      if (rows.length === 0) return { kind: 'success', text: includeArchived ? '长期记忆为空。' : '没有 active 记忆（试试 /memory admin list --archived）。' }
       return { kind: 'success', text: `${rows.length} 条记忆：\n${rows.map((record) => `${listLine(record)}${record.status === 'archived' ? ' [archived]' : ''}`).join('\n')}` }
     },
     /**
-     * M12（契约 §4.4）：`/memory branch [--all]`（只读）——当前分支、带标签条数与清单。
+     * M12（契约 §4.4）：`/memory admin branch [--all]`（只读）——当前分支、带标签条数与清单。
      *
      * 无 `--all` 时只列**当前分支**的标签记录（跨分支的记忆不在这里重复列），
      * `--all` 附带其它分支的标签记录 —— 诊断「这条记忆为什么没进来」时一眼能看到它在哪个分支上。
@@ -4108,16 +4189,16 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         lines.push(others.length > 0 ? '[其它分支的标签记录]' : '（没有其它分支的标签记录。）')
         if (others.length > 0) lines.push(...[...others].sort(compareRecords).map(labeled))
       } else if (others.length > 0) {
-        lines.push(`（其它分支还有 ${others.length} 条标签记录：/memory branch --all 查看）`)
+        lines.push(`（其它分支还有 ${others.length} 条标签记录：/memory admin branch --all 查看）`)
       }
       if (current === null && tagged.length > 0) {
-        lines.push(`当前分支未知：这 ${tagged.length} 条标签记录都不参与注入 / 召回 / 列表；/memory branch --all 可查看它们。`)
+        lines.push(`当前分支未知：这 ${tagged.length} 条标签记录都不参与注入 / 召回 / 列表；/memory admin branch --all 可查看它们。`)
       }
       return { kind: 'success', text: lines.join('\n') }
     },
     show(args: string[]): DshCommandResult {
       const id = args[0]
-      if (!id) return { kind: 'error', text: '用法：/memory show <id 前缀>' }
+      if (!id) return { kind: 'error', text: '用法：/memory admin show <id 前缀>' }
       const record = [...state.records.values()].find((candidate) => candidate.id.startsWith(id))
       if (!record) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       // M9：把「凭什么这么说」摆出来（无引用时明确说明，而不是留一行空白）
@@ -4128,20 +4209,20 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       return { kind: 'success', text: `${JSON.stringify(record, null, 2)}\n${refLine}` }
     },
     /**
-     * M9：`/memory verify <id>`（只读）——回到引用指向的事件核对正文。
+     * M9：`/memory admin verify <id>`（只读）——回到引用指向的事件核对正文。
      * 四种结果：命中 / 未命中 / 无 sessionQuery（error 文案，不抛）/ 无引用。
      */
     async verify(args: string[]): Promise<DshCommandResult> {
       return await verifyRecord(String(args[0] ?? ''))
     },
     /**
-     * M15-A：`/memory trace <sessionId 前缀> [#<seq>]`（只读，契约 docs/trace.md）——来源反查。
+     * M15-A：`/memory admin trace <sessionId 前缀> [#<seq>]`（只读，契约 docs/trace.md）——来源反查。
      */
     trace(args: string[]): DshCommandResult {
       return traceRecords(args)
     },
     /**
-     * M10：`/memory pending`（只读）——把待确认队列摆出来。
+     * M10：`/memory admin pending`（只读）——把待确认队列摆出来。
      * 这是**用户唯一能看到 pending 的命令通道**（另一个是 `memory_explain` 的诊断输出）。
      */
     pending(): DshCommandResult {
@@ -4156,7 +4237,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       return { kind: 'success', text: `${head}\n${body}${hint}` }
     },
     /**
-     * M10：`/memory approve <id 前缀>` —— 让一条待确认写入生效。
+     * M10：`/memory admin approve <id 前缀>` —— 让一条待确认写入生效。
      *
      * 获批的若是 `agent_self`，**此刻才**跑 `planPortraitUpdate` 收敛（契约 §4.2）：
      * 入队时不知道将来库状态如何，批准时才知道 —— 按当时的库状态决定 add/reinforce/refine/supersede。
@@ -4207,7 +4288,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         }
       }
       record.status = 'active'
-      // M9：批准是用户命令 → 附着单点引用（与 /memory restore 同一语义）
+      // M9：批准是用户命令 → 附着单点引用（与 /memory admin restore 同一语义）
       attachRefs(record, commandRefs())
       const portraitFields = asPortrait(record)
       // 审计 high：本次批准涉及的所有 `persist()` 必须全部成功才算生效（内存已改、盘上未改＝没生效）。
@@ -4250,7 +4331,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
           return {
             kind: 'error',
             text: `批准未生效：这条自画像写入被自画像保护规则挡下（${planned.decision.reason}）。`
-              + '它仍留在待确认队列里（可用 /memory reject 清除）。',
+              + '它仍留在待确认队列里（可用 /memory admin reject 清除）。',
           }
         }
         if (planned && (planned.decision.action === 'reinforce' || planned.decision.action === 'refine')) {
@@ -4319,8 +4400,8 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       return { kind: 'success', text: `已批准 ${record.id.slice(0, 8)}：status → active${detail}，已落盘，从现在起它可以被注入。\n${record.text}` }
     },
     /**
-     * M10：`/memory reject <id 前缀>` —— 拒绝一条待确认写入。
-     * 置 `invalid` 而**不删除**：审计与 `/memory verify` 仍能看到它曾经存在（契约 §5）。
+     * M10：`/memory admin reject <id 前缀>` —— 拒绝一条待确认写入。
+     * 置 `invalid` 而**不删除**：审计与 `/memory admin verify` 仍能看到它曾经存在（契约 §5）。
      */
     async rejectPending(args: string[]): Promise<DshCommandResult> {
       const idPrefix = String(args[0] ?? '')
@@ -4329,7 +4410,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       const record = resolved.record
       record.status = 'invalid'
       record.invalidAt = Date.now()
-      // 登记指纹：同类自我观察不再重复产生（与 /memory reject 同一效果）
+      // 登记指纹：同类自我观察不再重复产生（与 /memory admin reject 同一效果）
       state.rejectedHashes.add(record.hash)
       attachRefs(record, commandRefs())
       const persisted = await persist(record)
@@ -4345,7 +4426,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       }
     },
     /**
-     * 命令行的 kebab-case 入口：`/memory reject-pending <id 前缀>`。
+     * 命令行的 kebab-case 入口：`/memory admin reject-pending <id 前缀>`。
      * 与 `rejectPending` 是同一个实现（两条键指向同一个函数对象），只是键名要能被命令行查到。
      */
     async 'reject-pending'(args: string[]): Promise<DshCommandResult> {
@@ -4367,7 +4448,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     async restore(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
-      if (!id) return { kind: 'error', text: '用法：/memory restore <id 前缀>' }
+      if (!id) return { kind: 'error', text: '用法：/memory admin restore <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       // M10：restore 会把状态改成 active —— 对 pending 就是绕过审批门，必须拦下。
@@ -4393,7 +4474,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     async pin(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
-      if (!id) return { kind: 'error', text: '用法：/memory pin <id 前缀>' }
+      if (!id) return { kind: 'error', text: '用法：/memory admin pin <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       const blocked = pendingGuard(target, 'pin')
@@ -4406,7 +4487,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     async archive(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
-      if (!id) return { kind: 'error', text: '用法：/memory archive <id 前缀>' }
+      if (!id) return { kind: 'error', text: '用法：/memory admin archive <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       const blocked = pendingGuard(target, 'archive')
@@ -4433,7 +4514,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     async refresh(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
-      if (!id) return { kind: 'error', text: '用法：/memory refresh <id 前缀>' }
+      if (!id) return { kind: 'error', text: '用法：/memory admin refresh <id 前缀>' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       target.observedAt = Date.now()
@@ -4445,7 +4526,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     async confirm(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
-      if (!id) return { kind: 'error', text: '用法：/memory confirm <id 前缀>（把模型自评升级为用户确认）' }
+      if (!id) return { kind: 'error', text: '用法：/memory admin confirm <id 前缀>（把模型自评升级为用户确认）' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       target.origin = 'user_explicit'
@@ -4457,13 +4538,13 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     async reject(args: string[]): Promise<DshCommandResult> {
       const id = args[0]
-      if (!id) return { kind: 'error', text: '用法：/memory reject <id 前缀>（拒绝一条自我观察）' }
+      if (!id) return { kind: 'error', text: '用法：/memory admin reject <id 前缀>（拒绝一条自我观察）' }
       const target = [...state.records.values()].find((record) => record.id.startsWith(id))
       if (!target) return { kind: 'error', text: `未找到匹配 "${id}" 的记忆。` }
       // M10：待确认记录**只能**用取待确认队列的 `reject-pending` 处理，避免两条路径语义重叠
       // （这条会把 origin/状态当成「已生效的自我观察」，与审批门的语义不同）。
       if (target.status === 'pending') {
-        return { kind: 'error', text: `这是一条待确认写入，请改用 /memory reject-pending ${target.id}（待确认队列的专用出口）。` }
+        return { kind: 'error', text: `这是一条待确认写入，请改用 /memory admin reject-pending ${target.id}（待确认队列的专用出口）。` }
       }
       target.status = 'invalid'
       target.invalidAt = Date.now()
@@ -4477,7 +4558,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       const confirmed = args.includes('--yes')
       const kindRaw = args.find((part) => part.startsWith('--kind='))?.slice(7)
       const scopeRaw = args.find((part) => part.startsWith('--scope='))?.slice(8)
-      const usage = '用法：/memory clear --all --yes | /memory clear --kind=<kind> [--scope=<level>] --yes（多个条件按 AND 组合；--all 不能与其它条件同时使用）'
+      const usage = '用法：/memory admin clear --all --yes | /memory admin clear --kind=<kind> [--scope=<level>] --yes（多个条件按 AND 组合；--all 不能与其它条件同时使用）'
       if (!all && kindRaw === undefined && scopeRaw === undefined) return { kind: 'error', text: usage }
       // 枚举校验：拼错的 --kind/--scope 以前会静默匹配 0 条却回「已永久删除」。
       if (kindRaw !== undefined && !isMemoryKind(kindRaw)) {
@@ -4495,14 +4576,14 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       const scope = scopeRaw as ScopeLevel | undefined
       // 多条件 **AND**（旧实现是 OR：`--kind=a --scope=b` 会删掉「所有 a」加上「所有 b」）。
       // M10：待确认记录不参与 clear —— 它是「等用户决定」的东西，不该被 `--all` 顺手抹掉
-      // （要清就明确地 /memory approve 或 /memory reject-pending，审计链才完整）。
+      // （要清就明确地 /memory admin approve 或 /memory admin reject-pending，审计链才完整）。
       const pendingSkipped = [...state.records.values()].filter((record) =>
         record.status === 'pending'
         && (all || (kind !== undefined && record.kind === kind)) && (scope === undefined || record.scope.level === scope)).length
       const victims = [...state.records.values()].filter((record) =>
         record.status !== 'pending'
         && (all || (kind !== undefined && record.kind === kind)) && (scope === undefined || record.scope.level === scope))
-      const pendingNote = pendingSkipped > 0 ? `（跳过 ${pendingSkipped} 条待确认写入：请用 /memory pending 处理）` : ''
+      const pendingNote = pendingSkipped > 0 ? `（跳过 ${pendingSkipped} 条待确认写入：请用 /memory admin pending 处理）` : ''
       if (victims.length === 0) {
         return { kind: 'success', text: pendingSkipped > 0 ? `没有可删除的记忆${pendingNote}` : '没有匹配的记忆，未删除任何条目。' }
       }
@@ -4525,7 +4606,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     },
     async import(args: string[]): Promise<DshCommandResult> {
       const path = args[0]
-      if (!path) return { kind: 'error', text: '用法：/memory import <导出文件路径>' }
+      if (!path) return { kind: 'error', text: '用法：/memory admin import <导出文件路径>' }
       try {
         const doc = JSON.parse(readFileSync(path, 'utf8')) as { items?: unknown } | null
         const items = Array.isArray(doc?.items) ? doc.items : []
@@ -4574,7 +4655,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
       }
     },
     /**
-     * M13：`/memory audit [--limit N] [--verify]`（契约 §3.2，**只读**）。
+     * M13：`/memory admin audit [--limit N] [--verify]`（契约 §3.2，**只读**）。
      *
      * 默认渲染「记录派生 + 尝试环」；`--verify` 额外核对本会话注入是否逐字出现在日志里。
      * 渲染与核对都在 try/catch 里：审计不可用也绝不能让命令抛给宿主。
@@ -4640,9 +4721,9 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
             + (cfg.refsEnabled === false ? '；refsEnabled=false（新写入不附着引用）' : '')
             + (refs.lastError ? `；lastError=${refs.lastError}` : ''),
           // M13：审计摘要（契约 §3.3）——「最近尝试几条、记录档几条、核对未命中几次」一眼可见；
-          // 详细内容（含 `--verify` 的注入核对）在 `/memory audit`。
+          // 详细内容（含 `--verify` 的注入核对）在 `/memory admin audit`。
           `审计：最近尝试 ${state.audit.length} 条（记录档 ${state.records.size} 条）；`
-            + `核对未命中 ${refs.mismatched} 次（详见 /memory audit）`,
+            + `核对未命中 ${refs.mismatched} 次（详见 /memory admin audit）`,
           `turn-stopping：plain=${state.turnStopping.plain}${state.turnStopping.last ? `，last=${state.turnStopping.last.at}（${state.turnStopping.last.channel}）` : '，last=none'}`,
           `设置页：${settingsLine()}`,
         ].join('\n'),
@@ -4803,7 +4884,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
         for (const record of victims) {
           // 归档而非删除：历史与检索都还在（契约 §4.3）。
           record.status = 'archived'
-          // M9：批量归档同样是用户命令 → 附着 command 引用（与 /memory archive 一致）
+          // M9：批量归档同样是用户命令 → 附着 command 引用（与 /memory admin archive 一致）
           attachRefs(record, commandRefs())
           await persist(record)
           archived += 1
@@ -4818,14 +4899,50 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
 
       return { kind: 'error', text: `未知的 self 子命令「${sub}」。${SELF_USAGE}` }
     },
+    /**
+     * M28（契约 §2）：`/memory admin <子命令>` —— 治理与诊断命令的统一入口。
+     *
+     * 不带子命令 → 列出全部子命令与一句话说明；带子命令 → 参数原样转交 `handlers` 里的**同一个**
+     * 处理器（例如 `admin(['approve', id])` 与顶层 `approve([id])` 是同一个函数对象）。
+     * 因此两条路径的输出逐字相同，旧写法只是「不再列出」的隐藏别名。
+     */
+    async admin(args: string[]): Promise<DshCommandResult> {
+      const sub = String(args[0] ?? '').toLowerCase()
+      if (sub === '') return { kind: 'success', text: adminUsageText() }
+      if (!ADMIN_SUBS.includes(sub)) {
+        return { kind: 'error', text: `未知的 admin 子命令「${sub}」。\n${adminUsageText()}` }
+      }
+      const handler = (handlers as unknown as Record<string, CommandHandler | undefined>)[sub]
+      if (typeof handler !== 'function') {
+        return { kind: 'error', text: `admin 子命令「${sub}」当前不可用。\n${adminUsageText()}` }
+      }
+      return await handler(args.slice(1))
+    },
+    /**
+     * M28（契约 §2）：`/memory help` 只列**日常 6 条**（`/memory`、`search`、`forget`、`self`、
+     * `help`、`/sleep`）与 `admin` 一行说明；其余子命令不再列出（能力仍在，见 `/memory admin`）。
+     */
     help(): DshCommandResult {
-      return { kind: 'success', text: '用法：/memory list [--kind=agent_self] | search <关键词> | show <id> | verify <id> | trace <sessionId 前缀> [#<seq>] | audit [--limit N] [--verify] | branch [--all] | forget <id> | restore <id> | pin <id> | archive <id> | refresh <id> | confirm <id> | reject <id> | pending | approve <id> | reject-pending <id> | export [path] | import <path> | clear --all --yes | clear --kind=<kind> [--scope=<level>] --yes | self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work] | consolidate | stats | help' }
+      return {
+        kind: 'success',
+        text: [
+          '长期记忆 · 日常命令（其余子命令都收在 /memory admin 下）：',
+          '  /memory                                概览：库名、条数、待确认、自画像、语言',
+          '  /memory search <查询>                   按查询检索（id 前缀 / 类型 / 正文）',
+          '  /memory forget <id 前缀>                删除一条（按 query 删除需 --query … --yes）',
+          '  /memory self [list] | self set <persona|work> <正文> | self history [subject] | self reset [persona|work]',
+          '                                         自画像：查看 / 直接设定（含命名 key）/ 版本链 / 归档',
+          '  /memory help                           本帮助',
+          '  /sleep [--apply] [--sessions=N] [--all] 空闲梳理（手动触发）',
+          '  /memory admin <子命令>                  治理与诊断：列出全部子命令与说明',
+        ].join('\n'),
+      }
     },
   }
 
   // ---------------- M8：`/sleep` 空闲梳理（契约 docs/sleep.md §5/§6） ----------------
   //
-  // 与 `/memory consolidate` 的分工：consolidate 做**库内治理**，`/sleep` 做**跨库 + 跨会话**的梳理 ——
+  // 与 `/memory admin consolidate` 的分工：consolidate 做**库内治理**，`/sleep` 做**跨库 + 跨会话**的梳理 ——
   // 回看最近若干会话的完整事件日志，补上当时漏掉/被节流掉的记忆，再把整个库重新排一遍。
   // 数据源是宿主服务 `ctx.sessionQuery`（实测契约见 §3），不是手工解会话日志文件。
   //
@@ -4863,7 +4980,7 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     const parts = String(rawInput ?? '').trim().split(/\s+/u).filter(Boolean)
     const raw = parts.find((part) => part.startsWith('--sessions='))?.slice('--sessions='.length)
     const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10)
-    // 至少要回看 1 个会话：0 个会话的 /sleep 没有意义（库内治理请用 /memory consolidate）。
+    // 至少要回看 1 个会话：0 个会话的 /sleep 没有意义（库内治理请用 /memory admin consolidate）。
     const requested = Number.isFinite(parsed) && parsed > 0 ? parsed : Math.max(1, sleepLimits().sleepSessions)
     return {
       apply: parts.includes('--apply'),
@@ -5140,14 +5257,14 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     const limits = sleepLimits()
     // §5.5：/sleep 是用户显式触发的维护动作，与 recallMode / autoRecall 无关；只受 sleepEnabled 约束。
     if (limits.sleepEnabled === false) {
-      return { kind: 'error', text: '`/sleep` 已在配置里关闭（sleepEnabled=false）：本次不做任何事。开启后可随时重跑；`/memory consolidate` 仍可用。' }
+      return { kind: 'error', text: '`/sleep` 已在配置里关闭（sleepEnabled=false）：本次不做任何事。开启后可随时重跑；`/memory admin consolidate` 仍可用。' }
     }
     const sq = ctx.get<DshSessionQuery>('sessionQuery')
     if (!sq || typeof sq.listSessions !== 'function' || typeof sq.readSession !== 'function') {
       return {
         kind: 'error',
         text: '当前宿主没有 sessionQuery 服务，`/sleep` 需要它读取会话记录（DSH 的日志是多 zstd 帧拼接，不能手工解）；'
-          + '/memory consolidate 仍可用（库内治理不依赖会话日志）。',
+          + '/memory admin consolidate 仍可用（库内治理不依赖会话日志）。',
       }
     }
     if (request.apply && !state.opened) {
@@ -5235,12 +5352,17 @@ export function apply(ctx: DshPluginContext, config: unknown = {}): void {
     ctx.commands.register({
       name: 'memory',
       description: '查看与管理长期记忆',
-      input: { hint: 'list | show <id> | verify <id> | trace <sessionId 前缀> [#<seq>] | audit [--limit N] [--verify] | branch [--all] | pending | self | forget <id> | export | stats' },
+      // M28（契约 docs/simplify.md §2）：可见命令面 = 日常 6 条；其余子命令在 `/memory admin` 下，
+      // 因此 hint 里也不列它们（旧写法仍可用，只是不再出现在 help 与任何列出命令的地方）。
+      input: { hint: '（无参数＝概览） | search <查询> | forget <id 前缀> | self | help | admin <子命令>' },
       handler: async (invocation) => {
         const parts = String(invocation?.rawInput ?? '').trim().split(/\s+/u).filter(Boolean)
-        const sub = parts.shift() ?? 'list'
-        const handler = handlers[sub] ?? handlers.help
+        const sub = parts.shift() ?? ''
         try {
+          // 无参数 → 概览；其余按分发表（隐藏别名与 admin 收纳的子命令指向同一批处理器）；
+          // 未知子命令仍回落到 help，而不是抛错或静默成功。
+          if (sub === '') return handlers.overview()
+          const handler = handlers[sub] ?? handlers.help
           return await handler(parts)
         } catch (error) {
           return { kind: 'error', text: `记忆命令失败：${errorText(error)}` }

@@ -100,7 +100,7 @@ ordinary persona rows under three subjects:
   /memory self set persona name 我叫小忆。                   # -> self.persona.name
   /memory self set persona address_user 我称呼你为「老板」。   # -> self.persona.address_user
   /memory self set persona address_self 用户叫我「忆」。       # -> self.persona.address_self
-  /memory self set persona 我重视把事实和推测分开说。           # no key: still self.persona.general
+  /memory self set persona 我重视把事实和推测分开说。           # -> self.persona.general (the name/address keys are optional)
   ```
 
   The naming keys are only recognised on the `persona` facet; anything else (or the `work` facet) is treated as
@@ -113,12 +113,12 @@ ordinary persona rows under three subjects:
 /memory self set <persona|work> [name|address_user|address_self] <text>   set/override (user-side, pinned, confidence 1); a naming key on persona settles the names
 /memory self history [subject]           revision chain, old → new (with archival time)
 /memory self reset [persona|work]        archive the current self-portrait (history is kept, nothing is deleted)
-/memory verify <id prefix>               walk back to the cited events and check where this memory came from (read-only)
+/memory admin verify <id prefix>         walk back to the cited events and check where this memory came from (read-only)
 ```
 
 ## `/sleep`: idle review
 
-`/memory consolidate` only does **governance inside the store** (merge / invalidate / archive / summarize).
+`/memory admin consolidate` only does **governance inside the store** (merge / invalidate / archive / summarize).
 `/sleep` is an **independent command** (not a `/memory` subcommand) that works **across the store and across
 sessions**: it replays the **complete event logs** of the most recent sessions through the memory pipeline to pick
 up what was missed at the time, then reorders the whole store.
@@ -131,12 +131,12 @@ up what was missed at the time, then reorders the whole store.
   backfill, how many groups to merge, how many rows to invalidate, how many to archive, which project gists to
   recompute. **It writes nothing.**
 - **Only `--apply` writes**, and its first step is an **automatic backup** (a `sleep-backup-<ISO timestamp>.json` in
-  the export directory, reusing the `/memory export` implementation): if the backup fails, the run stops. There is
-  no "write first, back up later".
+  the export directory, reusing the `/memory admin export` implementation): if the backup fails, the run stops. There
+  is no "write first, back up later".
 - `--sessions=N` reviews the last N sessions (default `sleepSessions`, capped at 20). Without `--all` the list is
   filtered by the cwd of the current / most recent session, so another project's business does not leak in.
 - Session logs are read through the host's `sessionQuery` service. Where that service is unavailable, the command
-  says so and points out that `/memory consolidate` still works.
+  says so and points out that `/memory admin consolidate` still works.
 - **Real user messages only**: only messages whose `source.kind === 'user'` count — context the plugin injected
   itself does not (self-reinforcement guard) — and `origin: 'subagent'` sessions are skipped by default.
 - Every budget that is hit (per-session `sleepMaxCharsPerSession`, total `sleepMaxCharsTotal`, backfill
@@ -166,9 +166,9 @@ Each memory records its **source**: which session, and which event-sequence rang
   and compaction solidification store the single point `last`; `/sleep` backfill stores the sequence of **the user
   message it came from**. On a merge (reinforce/refine) the new reference is added to the existing row and old ones
   are kept.
-- **Checkable**: `/memory verify <id>` walks back to the cited events and compares them with the row's text using
+- **Checkable**: `/memory admin verify <id>` walks back to the cited events and compares them with the row's text using
   informative-token coverage, printing `✅ hit (coverage x)` / `⚠️ miss` / `⚠️ session or events missing`. Read-only.
-- **Visible**: `/memory show <id>` gains a `source:` line, and `memory_explain` exposes `refs` too.
+- **Visible**: `/memory admin show <id>` gains a `source:` line, and `memory_explain` exposes `refs` too.
 - **Machine-readable form**: a reference is written `sessionId#from-to`, a single point is just `sessionId#from`
   (a reference with no sequence numbers is the bare `sessionId`), and several references are joined with `;` —
   `session-84a547da-5727-4ffc-adf0-26d02e749e13#120-180;session-…-…#93` (the `…-…-…` are elided id segments, not
@@ -176,7 +176,7 @@ Each memory records its **source**: which session, and which event-sequence rang
   the short form (`ses-84a547da#120-180`) exists only for display, and `formatRefs` does **not** shorten by default.
 - **Never part of the fingerprint**: `recordHash` ignores `refs` — otherwise the same memory would count as two rows
   just because it came from somewhere else, breaking deduplication and idempotency. Rows written before 0.5.9 have no
-  references; every read path tolerates that (`/memory verify` says so explicitly).
+  references; every read path tolerates that (`/memory admin verify` says so explicitly).
 
 `refsEnabled` (default `true`) turns collection off for new rows (existing references stay); `refsMax` (default `5`)
 caps how many references one row keeps.
@@ -197,34 +197,37 @@ behaviour); to separate "the model proposed it" from "you settled it", set `writ
 - **Only rows the model proposed are gated.** Rule capture (`observed`), explicit user asks (`user_explicit`)
   and user corrections (`user_correction`) are **never** gated: they are your own words, and queuing them would
   only drown them.
-- **The model cannot approve itself.** No model tool can change a `pending` status; only your `/memory approve` can.
+- **The model cannot approve itself.** No model tool can change a `pending` status; only your `/memory admin approve`
+  can.
 
-Using the pending queue:
+Using the pending queue (0.5.27 collects these under `admin`; the old spellings still work):
 
 ```
-/memory pending                     list pending writes (id · kind/facet · origin · time · refs · text preview)
-/memory approve <id prefix>         approve → takes effect immediately (a self-portrait row converges at this point)
-/memory reject-pending <id prefix>  reject → set to invalid (kept for audit, never physically deleted)
+/memory admin pending                     list pending writes (id · kind/facet · origin · time · refs · text preview)
+/memory admin approve <id prefix>         approve → takes effect immediately (a self-portrait row converges at this point)
+/memory admin reject-pending <id prefix>  reject → set to invalid (kept for audit, never physically deleted)
 ```
 
 - **Pending never enters context.** The resident block (R1), per-turn recall (R2), the self-portrait, project
   gists, search and consolidation never see it — an unapproved model guess reaching the system prompt is this
   feature's worst failure mode, and every read path is pinned by a test. Only two windows show it on purpose:
-  `/memory pending` and the diagnostic output of `memory_explain`.
+  `/memory admin pending` and the diagnostic output of `memory_explain`.
 - **Bounded and honest.** `pendingMax` (default `50`) caps the queue. When it is full, a new write is **rejected
   with a structured error** — never silently dropped, never auto-compacted; process a few rows through
-  `/memory pending` first. `0` = unlimited.
+  `/memory admin pending` first. `0` = unlimited.
 - **Approval does not bypass the safety gate.** In `ask` mode sensitive content is still rejected *before* the row
   is queued; the queue is not a masking back door.
-- **Rejection leaves a trace.** `reject-pending` sets `invalid` rather than deleting, so audit and `/memory verify`
-  can still see that the row existed.
+- **Rejection leaves a trace.** `reject-pending` sets `invalid` rather than deleting, so audit and
+  `/memory admin verify` can still see that the row existed.
 - Pending rows are persisted like any other row (they survive a restart), and `/memory stats` / `memory_stats`
   report the pending count together with the active policy (e.g. `待确认：1 条（writePolicy=ask）`).
 
-`writePolicy` (default `auto`) and `pendingMax` (default `50`) both appear in the settings form.
+`writePolicy` (default `auto`) appears in the settings form; `pendingMax` (default `50`) is patch-row only (it moved
+out of the form in 0.5.27, but it is unchanged in every other way).
 
-> The queue's reject exit is `/memory reject-pending <id prefix>`; the pre-existing `/memory reject <id prefix>`
-> rejects a self-observation instead ("that kind is never re-created"). The two are different on purpose.
+> The queue's reject exit is `/memory admin reject-pending <id prefix>`; the pre-existing
+> `/memory admin reject <id prefix>` rejects a self-observation instead ("that kind is never re-created"). The two
+> spellings differ on purpose; the old top-level forms (`/memory reject-pending`, `/memory reject`) still work.
 
 ## Model-visible text language (`language`): English for the model, Chinese for you
 
@@ -237,7 +240,7 @@ terminal stays Chinese. `language` is `'zh'` (default) or `'en'`.
 | Injection prompts (`REFLECT_NOTICE`, `INTRO_NOTICE`) | ✅ yes | The same channel |
 | Per-turn recall block header/footer (R2) | ✅ yes | The same channel |
 | Descriptions and parameter docs of the seven `memory_*` tools | ✅ yes | The tool schema goes straight into the model's context |
-| Command output (`/memory list`, `/memory show`, `/sleep` preview, `stats`, …) | ❌ **no — stays Chinese** | User-visible and large; deliberately out of scope for this release |
+| Command output (`/memory admin list`, `/memory admin show`, `/sleep` preview, `stats`, …) | ❌ **no — stays Chinese** | User-visible and large; deliberately out of scope for this release |
 
 - **The default `'zh'` changes nothing.** With `language` unset, missing or invalid, every injected byte is identical
   to 0.5.10 — the English table is an addition, not a rewrite of the Chinese one.
@@ -272,9 +275,9 @@ that holds only on `feat/x` should not keep steering the model after you switch 
   text is identical. (Unlike `refs`, which is provenance evidence and stays out of the fingerprint.)
 - Names are normalized: trimmed, a leading `refs/heads/` is dropped and the name is capped at 100 characters; an
   illegal name (empty or containing control characters) is treated as **no tag**.
-- **Visible and debuggable.** `/memory branch` prints the current branch, how many tagged rows exist and the groups;
-  `/memory branch --all` also lists rows tagged for other branches. `/memory stats` and `memory_stats` carry a
-  `分支：…（branchAware=…）` line, and `memory_explain` shows a row that branch filtering blocked and why.
+- **Visible and debuggable.** `/memory admin branch` prints the current branch, how many tagged rows exist and the
+  groups; `/memory admin branch --all` also lists rows tagged for other branches. `/memory stats` and `memory_stats`
+  carry a `分支：…（branchAware=…）` line, and `memory_explain` shows a row that branch filtering blocked and why.
 - **Zero shell.** The plugin only reads `.git/HEAD` (and a `.git` *file*'s `gitdir:` pointer for
   worktrees/submodules), with a short 5-second cache. It **never runs a git command**; anything it cannot read is
   simply "branch unknown".
@@ -342,10 +345,10 @@ What changes once one is registered:
   inject an embedder that calls a remote API (for example one whose `id` reads
   `openai:text-embedding-3-small`), **memory bodies leave the machine**.
 
-## `/memory audit`: write audit and injection verification
+## `/memory admin audit`: write audit and injection verification
 
 Not every write leaves a row behind: a **rejected** write leaves nothing at all, so "why is this not in memory?" had
-no answer. `/memory audit` shows both views side by side without keeping a second copy of the truth:
+no answer. `/memory admin audit` shows both views side by side without keeping a second copy of the truth:
 
 | Source | Covers | Persistence |
 |---|---|---|
@@ -356,7 +359,7 @@ That is why the audit adds **no storage**: successful write events are derived f
 view — including everything that was rejected — lives in the bounded ring.
 
 ```
-/memory audit [--limit N] [--verify]
+/memory admin audit [--limit N] [--verify]
 ```
 
 - **`--limit N`** shows at most `N` recent attempts (default `20`, capped at `200`; `--limit=N` is accepted too, and a
@@ -370,7 +373,7 @@ view — including everything that was rejected — lives in the bounded ring.
   be read, or when the log contains no `user/message` event at all, the command says that it **cannot verify, and
   why**. With no `--verify` at all it says that no check was run. "Not checked" is never rendered as "checked and
   consistent" — otherwise "the model can see it ⟺ it was recorded" would mean nothing.
-- **Read-only, and it never gets in the way.** `/memory audit` and `--verify` modify no record, no state and no
+- **Read-only, and it never gets in the way.** `/memory admin audit` and `--verify` modify no record, no state and no
   counter — reading the audit does not push an audit event of its own (otherwise one `--verify` would change the next
   one's input). Every push, render and comparison runs inside `try/catch`: an audit failure never blocks a write or an
   injection.
@@ -378,7 +381,8 @@ view — including everything that was rejected — lives in the bounded ring.
   store-derived summary). `/memory stats` and `memory_stats` carry a one-line summary (recent attempts · store rows ·
   verification misses); the detail is here.
 
-`auditMax` (default `50`) is a plain number field in the settings form.
+`auditMax` (default `50`) is patch-row only (it left the settings form in 0.5.27; the default and the behaviour are
+unchanged).
 
 ## Guarding against memory pollution / self-reinforcement
 
@@ -421,7 +425,7 @@ Uninstall (memory data is **not** deleted):
 dsh plugin --profile desktop remove dsh-plugin-memory
 ```
 
-To erase the store, use `/memory clear --all --yes` or delete `$DSH_HOME/storages/<domainName>/`.
+To erase the store, use `/memory admin clear --all --yes` or delete `$DSH_HOME/storages/<domainName>/`.
 
 ### Manual route (no plugin manager)
 
@@ -437,10 +441,18 @@ Add this package to the profile's `dependencies`, append `dsh-plugin-memory` to
 
 ## The settings form
 
-The plugin exports a schemastery `Config` whose **30 fields** are declared `volatile()` (hot-applied when edited);
-everything else is patch-row only. It ships a small browser half (`src/client.ts`, built to `lib/client.js`) that
-renders those 30 fields as a form. Find it under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card
-also shows a one-line summary).
+The plugin exports a schemastery `Config` whose fields are all declared `volatile()` (hot-applied when edited). The
+form shows **8 fields** — `domainName`, `captureMode`, `recallMode`, `writePolicy`, `language`,
+`selfPortraitEnabled`, `branchAware`, `sleepEnabled` — in 4 groups, and **the other 22 keys are patch-row only**:
+they are still just as usable and still hot-apply, they are simply not rendered (the schema is unchanged: all 30 keys
+stay `volatile()`, so a patch-row edit takes effect without a restart, exactly as before). The 22 are
+`maxInjectedTokens`, `maxItemTokens`, `recallTopK`, `captureMaxPerTurn`, `consolidateEnabled`,
+`consolidateIntervalMinutes`, `selfPortraitMaxTokens`, `selfPersonaMaxTokens`, `selfPortraitMergeThreshold`,
+`selfReflectEnabled`, `selfReflectEveryTurns`, `selfReflectMinTurn`, `selfReflectMaxPerSession`, `selfIntroEnabled`,
+`selfIntroMinTurn`, `selfIntroMaxAsks`, `sleepSessions`, `sleepMaxBackfill`, `refsEnabled`, `refsMax`, `pendingMax`,
+`auditMax` — all of them are listed with their defaults and meanings in [Configuration](#configuration) below. It
+ships a small browser half (`src/client.ts`, built to `lib/client.js`) that renders those 8 fields as a form. Find it
+under **Plugins → `dsh-plugin-memory` → row `dsh-memory`** (the list card also shows a one-line summary).
 
 Under the hood the client half registers into the keyed `plugins.row.config` slot with
 `key: 'dsh-plugin-memory#dsh-memory'`, using DSH's shared `SettingsFormModel` / `SettingsForm`. Saving validates the
@@ -448,38 +460,27 @@ whole Config through the settings service and persists it into the profile patch
 
 ## Commands
 
-```
-/memory list [--kind=agent_self] [--archived]   list memories (--archived includes archived rows)
-/memory search <keywords>                        lexical search (includes archived, never invalid)
-/memory show <id prefix>                         full record with origin and timeline
-/memory branch [--all]                           current branch, tagged-row count and groups (--all adds other branches)
-/memory forget <id prefix>                       permanently delete one memory
-/memory restore <id prefix>                      revive an invalid/archived row (and undo its superseders)
-/memory pin <id prefix>                          pin (never decays, never auto-archives)
-/memory archive <id prefix>                      archive (no resident injection, still searchable)
-/memory refresh <id prefix>                      refresh (restart the decay clock)
-/memory confirm <id prefix>                      promote a model self-observation to user-confirmed
-/memory reject <id prefix>                       reject a self-observation (that kind is never re-created)
-/memory pending                                  list pending writes (read-only; ids feed approve / reject-pending)
-/memory approve <id prefix>                      approve a pending write, it takes effect immediately (the writePolicy=ask exit)
-/memory reject-pending <id prefix>               reject a pending write (set to invalid, kept for audit)
-/memory self                                     self-portrait: list the persona and work subsections
-/memory self set <persona|work> [name|address_user|address_self] <text>            set/override it directly (user-side, pinned, confidence 1); a naming key on persona settles the names
-/memory self history [subject]                   self-portrait revision chain (old → new, with archival time)
-/memory self reset [persona|work]                archive the current self-portrait (history kept, nothing deleted)
-/memory audit [--limit N] [--verify]             write audit: recent attempts + store summary; --verify checks this session's injection against the session log (read-only)
-/memory verify <id prefix>                       walk back to the cited events and check where this memory came from (read-only)
-/memory trace <sessionId prefix> [#<seq>]        reverse lookup: list memories whose refs point at this session (#<seq> keeps only intervals covering that event; --at <seq> is equivalent) (read-only)
-/memory export [path]                            export JSON
-/memory import <path>                            import JSON (deduplicated by fingerprint; every field is validated, numbers are clamped, `pinned` is forced off and the origin is downgraded to `observed`)
-/memory clear --all --yes                        permanently clear everything (`--all` is mutually exclusive with the filters below)
-/memory clear --kind=<kind> --scope=<level> --yes   clear a subset; conditions combine with AND and values are validated against the enums
-/memory consolidate                              consolidate right now
-/memory stats                                    runtime observability: counts, writes, render time
-/memory help
+Daily use is these 6 commands (0.5.27; `/memory help` lists the same set). Every other subcommand is still there —
+it just lives under `/memory admin <subcommand>`:
 
+```
+/memory                                          overview: store name, row count, pending count, a one-line self-portrait summary and the language
+/memory search <query>                           lexical search (includes archived, never invalid)
+/memory forget <id prefix>                       permanently delete one memory
+/memory self [set|history|reset]                 self-portrait: view / set directly (naming keys included) / revision chain / archive
+/memory help                                     list these commands plus the `/memory admin` line
 /sleep [--sessions=N] [--all] [--apply]          idle review (independent command, not a /memory subcommand): preview only by default; --apply backs up first
 ```
+
+- `/memory` with **no argument is the overview** (store name, row count, pending count, self-portrait, language) and
+  points at the commands above.
+- `/memory admin <subcommand>` holds the 20 governance and diagnostic subcommands: `list`, `show`, `stats`,
+  `pending`, `approve`, `reject-pending`, `export`, `import`, `clear`, `consolidate`, `branch`, `trace`, `verify`,
+  `audit`, `pin`, `archive`, `restore`, `confirm`, `reject`, `refresh`. `/memory admin` with no subcommand lists them
+  all with a one-line description each, and **every parameter keeps exactly its old semantics** (for example
+  `audit --verify`, `branch --all`, `trace <prefix>#<seq>`).
+- The old spellings are **unchanged in behaviour** (`/memory pending`, `/memory approve <id>`, `/memory trace …`,
+  `/memory audit --verify`, …) — they are simply no longer listed anywhere. Nothing was removed.
 
 ## Model tools
 
@@ -495,8 +496,10 @@ whole Config through the settings service and persists it into the profile patch
 
 ## Configuration
 
-Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The 30 fields exposed in
-the settings form:
+Set `config` on the patch row; the full default set lives in `DEFAULTS` in `src/lib.ts`. The **8 fields** exposed in
+the settings form (in form order) are `domainName`, `captureMode`, `recallMode`, `writePolicy`, `language`,
+`selfPortraitEnabled`, `branchAware` and `sleepEnabled`. The table lists all 30 `volatile` keys: those 8 save from
+the form, and the other 22 go through the patch row (same defaults, same hot-apply semantics).
 
 | Field | Default | Meaning |
 |---|---|---|

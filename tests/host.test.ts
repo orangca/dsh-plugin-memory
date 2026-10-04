@@ -401,7 +401,7 @@ test('host#1 apply 注册契约：7 个工具（都带 output）、memory + slee
   assert.match(String(harness.commandNamed('sleep').description ?? ''), /梳理/u)
   // 独立命令：/memory 的子命令表里不该多出 sleep（否则等于注册成子命令）
   const viaMemory = await harness.runCommand('sleep')
-  assert.match(viaMemory.text, /用法：\/memory list/u, 'sleep 不是 /memory 的子命令')
+  assert.match(viaMemory.text, /\/memory admin <子命令>/u, 'sleep 不是 /memory 的子命令（回落到 help）')
 
   assert.equal(harness.sections.length, 1, 'systemPrompt.section 恰好注册一次')
   assert.equal(harness.contexts.length, 1, 'systemPrompt.context 恰好注册一次')
@@ -411,7 +411,7 @@ test('host#1 apply 注册契约：7 个工具（都带 output）、memory + slee
   // 未知子命令回落到 help，而不是抛错或静默成功
   const result = await harness.runCommand('definitely-not-a-subcommand')
   assert.equal(result.kind, 'success')
-  assert.match(result.text, /用法：\/memory list/)
+  assert.match(result.text, /\/memory admin <子命令>/)
 })
 
 // ---------------------------------------------------------------- 2. volatile 解包（rev20 回归）
@@ -1556,7 +1556,7 @@ test('host#28 /sleep 无 sessionQuery：可读降级文案、绝不抛、零写�
   assert.equal(result.kind, 'error', '缺服务必须走 error 而不是抛异常')
   assert.match(result.text, /sessionQuery/u, '降级文案要点名缺的是哪个服务')
   assert.match(result.text, /仍可用/u, '必须告诉用户还有别的路可走')
-  assert.match(result.text, /\/memory consolidate/u, '契约 §5.3：要说明 /memory consolidate 仍可用')
+  assert.match(result.text, /\/memory admin consolidate/u, '契约 §5.3：要说明 /memory admin consolidate 仍可用')
 
   assert.equal(harness.domain.puts.length, 0, '降级路径不得碰领域表')
   assert.equal(harness.memory().list().length, 0)
@@ -2207,7 +2207,7 @@ test('host#46 /memory verify：无引用的记录（0.5.9 之前的存量）给�
   assert.match(result.text, /这条没有引用/u)
   assert.match(result.text, /0\.5\.9/u, '要说明可能是老版本写入的')
   // 用法错误与未找到也要有可读文案
-  assert.match((await harness.runCommand('verify')).text, /用法：\/memory verify/u)
+  assert.match((await harness.runCommand('verify')).text, /用法：\/memory admin verify/u)
   assert.match((await harness.runCommand('verify definitely-absent')).text, /未找到/u)
 })
 
@@ -2261,9 +2261,12 @@ test('host#48 /memory show：带「来源：」一行（有引用/无引用都�
   const plain = (harness.memory().list() as Json[]).find((row) => String(row.text).includes('没有任何引用'))!
   // 用完整 id：同一毫秒创建的两条记录前 8 位会撞前缀（show 是按前缀找第一条）
   assert.match((await harness.runCommand(`show ${String(plain.id)}`)).text, /来源：（无引用/u)
-  assert.match((await harness.runCommand('help')).text, /verify <id>/u, 'help 要提到新命令')
+  // M28（docs/simplify.md §2）：verify 收进 /memory admin —— help 只给 admin 入口，隐藏别名不再被列出。
+  const helpText = (await harness.runCommand('help')).text
+  assert.match(helpText, /\/memory admin <子命令>/u, 'help 要给 admin 入口')
+  assert.doesNotMatch(helpText, /verify/u, '隐藏别名 verify 不得出现在 help 里')
   const hint = String((harness.command() as unknown as { input?: { hint?: string } }).input?.hint ?? '')
-  assert.match(hint, /verify/u, '命令的 input.hint 也要提到 verify')
+  assert.match(hint, /admin/u, '命令的 input.hint 指向 /memory admin')
 })
 
 test('host#49 memory_explain：记录视图带机器可读的 refs 串', async (t) => {
@@ -2393,7 +2396,7 @@ test('host#53 ask 模式：工具写入落成 pending 且 ok:true，此刻不执
   assert.equal(result.pending, true, '必须明确回报 pending:true')
   assert.ok(typeof result.id === 'string' && (result.id as string).length > 0, '要给出 id 供 /memory approve 使用')
   assert.equal(result.text, '构建流程统一用 pnpm，产物输出到 dist 目录')
-  assert.match(String(result.notice), /\/memory approve/u, '必须告诉模型/用户怎么让它生效')
+  assert.match(String(result.notice), /\/memory admin approve/u, '必须告诉模型/用户怎么让它生效')
   assert.match(String(result.notice), /模型无法自我批准/u)
   assert.equal(result.status, undefined, 'pending 不是 created/merged：没有生效')
 
@@ -2509,7 +2512,7 @@ test('host#55 /memory approve：置 active 且随后能注入；agent_self 在�
   assert.equal(tooShort.kind, 'error')
   assert.match(tooShort.text, /没有匹配/u)
   assert.equal((await harness.runCommand('approve')).kind, 'error', '缺参数要走 error')
-  assert.match((await harness.runCommand('approve')).text, /用法：\/memory approve/u)
+  assert.match((await harness.runCommand('approve')).text, /用法：\/memory admin approve/u)
 
   // 唯一性：同一前缀命中多条时必须报错并列出候选，而不是取第一条
   const twin = await writeTool(harness, { kind: 'semantic', text: '第二条用于前缀歧义的待确认内容' })
@@ -2670,7 +2673,7 @@ test('host#57b 队列满：结构化错误 pending_queue_full，且零写入', a
   assert.equal(full.ok, false)
   assert.match(String(full.error), /^pending_queue_full:/u, '队列满必须是结构化错误')
   assert.match(String(full.error), /2\/2/u, '错误文案要写清 N/上限')
-  assert.match(String(full.error), /\/memory pending/u, '要告诉用户去哪里处理')
+  assert.match(String(full.error), /\/memory admin pending/u, '要告诉用户去哪里处理')
   assert.equal(harness.domain.puts.length, putsBefore, '队列满不得静默丢弃、也不得写盘')
   assert.equal(allRows(harness).length, 2)
 
@@ -3445,7 +3448,7 @@ test('host#71 /memory branch：当前分支、带标签条数与清单；--all �
   assert.match(base, /分支专属约定/u, '当前分支的标签记录要列出来')
   assert.doesNotMatch(base, /主干专属/u, '无 --all 时不得列出其它分支的记录')
   assert.match(base, /其它分支还有 1 条标签记录/u)
-  assert.match(base, /\/memory branch --all/u)
+  assert.match(base, /\/memory admin branch --all/u)
 
   const all = (await harness.runCommand('branch --all')).text
   assert.match(all, /主干专属/u, '--all 必须附带其它分支的标签记录')
@@ -3768,14 +3771,16 @@ test('host#80 审计：入队 / 批准 / 拒绝待确认各推一条；/memory a
   assert.equal(JSON.stringify(harness.memory().list()), rowsBefore, 'audit 只读：记录一字不动')
   assert.equal(JSON.stringify(harness.reportState()), reportBefore, 'audit 只读：状态与计数器一字不动')
 
-  // help 与 input.hint 同步（与其它子命令同一口径）
-  assert.match((await harness.runCommand('help')).text, /audit \[--limit N\] \[--verify\]/u)
+  // M28（docs/simplify.md §2）：audit 收进 /memory admin —— help 只给 admin 入口，隐藏别名不再被列出。
+  const auditHelpText = (await harness.runCommand('help')).text
+  assert.match(auditHelpText, /\/memory admin <子命令>/u, 'help 要给 admin 入口')
+  assert.doesNotMatch(auditHelpText, /audit/u, '隐藏别名 audit 不得出现在 help 里')
   const hint = String((harness.command() as unknown as { input?: { hint?: string } }).input?.hint ?? '')
-  assert.match(hint, /audit/u, '命令的 input.hint 也要提到 audit')
+  assert.match(hint, /admin/u, '命令的 input.hint 指向 /memory admin')
 
   // 契约 §3.3：`/memory stats` 与 `memory_stats` 的最小摘要（最近尝试条数、核对未命中次数）
   const stats = await harness.runCommand('stats')
-  assert.match(stats.text, /审计：最近尝试 4 条（记录档 2 条）；核对未命中 0 次（详见 \/memory audit）/u)
+  assert.match(stats.text, /审计：最近尝试 4 条（记录档 2 条）；核对未命中 0 次（详见 \/memory admin audit）/u)
   const raw = JSON.parse(String(await harness.tool('memory_stats').execute({}))) as Json
   const auditField = raw.audit as Json
   assert.ok(auditField, 'memory_stats 必须带结构化的 audit 字段')
@@ -4096,7 +4101,7 @@ test('host#88 /memory trace：按会话前缀反查命中一条（首行 / 行�
     `命中行格式必须是 id 前缀 · kind · status · origin · refs · 正文：${lines[2]}`,
   )
   assert.match(lines[2]!, /构建流程统一用 pnpm/u, '正文预览要带出来')
-  assert.equal(lines[3], '用 /memory show <id> 看全文，/memory verify <id> 回到原文核对。')
+  assert.equal(lines[3], '用 /memory admin show <id> 看全文，/memory admin verify <id> 回到原文核对。')
 
   // 完整 id、以及 `--at <seq>` 等价写法都要认
   assert.equal((await harness.runCommand(`trace ${TRACE_SESSION}`)).kind, 'success')
@@ -4255,7 +4260,7 @@ test('host#94 /memory trace：参数非法都明确报错、不抛异常', async
 
   const usage = await harness.runCommand('trace')
   assert.equal(usage.kind, 'error')
-  assert.match(usage.text, /用法：\/memory trace <sessionId 前缀> \[#<seq>\]/u)
+  assert.match(usage.text, /用法：\/memory admin trace <sessionId 前缀> \[#<seq>\]/u)
 
   const badSeq = await harness.runCommand('trace 84a547da #abc')
   assert.equal(badSeq.kind, 'error')
@@ -4314,9 +4319,12 @@ test('host#96 /memory trace：命令用法进 help 与 input.hint；库内共 M 
   const queued = await writeTool(harness, { kind: 'semantic', text: '另一条待确认写入' })
   assert.equal(queued.pending, true)
 
-  assert.match((await harness.runCommand('help')).text, /trace <sessionId 前缀> \[#<seq>\]/u, 'help 要提到 trace')
+  // M28（docs/simplify.md §2）：trace 收进 /memory admin —— help 只给 admin 入口，隐藏别名不再被列出。
+  const traceHelpText = (await harness.runCommand('help')).text
+  assert.match(traceHelpText, /\/memory admin <子命令>/u, 'help 要给 admin 入口')
+  assert.doesNotMatch(traceHelpText, /trace/u, '隐藏别名 trace 不得出现在 help 里')
   const hint = String((harness.command() as unknown as { input?: { hint?: string } }).input?.hint ?? '')
-  assert.match(hint, /trace/u, '命令的 input.hint 也要提到 trace')
+  assert.match(hint, /admin/u, '命令的 input.hint 指向 /memory admin')
   // 「库内共 M 条」按整个库算（pending 也算库内记录），但结果行里不出现 pending
   const out = await harness.runCommand('trace 84a547da')
   assert.match(out.text, /命中 1 条（库内共 2 条记录）/u)
@@ -7284,4 +7292,310 @@ test('host#162 变异测试补盲：冲突槽位要求 value 存在（C6）', as
   const out = await harness.runCommand('consolidate')
   assert.match(out.text, /整合完成：合并 0，冲突失效 0/u, `没有 value 的条目不参与冲突判定：${out.text}`)
   assert.equal(allRows(harness).filter((row) => row.status === 'active').length, 2, '两条都必须保持 active')
+})
+
+// ================================================================ M28 命令面合并（docs/simplify.md §2）
+// 可见命令面 = 日常 6 条（`/memory`、`search`、`forget`、`self`、`help`、`/sleep`）+ `/memory admin`；
+// 20 个治理/诊断子命令收进 admin 入口，**参数语义完全沿用现状**；旧写法保持可用但不再被列出
+// （隐藏别名指向同一批处理器，因此两条路径的输出逐字相同）。
+//
+// 这里一条条钉死：help 的可见面、概览的内容、admin 的列出、**每个 admin 子命令至少一次真实调用**、
+// 以及旧写法的回归等价性。
+
+/** `/memory admin` 收纳的 20 个子命令（测试侧独立列一份：实现漏一个就会被下面 #165 抓出来）。 */
+const ADMIN_SUBCOMMANDS: readonly string[] = [
+  'list', 'show', 'stats', 'pending', 'approve', 'reject-pending', 'export', 'import', 'clear',
+  'consolidate', 'branch', 'trace', 'verify', 'audit', 'pin', 'archive', 'restore', 'confirm', 'reject', 'refresh',
+]
+
+/** `/memory admin` 列出文本里的子命令名（跳过首行用法，每行取第一个词）。 */
+const listedAdminSubs = (text: string): string[] => text.split('\n').slice(1)
+  .map((line) => line.trim().split(/\s+/u)[0] ?? '')
+  .filter((name) => name.length > 0)
+
+test('host#163 /memory help：只列日常 6 条 + admin 一行，隐藏别名一条都不出现', async (t) => {
+  const harness = makeHarness({
+    noReport: true,
+    config: { selfIntroEnabled: false, selfReflectEnabled: false },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const help = await harness.runCommand('help')
+  assert.equal(help.kind, 'success', help.text)
+
+  // 只列 6 条日常 + admin 一行：按「行首是 /memory 或 /sleep」数命令行，必须恰好 7 行。
+  const commandLines = help.text.split('\n').filter((line) => /^\s*\/(memory|sleep)\b/u.test(line))
+  assert.equal(commandLines.length, 7, `help 只该有日常 6 条 + admin 一行：\n${help.text}`)
+  for (const daily of ['/memory ', '/memory search <查询>', '/memory forget <id 前缀>', '/memory self', '/memory help', '/sleep']) {
+    assert.ok(help.text.includes(daily), `help 缺少日常命令 ${daily}：\n${help.text}`)
+  }
+  assert.match(help.text, /\/memory admin <子命令>/u, 'admin 必须有一行说明（列出全部子命令）')
+
+  // 隐藏别名（20 个子命令名）都不许出现在 help 里 —— 只有 self 的 [list] 属于日常用法。
+  for (const hidden of ADMIN_SUBCOMMANDS.filter((name) => name !== 'list')) {
+    assert.doesNotMatch(help.text, new RegExp(`\\b${hidden}\\b`, 'u'), `隐藏别名 ${hidden} 不得出现在 help 里：\n${help.text}`)
+  }
+  // 命令的 input.hint 也只看得到日常 6 条 + admin。
+  const hint = String((harness.command() as unknown as { input?: { hint?: string } }).input?.hint ?? '')
+  assert.match(hint, /admin/u, 'input.hint 必须指向 /memory admin')
+  for (const hidden of ['trace', 'verify', 'audit', 'pending', 'approve']) {
+    assert.doesNotMatch(hint, new RegExp(hidden, 'u'), `隐藏别名 ${hidden} 不得出现在 input.hint 里：${hint}`)
+  }
+})
+
+test('host#164 /memory（无参数）＝概览：库名 / 条数 / 待确认 / 自画像 / 语言，且完全只读', async (t) => {
+  const harness = makeHarness({ config: { selfIntroEnabled: false, selfReflectEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const written = await writeTool(harness, { kind: 'semantic', text: '概览用例：构建产物统一放在 dist 目录下' })
+  assert.equal(written.ok, true, `前提：写入成功（${String(written.error ?? '')}）`)
+  const before = JSON.stringify(harness.reportState())
+
+  const overview = await harness.runCommand('')
+  assert.equal(overview.kind, 'success', overview.text)
+  assert.match(overview.text, /记忆库：dsh_memory/u, '概览要给库名')
+  assert.match(overview.text, /记录数：1（active 1）/u, '概览要给条数')
+  assert.match(overview.text, /待确认：0 条/u, '概览要给待确认数')
+  assert.match(overview.text, /语言：language=zh/u, '概览要给当前语言')
+  assert.match(overview.text, /自画像：/u, '概览要给自画像一行摘要')
+  for (const hint of ['/memory search', '/memory forget', '/memory self', '/memory admin', '/memory help']) {
+    assert.ok(overview.text.includes(hint), `概览末尾要提示 ${hint}：\n${overview.text}`)
+  }
+  // 只读：概览不得推进任何计数器、不得改任何记录。
+  assert.equal(JSON.stringify(harness.reportState()), before, '概览必须零副作用')
+  assert.equal(rowsOf(harness).length, 1)
+
+  // 有自画像时给一行摘要（两个 facet 的条数 + 最近一条正文）。
+  const portrait = await writeSelf(harness, {
+    kind: 'agent_self', facet: 'persona', subject: 'voice',
+    text: '我在解释概念时会先给出结论再补充理由。',
+  })
+  assert.equal(portrait.ok, true, `前提：自画像写入成功（${String(portrait.error ?? '')}）`)
+  const withPortrait = await harness.runCommand('')
+  assert.match(withPortrait.text, /自画像：人格 1 条 \/ 工作倾向 0 条；最近：我在解释概念时/u, withPortrait.text)
+  // 待确认数如实反映队列（writePolicy=ask 时模型写入进队列）。
+  const asked = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false, selfReflectEnabled: false } })
+  t.after(() => asked.dispose())
+  await asked.settle()
+  const queued = await writeTool(asked, { kind: 'semantic', text: '概览用例：这条写入进入待确认队列' })
+  assert.equal(queued.pending, true)
+  assert.match((await asked.runCommand('')).text, /待确认：1 条/u, '概览的待确认数必须如实')
+})
+
+test('host#165 /memory admin（不带子命令）列出全部 20 个子命令与一句话说明', async (t) => {
+  const harness = makeHarness({ noReport: true })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const out = await harness.runCommand('admin')
+  assert.equal(out.kind, 'success', out.text)
+  assert.match(out.text.split('\n')[0]!, /\/memory admin <子命令>/u, '首行给用法')
+  const listed = listedAdminSubs(out.text)
+  assert.deepEqual([...listed].sort(), [...ADMIN_SUBCOMMANDS].sort(), `admin 必须恰好列出这 20 个子命令：\n${out.text}`)
+  // 每个子命令都带一句话说明（用法之后仍有非空说明）。
+  for (const line of out.text.split('\n').slice(1)) {
+    assert.match(line, /\S\s{2,}\S/u, `每个子命令都要有说明：${line}`)
+  }
+
+  // 未知子命令：明确报错，并照旧给出全部子命令（不静默回落 help）。
+  const bogus = await harness.runCommand('admin definitely-not-a-subcommand')
+  assert.equal(bogus.kind, 'error')
+  assert.match(bogus.text, /未知的 admin 子命令/u)
+  assert.match(bogus.text, /\/memory admin <子命令>/u)
+})
+
+test('host#166 admin 只读子命令：list / show / stats / pending / branch / trace / verify / audit / export 各至少一次', async (t) => {
+  // 正文与事件文本同源，verify 的覆盖率才会过阈值。
+  const text = '记住：构建统一用 pnpm，产物输出到 dist 目录。'
+  const fake = makeFakeSessionQuery([{
+    id: TRACE_SESSION,
+    cwd: 'C:\\work\\demo',
+    createdAt: 1_000,
+    events: [seqUserEvent(text, 10)],
+  }])
+  const harness = makeHarness({
+    sessionQuery: fake.query,
+    config: { writePolicy: 'ask', selfIntroEnabled: false, selfReflectEnabled: false },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const traced = await writeWithRefs(harness, text, [{ sessionId: TRACE_SESSION, from: 10, to: 10, via: 'tool' }])
+  const queued = await writeTool(harness, { kind: 'semantic', text: '另一条进入待确认队列的写入' })
+  assert.equal(queued.pending, true, '前提：writePolicy=ask 下模型写入进队列')
+  const id = String(traced.id)
+
+  // list
+  const list = await harness.runCommand('admin list')
+  assert.equal(list.kind, 'success', list.text)
+  assert.match(list.text, new RegExp(id.slice(0, 8), 'u'), 'admin list 要列出 active 记录')
+  assert.doesNotMatch(list.text, /另一条进入待确认队列的写入/u, 'admin list 不得列出 pending')
+
+  // show
+  const show = await harness.runCommand(`admin show ${id}`)
+  assert.equal(show.kind, 'success', show.text)
+  assert.match(show.text, /构建统一用 pnpm/u)
+  assert.match(show.text, /来源：/u)
+
+  // stats
+  const stats = await harness.runCommand('admin stats')
+  assert.match(stats.text, /记录数：2（active 1，播种 0）/u, stats.text)
+  assert.match(stats.text, /待确认：1 条/u)
+
+  // pending
+  const pending = await harness.runCommand('admin pending')
+  assert.match(pending.text, /另一条进入待确认队列的写入/u, pending.text)
+
+  // branch
+  const branch = await harness.runCommand('admin branch')
+  assert.equal(branch.kind, 'success', branch.text)
+  assert.match(branch.text, /记忆分支/u)
+
+  // trace
+  const trace = await harness.runCommand('admin trace 84a547da')
+  assert.equal(trace.kind, 'success', trace.text)
+  assert.match(trace.text, /来源反查/u)
+  assert.match(trace.text, new RegExp(id.slice(0, 8), 'u'))
+
+  // verify
+  const verify = await harness.runCommand(`admin verify ${id}`)
+  assert.equal(verify.kind, 'success', verify.text)
+  assert.match(verify.text, /✅ 命中/u, verify.text)
+
+  // audit（--limit 也照旧）
+  const audit = await harness.runCommand('admin audit --limit 5')
+  assert.equal(audit.kind, 'success', audit.text)
+  assert.match(audit.text, /\[记忆审计 · 内存尝试环 \d+ 条 · 容量 50\]/u, audit.text)
+
+  // export
+  const file = join(harness.tempDir, 'admin-export.json')
+  const exported = await harness.runCommand(`admin export ${file}`)
+  assert.equal(exported.kind, 'success', exported.text)
+  assert.match(exported.text, /已导出/u)
+  assert.match(readFileSync(file, 'utf8'), /构建统一用 pnpm/u, '导出文件必须真的落盘')
+})
+
+test('host#167 admin 治理子命令：consolidate / import / pin / archive / restore / refresh / confirm / reject / approve / reject-pending / clear 各至少一次', async (t) => {
+  const harness = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false, selfReflectEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  // 前提：三条用户侧记录 + 两条待确认写入 + 一条待清空的 victim。
+  const pinned = await harness.memory().write({ kind: 'semantic', text: '治理用例甲：构建产物统一放在 dist 目录下', origin: 'observed' })
+  const confirmed = await harness.memory().write({ kind: 'semantic', text: '治理用例乙：发布流程统一走 pnpm publish', origin: 'observed' })
+  const rejected = await harness.memory().write({ kind: 'semantic', text: '治理用例丙：数据库迁移前先跑一遍完整测试', origin: 'observed' })
+  const victim = await harness.memory().write({ kind: 'procedural', text: '清理用例：临时文件统一放 .tmp 目录', origin: 'observed' })
+  for (const row of [pinned, confirmed, rejected, victim]) {
+    assert.equal(row.ok, true, `前提：写入成功（${String(row.error ?? '')}）`)
+  }
+  const queuedA = await writeTool(harness, { kind: 'semantic', text: '待确认甲：日志统一写成单行 JSON' })
+  const queuedB = await writeTool(harness, { kind: 'semantic', text: '待确认乙：提交信息统一用祈使句' })
+  assert.equal(queuedA.pending, true, '前提：第一条进入待确认队列')
+  assert.equal(queuedB.pending, true, '前提：第二条进入待确认队列')
+
+  // 用**完整 id**：同一毫秒创建的多条记录前 8 位可能撞前缀（前缀歧义是另一条契约）。
+  const fullId = (row: Json): string => String(row.id)
+
+  const consolidated = await harness.runCommand('admin consolidate')
+  assert.equal(consolidated.kind, 'success', consolidated.text)
+  assert.match(consolidated.text, /整合完成：合并/u)
+
+  const inbox = join(harness.tempDir, 'admin-import.json')
+  writeFileSync(inbox, JSON.stringify({
+    items: [{ kind: 'semantic', text: '导入用例：日志统一写成单行 JSON。', subject: 'log.format' }],
+  }))
+  const imported = await harness.runCommand(`admin import ${inbox}`)
+  assert.equal(imported.kind, 'success', imported.text)
+  assert.match(imported.text, /导入完成：新建 1 条/u)
+
+  assert.match((await harness.runCommand(`admin pin ${fullId(pinned)}`)).text, /已固定/u)
+  assert.match((await harness.runCommand(`admin archive ${fullId(pinned)}`)).text, /已归档/u)
+  assert.match((await harness.runCommand(`admin restore ${fullId(pinned)}`)).text, /已恢复/u)
+  assert.match((await harness.runCommand(`admin refresh ${fullId(confirmed)}`)).text, /已刷新/u)
+  assert.match((await harness.runCommand(`admin confirm ${fullId(confirmed)}`)).text, /已确认/u)
+  assert.match((await harness.runCommand(`admin reject ${fullId(rejected)}`)).text, /已拒绝/u)
+  assert.match((await harness.runCommand(`admin approve ${fullId(queuedA)}`)).text, /已批准/u)
+  assert.match((await harness.runCommand(`admin reject-pending ${fullId(queuedB)}`)).text, /已拒绝/u)
+
+  const cleared = await harness.runCommand('admin clear --kind=procedural --yes')
+  assert.equal(cleared.kind, 'success', cleared.text)
+  assert.match(cleared.text, /已永久删除 1 条记忆/u, cleared.text)
+
+  // 状态必须真的落地（不是只回了一句 success）。
+  const rows = rowsOf(harness)
+  assert.equal(rows.find((row) => row.id === pinned.id)!.pinned, true, 'pin 要真的固定')
+  assert.equal(rows.find((row) => row.id === confirmed.id)!.origin, 'user_explicit', 'confirm 要真的升级来源')
+  assert.equal(rows.find((row) => row.id === rejected.id)!.status, 'invalid', 'reject 要真的置 invalid')
+  assert.equal(rows.find((row) => row.id === queuedA.id)!.status, 'active', 'approve 要真的置 active')
+  assert.equal(rows.find((row) => row.id === queuedB.id)!.status, 'invalid', 'reject-pending 要真的置 invalid')
+  assert.equal(rows.some((row) => row.id === victim.id), false, 'clear 必须真的删除')
+})
+
+test('host#168 隐藏别名回归：旧写法仍可用，且输出与 /memory admin 路径逐字相同', async (t) => {
+  const text = '记住：构建统一用 pnpm，产物输出到 dist 目录。'
+  const fake = makeFakeSessionQuery([{
+    id: TRACE_SESSION,
+    cwd: 'C:\\work\\demo',
+    createdAt: 1_000,
+    events: [seqUserEvent(text, 10)],
+  }])
+  const harness = makeHarness({
+    sessionQuery: fake.query,
+    config: { writePolicy: 'ask', selfIntroEnabled: false, selfReflectEnabled: false },
+  })
+  t.after(() => harness.dispose())
+  await harness.settle()
+
+  const traced = await writeWithRefs(harness, text, [{ sessionId: TRACE_SESSION, from: 10, to: 10, via: 'tool' }])
+  const queued = await writeTool(harness, { kind: 'semantic', text: '待确认的回归用例' })
+  assert.equal(queued.pending, true, '前提：队列里有一条待确认写入')
+
+  // 只读命令：同一次会话里连跑两条路径，必须逐字相同（同一次调用后的状态也一样）。
+  const sameReadOnly = async (alias: string, admin: string): Promise<void> => {
+    const viaAlias = await harness.runCommand(alias)
+    const viaAdmin = await harness.runCommand(admin)
+    assert.equal(viaAlias.kind, viaAdmin.kind, `${alias} 与 ${admin} 的 kind 必须一致`)
+    assert.equal(viaAlias.kind, 'success', `${alias} 必须仍然可用：${viaAlias.text}`)
+    assert.equal(viaAlias.text, viaAdmin.text, `${alias} 与 ${admin} 的输出必须逐字相同\n旧：${viaAlias.text}\n新：${viaAdmin.text}`)
+  }
+
+  const id = String(traced.id)
+  await sameReadOnly('pending', 'admin pending')
+  await sameReadOnly('branch', 'admin branch')
+  await sameReadOnly('branch --all', 'admin branch --all')
+  await sameReadOnly('trace 84a547da', 'admin trace 84a547da')
+  await sameReadOnly('audit', 'admin audit')
+  await sameReadOnly('audit --limit 5', 'admin audit --limit 5')
+  await sameReadOnly('list', 'admin list')
+  await sameReadOnly('list --archived', 'admin list --archived')
+  await sameReadOnly(`show ${id}`, `admin show ${id}`)
+  await sameReadOnly('stats', 'admin stats')
+  await sameReadOnly(`verify ${id}`, `admin verify ${id}`)
+
+  // 改状态命令：用「同一份盘上数据」的两个实例分别跑旧写法与新写法（id 逐字相同）。
+  // 播种前深拷贝：两个实例的状态必须各自独立，否则第一个实例的批准会改到第二个的库。
+  const writer = makeHarness({ config: { writePolicy: 'ask', selfIntroEnabled: false, selfReflectEnabled: false } })
+  t.after(() => writer.dispose())
+  await writer.settle()
+  const pendingRow = await writeTool(writer, { kind: 'semantic', text: '审批门回归：这条待确认写入用于比对两条入口' })
+  assert.equal(pendingRow.pending, true)
+  const snapshot = new Map<string, Json>(
+    [...writer.domain.rows.entries()].map(([key, value]) => [key, JSON.parse(JSON.stringify(value)) as Json]),
+  )
+  const reborn = makeHarness({
+    config: { writePolicy: 'ask', selfIntroEnabled: false, selfReflectEnabled: false },
+    seedDomainRows: snapshot,
+  })
+  t.after(() => reborn.dispose())
+  await reborn.settle()
+
+  const viaAdmin = await writer.runCommand(`admin approve ${String(pendingRow.id)}`)
+  const viaAlias = await reborn.runCommand(`approve ${String(pendingRow.id)}`)
+  assert.equal(viaAdmin.kind, 'success', viaAdmin.text)
+  assert.equal(viaAlias.kind, 'success', viaAlias.text)
+  assert.equal(viaAlias.text, viaAdmin.text, `approve 与 admin approve 的输出必须逐字相同\n旧：${viaAlias.text}\n新：${viaAdmin.text}`)
+  assert.equal(rowsOf(writer).find((row) => row.id === pendingRow.id)!.status, 'active')
+  assert.equal(rowsOf(reborn).find((row) => row.id === pendingRow.id)!.status, 'active')
 })

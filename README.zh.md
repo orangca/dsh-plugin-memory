@@ -85,7 +85,7 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
   /memory self set persona name 我叫小忆。                   # → self.persona.name
   /memory self set persona address_user 我称呼你为「老板」。   # → self.persona.address_user
   /memory self set persona address_self 用户叫我「忆」。       # → self.persona.address_self
-  /memory self set persona 我重视把事实和推测分开说。           # 不带 key：仍写 self.persona.general
+  /memory self set persona 我重视把事实和推测分开说。           # → self.persona.general（命名 key 是可选的）
   ```
 
   命名 key 只在 `persona` 面识别；写成别的 key、或用在 `work` 面，都按普通正文处理。
@@ -97,12 +97,12 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 /memory self set <persona|work> [name|address_user|address_self] <正文>    用户直接设定/覆盖（用户侧、固定、置信度 1）；带命名 key 时同时定下称呼
 /memory self history [subject]            修订链：由旧到新（含归档时间）
 /memory self reset [persona|work]         归档当前自画像（保留历史，不删除）
-/memory verify <id prefix>                    回到引用指向的事件核对这条记忆的来源（只读）
+/memory admin verify <id prefix>          回到引用指向的事件核对这条记忆的来源（只读）
 ```
 
 ## `/sleep`：空闲梳理
 
-`/memory consolidate` 只做**库内治理**（合并 / 失效 / 归档 / 摘要）；`/sleep` 是**独立命令**（不是
+`/memory admin consolidate` 只做**库内治理**（合并 / 失效 / 归档 / 摘要）；`/sleep` 是**独立命令**（不是
 `/memory` 的子命令），做的是**跨库 + 跨会话**的梳理：把最近若干会话的**完整事件日志**重新过一遍记忆管线，
 补上当时漏掉的记忆，再把整个库重新排一遍。
 
@@ -113,11 +113,11 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 - **默认只是预览**：只读、只算，输出一份「会怎么改」的计划 —— 补录几条、合并几组、失效几条、归档几条、
   重算哪几段项目印象。**不写任何东西**。
 - **`--apply` 才落盘**，而且第一步就是**自动导出备份**（导出目录下的 `sleep-backup-<ISO 时间戳>.json`，
-  复用 `/memory export` 的实现）：备份失败即中止，绝不「先改再备份」。
+  复用 `/memory admin export` 的实现）：备份失败即中止，绝不「先改再备份」。
 - `--sessions=N` 回看最近 N 个会话（默认 `sleepSessions`，上限 20）；不带 `--all` 时按当前/最近会话的
   cwd 过滤，免得把别的项目的事混进来。
 - 会话记录经宿主的 `sessionQuery` 服务读取；宿主没有这个服务时，命令给出说明并提示
-  `/memory consolidate` 仍可用。
+  `/memory admin consolidate` 仍可用。
 - **只认真实用户消息**：只有 `source.kind === 'user'` 的消息算数 —— 插件自己注入的上下文不算（防自激）；
   `origin: 'subagent'` 的子代理会话默认跳过。
 - 各项预算（单会话 `sleepMaxCharsPerSession`、合计 `sleepMaxCharsTotal`、补录 `sleepMaxBackfill`）任一
@@ -143,15 +143,15 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 - **零成本**：序号来自已经订阅的 `session/event` 回调，不额外读盘、不额外调用模型。
 - **写路径全覆盖**：回合收尾捕获记 `turnStart..last` 区间；模型工具、用户命令、压缩固化记单点 `last`；
   `/sleep` 补录记**用户当时那条消息**的序号。合并（reinforce/refine）时新引用并入旧条目，旧引用保留。
-- **可核对**：`/memory verify <id>` 回到引用指向的事件，用信息量 token 覆盖率判断「记录正文在不在那里」，
+- **可核对**：`/memory admin verify <id>` 回到引用指向的事件，用信息量 token 覆盖率判断「记录正文在不在那里」，
   输出 `✅ 命中（覆盖率 x）` / `⚠️ 未命中` / `⚠️ 会话或事件不存在`。只读，不改任何数据。
-- **展示**：`/memory show <id>` 会多一行「来源：…」；`memory_explain` 的记录视图也带 `refs`。
+- **展示**：`/memory admin show <id>` 会多一行「来源：…」；`memory_explain` 的记录视图也带 `refs`。
 - **机器可读形态**：一条引用写作 `sessionId#from-to`，单点引用只写 `sessionId#from`
   （完全没带序号的引用就是裸 `sessionId`），多条用 `;` 分隔 ——
   `session-84a547da-5727-4ffc-adf0-26d02e749e13#120-180;session-…-…#93`（`…-…-…` 是省略的 id 段，不是字面量）。
   **存储**形态一律保留完整会话 id；短化形态（`ses-84a547da#120-180`）只用于展示，`formatRefs` 默认**不**短化。
 - **不参与指纹**：`recordHash` 不吃 `refs` —— 否则同一条记忆会因为来源不同被判成两条，破坏去重与幂等。
-  0.5.9 之前的记录没有引用，一切读取路径都容错（`/memory verify` 会说明「这条没有引用」）。
+  0.5.9 之前的记录没有引用，一切读取路径都容错（`/memory admin verify` 会说明「这条没有引用」）。
 
 `refsEnabled`（默认 `true`）关掉后新记录不再带引用（已有引用不受影响）；`refsMax`（默认 `5`）限制每条保留几个。
 
@@ -169,29 +169,30 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 - **默认 `auto` 不改变任何现有行为**：升级后不该察觉差异 —— 模型写入照旧立刻生效、不进队列。
 - **只门控模型自己提出的记忆**：规则捕获（`observed`）、你明确要求（`user_explicit`）、你的纠正
   （`user_correction`）**不受门控** —— 那些本来就是你说的话，塞进队列只会淹没它们。
-- **模型不能自我批准**：没有任何模型工具能改 `pending`；只有你敲 `/memory approve` 才行。
+- **模型不能自我批准**：没有任何模型工具能改 `pending`；只有你敲 `/memory admin approve` 才行。
 
-待确认队列怎么用：
+待确认队列怎么用（0.5.27 起收在 `admin` 下；旧写法照旧可用）：
 
 ```
-/memory pending                    列出待确认写入（id · kind/facet · 来源 · 时间 · 引用 · 正文预览）
-/memory approve <id 前缀>          批准 → 立刻生效（若是自画像，此刻才跑收敛）
-/memory reject-pending <id 前缀>   拒绝 → 置为 invalid（保留用于审计，不物理删除）
+/memory admin pending                    列出待确认写入（id · kind/facet · 来源 · 时间 · 引用 · 正文预览）
+/memory admin approve <id 前缀>          批准 → 立刻生效（若是自画像，此刻才跑收敛）
+/memory admin reject-pending <id 前缀>   拒绝 → 置为 invalid（保留用于审计，不物理删除）
 ```
 
 - **pending 绝不进上下文**：常驻注入（R1）、按轮召回（R2）、自画像、项目印象、检索与整合一律看不见它 ——
   未批准的模型猜想进系统提示是本功能最严重的失效模式，每条读取路径都有测试钉死。
-  只有两个窗口能显式看到它：`/memory pending`，以及 `memory_explain` 的诊断输出。
+  只有两个窗口能显式看到它：`/memory admin pending`，以及 `memory_explain` 的诊断输出。
 - **有界且诚实**：`pendingMax`（默认 `50`）封顶；队列满了**拒绝新写入并报结构化错误**，
-  绝不静默丢弃、也不自动压缩 —— 先用 `/memory pending` 处理掉几条；`0` = 不设上限。
+  绝不静默丢弃、也不自动压缩 —— 先用 `/memory admin pending` 处理掉几条；`0` = 不设上限。
 - **审批不绕过安全闸**：`ask` 模式下敏感信息照样在**入队前**就被拒写，队列不是脱敏的后门。
-- **拒绝留痕**：`reject-pending` 置 `invalid` 而非删除，审计与 `/memory verify` 仍能看到它曾经存在。
+- **拒绝留痕**：`reject-pending` 置 `invalid` 而非删除，审计与 `/memory admin verify` 仍能看到它曾经存在。
 - 待确认记录照常落盘（进程重启后仍在）；`/memory stats` 与 `memory_stats` 会显示「待确认：N 条（writePolicy=…）」。
 
-`writePolicy`（默认 `auto`）与 `pendingMax`（默认 `50`）都在设置页表单里。
+`writePolicy`（默认 `auto`）在设置页表单里；`pendingMax`（默认 `50`）只走 patch 行（0.5.27 起不再渲染进表单，
+其余行为一概不变）。
 
-> 队列的拒绝出口是 `/memory reject-pending <id 前缀>`；既有的 `/memory reject <id 前缀>` 是「拒绝一条
-> 自我观察（同类不再产生）」，两者语义不同，别混。
+> 队列的拒绝出口是 `/memory admin reject-pending <id 前缀>`；既有的 `/memory admin reject <id 前缀>` 是「拒绝一条
+> 自我观察（同类不再产生）」，两者语义不同，别混；旧写法（`/memory reject-pending`、`/memory reject`）照旧可用。
 
 ## 模型可见文本语言（language）：模型看英文，终端看中文
 
@@ -204,7 +205,7 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 | 注入提示词（`REFLECT_NOTICE`、`INTRO_NOTICE`） | ✅ 是 | 同一条通道 |
 | 每轮召回块头/页脚（R2） | ✅ 是 | 同一条通道 |
 | 7 个 `memory_*` 工具的**描述与参数说明** | ✅ 是 | 工具 schema 直接进模型上下文 |
-| 命令输出（`/memory list`、`/memory show`、`/sleep` 预览、`stats`…） | ❌ **否，仍为中文** | 用户可见、量大，本轮明确不做 |
+| 命令输出（`/memory admin list`、`/memory admin show`、`/sleep` 预览、`stats`…） | ❌ **否，仍为中文** | 用户可见、量大，本轮明确不做 |
 
 - **默认 `'zh'` 不改变任何行为**：`language` 未设置、缺失或非法时，注入的每一个字节都与 0.5.10 相同 ——
   英文表是新增，不是对中文表的重写。
@@ -234,7 +235,7 @@ DSH（DeepSeek Harness）的**个性化长期记忆**插件：本地优先、自
 - **`branch` 参与 `recordHash`**：它改变的是记录的**适用范围**（不只是来源），所以「主干上通用的构建约定」
   与「只在 `feat/x` 成立的临时约定」即使正文相同也是两条记录。（`refs` 是来源证据，故不参与指纹。）
 - 分支名做**规范化**：trim、去掉 `refs/heads/` 前缀、最长 100 字符；非法（空、含控制字符）→ 视为无标签。
-- **可见可排查**：`/memory branch` 显示当前分支、带标签条数与分组；`/memory branch --all` 附带列出其它分支的
+- **可见可排查**：`/memory admin branch` 显示当前分支、带标签条数与分组；`/memory admin branch --all` 附带列出其它分支的
   标签记录。`/memory stats` 与 `memory_stats` 会多一行「分支：…（branchAware=…）」，
   `memory_explain` 能看到「这条因为分支不匹配被挡住了」以及原因。
 - **零 shell**：插件只读 `.git/HEAD`（worktree/submodule 场景再读 `.git` 文件里的 `gitdir:` 指针），
@@ -294,10 +295,10 @@ if (memory?.setEmbedder) {                                 // '1.2' 服务面没
   也不能替他们做这个决定。你不注入嵌入器，就什么都不会被发出去；你若注入的嵌入器会调远端 API（例如 `id` 写着
   `openai:text-embedding-3-small` 的那种），**记忆正文就会离开本机**。
 
-## `/memory audit`：写入审计与注入核对
+## `/memory admin audit`：写入审计与注入核对
 
 不是每一次写入都会留下一行记录：**被拒**的写入什么都不留，于是「为什么这条没进记忆」没有答案。
-`/memory audit` 把两种视角摆在一起，却不留第二份真相：
+`/memory admin audit` 把两种视角摆在一起，却不留第二份真相：
 
 | 来源 | 覆盖 | 持久性 |
 |---|---|---|
@@ -307,7 +308,7 @@ if (memory?.setEmbedder) {                                 // '1.2' 服务面没
 正因如此，审计**不新增存储**：成功的写事件由记录本身派生，只有「尝试」这一侧 —— 包括所有被拒的 —— 放进有界的环里。
 
 ```
-/memory audit [--limit N] [--verify]
+/memory admin audit [--limit N] [--verify]
 ```
 
 - **`--limit N`**：最多显示最近 N 条尝试（默认 `20`，上限 `200`；也认 `--limit=N`；缺值或非正数回落默认值）。
@@ -318,13 +319,13 @@ if (memory?.setEmbedder) {                                 // '1.2' 服务面没
 - **缺口要说出来，绝不藏。** 没有 `sessionQuery`、当前会话 id 未知、日志读不到、日志里没有任何 `user/message`
   事件时，命令**明说「无法核对」及原因**；不带 `--verify` 时也会说明「本轮没有核对」。
   「没核对」永远不会被渲染成「核对通过」—— 否则「模型可见 ⟺ 已记录」就失去意义。
-- **只读，且绝不挡路。** `/memory audit` 与 `--verify` 不改任何记录、不改状态、不动任何计数器 ——
+- **只读，且绝不挡路。** `/memory admin audit` 与 `--verify` 不改任何记录、不改状态、不动任何计数器 ——
   读审计不会自己推一条审计事件（否则一次 `--verify` 会改变下一次的输入）。推事件、渲染、比对全部包在
   `try/catch` 里：审计出异常也**不影响写入与注入**。
 - `auditMax`（默认 `50`）是环的容量；`0` = 不记录任何尝试（命令照常可用，库内汇总仍会显示）。
   `/memory stats` 与 `memory_stats` 会带一行摘要（最近尝试 · 记录档条数 · 核对未命中次数），详细内容在这里。
 
-`auditMax`（默认 `50`）是设置页里的普通数字字段。
+`auditMax`（默认 `50`）只走 patch 行（0.5.27 起不再渲染进设置页；默认值与行为一概不变）。
 
 ## 防「记忆污染 / 自激」
 
@@ -363,7 +364,7 @@ dsh plugin --profile desktop add dsh-plugin-memory
 dsh plugin --profile desktop remove dsh-plugin-memory
 ```
 
-要清空数据，用 `/memory clear --all --yes`，或手动删除 `$DSH_HOME/storages/<domainName>/`。
+要清空数据，用 `/memory admin clear --all --yes`，或手动删除 `$DSH_HOME/storages/<domainName>/`。
 
 ### 手工安装（不用插件管理器）
 
@@ -379,8 +380,16 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置表单在哪
 
-插件导出 schemastery `Config`，其中 **30 个字段**声明为 `volatile()`（改动热生效），其余只能通过 patch 行设置；
-同时附带一个小的浏览器半边（`src/client.ts`，构建为 `lib/client.js`）把这 30 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
+插件导出 schemastery `Config`，所有字段都声明为 `volatile()`（改动热生效）。表单里只有 **8 个字段** ——
+`domainName`、`captureMode`、`recallMode`、`writePolicy`、`language`、`selfPortraitEnabled`、`branchAware`、
+`sleepEnabled` —— 分 4 组；**其余 22 个键只走 patch 行**：照旧可用、照旧热生效，只是不再渲染进表单
+（**Schema 未变**：30 个键仍然全部是 `volatile()`，所以 patch 行改完仍旧无需重启）。这 22 个是
+`maxInjectedTokens`、`maxItemTokens`、`recallTopK`、`captureMaxPerTurn`、`consolidateEnabled`、
+`consolidateIntervalMinutes`、`selfPortraitMaxTokens`、`selfPersonaMaxTokens`、`selfPortraitMergeThreshold`、
+`selfReflectEnabled`、`selfReflectEveryTurns`、`selfReflectMinTurn`、`selfReflectMaxPerSession`、`selfIntroEnabled`、
+`selfIntroMinTurn`、`selfIntroMaxAsks`、`sleepSessions`、`sleepMaxBackfill`、`refsEnabled`、`refsMax`、`pendingMax`、
+`auditMax`，各自的默认值与含义都列在下面的[配置](#配置)表里。同时附带一个小的浏览器半边（`src/client.ts`，
+构建为 `lib/client.js`）把这 8 个字段渲染成表单。位置：**「插件」页 → `dsh-plugin-memory` → 行 `dsh-memory`**
 （列表里的行卡片上还有一行摘要）。
 
 实现上，客户端半边注册进 **keyed** 插槽 `plugins.row.config`，key 为
@@ -389,38 +398,26 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 用户命令
 
-```
-/memory list [--kind=agent_self] [--archived]   列出记忆（归档条目需 --archived）
-/memory search <关键词>                          词面检索（含归档，不含已失效）
-/memory show <id 前缀>                           查看完整记录（含来源与时间线）
-/memory branch [--all]                           当前分支、带标签条数与分组（--all 附带其它分支的标签记录）
-/memory forget <id 前缀>                         永久删除一条
-/memory restore <id 前缀>                        恢复被失效/归档的条目（并撤销推翻它的条目）
-/memory pin <id 前缀>                            固定（不衰减、不自动归档）
-/memory archive <id 前缀>                        归档（不常驻注入，仍可检索）
-/memory refresh <id 前缀>                        刷新（衰减重新计时）
-/memory confirm <id 前缀>                        把模型自评升级为用户确认
-/memory reject <id 前缀>                         拒绝一条自我观察（同类不再产生）
-/memory pending                                  列出待确认写入（只读；id 供 approve / reject-pending 取用）
-/memory approve <id 前缀>                        批准一条待确认写入，立刻生效（writePolicy=ask 的出口）
-/memory reject-pending <id 前缀>                 拒绝一条待确认写入（置 invalid 保留审计）
-/memory self                                     自画像：列出人格与工作两小节
-/memory self set <persona|work> [name|address_user|address_self] <正文>            直接设定/覆盖自画像（用户侧、固定、置信度 1）；带命名 key 时同时定下称呼
-/memory self history [subject]                   自画像修订链（旧 → 新，含归档时间）
-/memory self reset [persona|work]                归档当前自画像（保留历史，不删除）
-/memory verify <id prefix>                    回到引用指向的事件核对这条记忆的来源（只读）
-/memory trace <sessionId 前缀> [#<seq>]        来源反查：列出引用指向该会话的记忆（#<seq> 只看覆盖该序号的区间；--at <seq> 等价）（只读）
-/memory audit [--limit N] [--verify]            写入审计：最近尝试 + 库内汇总；--verify 核对本会话注入是否逐字出现在会话日志里（只读）
-/memory export [path]                            导出 JSON
-/memory import <path>                            导入 JSON（按指纹去重；逐字段校验、数值夹取、`pinned` 强制关闭、来源一律降级为 `observed`）
-/memory clear --all --yes                        永久清空全部（`--all` 与下面的筛选条件互斥）
-/memory clear --kind=<kind> --scope=<level> --yes   清空子集；条件之间是 AND，取值按枚举校验
-/memory consolidate                              立即整理一次
-/memory stats                                    运行时可观测：计数、写入、渲染耗时、注入行数
-/memory help
+日常只用这 6 条命令（0.5.27 起；`/memory help` 列出的就是这一套）。其余子命令一条都没少 —— 只是收在
+`/memory admin <子命令>` 下：
 
+```
+/memory                                          概览：库名、条数、待确认、自画像一行摘要、语言
+/memory search <查询>                            按查询检索（id 前缀 / 类型 / 正文）
+/memory forget <id 前缀>                         删除一条（按 query 删除需 --query … --yes）
+/memory self [set|history|reset]                 自画像：查看 / 直接设定（含命名 key）/ 版本链 / 归档
+/memory help                                     只列上面这些 + `/memory admin` 一行说明
 /sleep [--sessions=N] [--all] [--apply]          空闲梳理（独立命令，不是 /memory 的子命令）：默认只预览；--apply 先备份再落盘
 ```
+
+- `/memory` **不带参数就是概览**（库名 / 条数 / 待确认 / 自画像 / 语言），并指向上面的日常命令。
+- `/memory admin <子命令>` 收纳 20 个治理与诊断子命令：`list`、`show`、`stats`、`pending`、`approve`、
+  `reject-pending`、`export`、`import`、`clear`、`consolidate`、`branch`、`trace`、`verify`、`audit`、`pin`、
+  `archive`、`restore`、`confirm`、`reject`、`refresh`。不带子命令时 `/memory admin` 会把它们连同各自的一句话
+  说明全部列出；**每个子命令的参数语义完全沿用现状**（例如 `audit --verify`、`branch --all`、
+  `trace <前缀>#<seq>`）。
+- 旧写法**行为完全不变**（`/memory pending`、`/memory approve <id>`、`/memory trace …`、`/memory audit --verify` …），
+  只是不再出现在任何列表里 —— 没有删除任何东西。
 
 ## 模型工具
 
@@ -436,7 +433,9 @@ dsh plugin --profile desktop remove dsh-plugin-memory
 
 ## 配置
 
-在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 30 个字段：
+在 patch 行里设置 `config`；完整默认值见 `src/lib.ts` 的 `DEFAULTS`。表单里可改的 **8 个字段**（顺序即表单顺序）是
+`domainName`、`captureMode`、`recallMode`、`writePolicy`、`language`、`selfPortraitEnabled`、`branchAware`、
+`sleepEnabled`；下表列全部 30 个 `volatile` 键：这 8 个在表单里保存，其余 22 个走 patch 行（默认值与热生效语义完全相同）。
 
 | 字段 | 默认 | 含义 |
 |---|---|---|

@@ -28,26 +28,41 @@ README 的「Three paths」「Known limitations」、[`docs/protocol-v1.md`](pro
 
 | 能力 | 你能感知到什么 | 落地版本 | 契约 / 依据 |
 |---|---|---|---|
-| 本地存储 + 设置表单 | 数据全在 `$DSH_HOME/storages/<domainName>/`（默认 `dsh_memory`），全机一份；设置页 30 个字段改完即热生效 | 存储与浏览器半边 **0.4.2**（首个公开提交）；表单 30 字段于 **0.5.14** | README「The settings form」；`docs/protocol-v1.md` §5 |
+| 本地存储 + 设置表单 | 数据全在 `$DSH_HOME/storages/<domainName>/`（默认 `dsh_memory`），全机一份；设置页 **8 个字段**改完即热生效（`domainName` / `captureMode` / `recallMode` / `writePolicy` / `language` / `selfPortraitEnabled` / `branchAware` / `sleepEnabled`），其余 22 个键走 patch 行、照旧热生效 | 存储与浏览器半边 **0.4.2**（首个公开提交）；表单 30 字段于 **0.5.14**；收敛到 8 字段于 **0.5.27**（M28） | README「The settings form」；`docs/protocol-v1.md` §5；[`docs/simplify.md`](simplify.md) §1 |
 | 规则捕获（零模型调用） | 回合结束时从**真实用户消息**抽偏好 / 约定 / 事实；硬秘密直接拒写、PII 脱敏后写入；同一事实换会话再提会提升重要性而非新增重复行 | **0.4.2** | README「Three paths」§1 |
 | 双通道注入 | R1 常驻：用户画像 + 自画像 + 当前工作区项目印象；R2 每轮：只注入与本轮真正相关的那几条，带 per-id 冷却与 token 预算 | **0.4.2** | README「Three paths」§2；协议 §3.3 |
 | 自画像（人格 + 工作倾向） | 模型对自己的认知（我是谁 / 怎么说话 / 工作倾向），机会式更新：合并 / 强化 / 细化 / 取代 / 跳过，取代保留版本链；低频反思提示 | v2 于 **0.5.4**（页脚口径改为「按事实判断」于 **0.5.5**） | [`docs/self-portrait.md`](self-portrait.md)（M6） |
 | 首次称呼一次性设定 | 从第 2 回合起、每会话最多一次、跨会话累计最多 `selfIntroMaxAsks`（默认 2）次，模型用**一句话**问「我叫你什么、你怎么称呼我」；明确拒绝也算「定过了」，永不再问 | **0.5.6** | `docs/self-portrait.md` §7（M7） |
 | `/sleep` 空闲梳理 | 独立命令（不是 `/memory` 子命令）：预览默认、不写盘；`--apply` **先备份再写**；重放最近会话完整日志补录漏掉的，再对全库重跑合并 / 冲突 / 归档 / gist | **0.5.7** | [`docs/sleep.md`](sleep.md)（M8） |
-| 可核验引用 | 每条记忆带 `refs`（会话 + 事件序号区间）；`/memory verify <id>` 回原文用 token 覆盖率核对并给 `✅ hit / ⚠️ miss`；`/memory show` 打印 `source:` 行 | **0.5.9**（模型可见的 `refs` 字段于 **0.5.16**） | [`docs/refs.md`](refs.md)（M9） |
+| 可核验引用 | 每条记忆带 `refs`（会话 + 事件序号区间）；`/memory admin verify <id>` 回原文用 token 覆盖率核对并给 `✅ hit / ⚠️ miss`；`/memory admin show` 打印 `source:` 行 | **0.5.9**（模型可见的 `refs` 字段于 **0.5.16**） | [`docs/refs.md`](refs.md)（M9） |
 | 写入审批门 `writePolicy` | `auto`（默认）立刻生效 / `ask` 进待确认队列 / `off` 直接拒绝并给可读原因；规则捕获、用户命令、`/sleep`、导入**永不被门控**；模型无法自己批准；`pending` 不进任何注入路径 | **0.5.10** | [`docs/write-policy.md`](write-policy.md)（M10） |
 | 模型可见文本多语言 | `language: 'zh'`（默认）/ `'en'` 只切**模型读到的东西**：注入块及其页眉页脚、反思 / 首次设定提示、R2 块、7 个工具的描述；命令输出**保持中文** | **0.5.11**（英文自画像在默认预算下不渲染的缺陷于 **0.5.12** 修复） | [`docs/i18n.md`](i18n.md)（M11） |
 | 分支感知的项目记忆 | 记录可带 `branch` 标签，注入 / 召回按当前 git 分支过滤；分支未知时带标签行 **fail-closed** 不注入；只读 `.git/HEAD`（含 worktree 的 `gitdir:` 指针），**从不执行 git 命令** | **0.5.13** | [`docs/branch.md`](branch.md)（M12） |
-| 写入审计与注入核对 | `/memory audit` 并列两种视图：**记录派生**（持久）+ **有界内存尝试环**（含被拒 / 入队 / 批准，重启即失）；`--verify` 用逐字 `includes` 核对本会话注入，缺口明说而不是报「通过」 | **0.5.14** | [`docs/audit.md`](audit.md)（M13） |
+| 写入审计与注入核对 | `/memory admin audit` 并列两种视图：**记录派生**（持久）+ **有界内存尝试环**（含被拒 / 入队 / 批准，重启即失）；`--verify` 用逐字 `includes` 核对本会话注入，缺口明说而不是报「通过」 | **0.5.14**（0.5.27 起入口收进 `/memory admin`） | [`docs/audit.md`](audit.md)（M13） |
 | 工具输出带出处 | `memory_recall` / `memory_list` 的每条命中带机器可读 `refs`（`sessionId#from-to`，多条用 `;` 连接；无引用给 `''` 而不是缺键） | **0.5.16** | `CHANGELOG.md` 0.5.16 |
-| 来源反查 | `/memory trace <会话 id 前缀> [#<seq>]`：从一次会话反查它留下了哪些记忆，可按事件序号收窄；只读、分支过滤生效、`pending` 不出现；**故意不加第 8 个工具** | **0.5.17** | [`docs/trace.md`](trace.md)（M15-A） |
+| 来源反查 | `/memory admin trace <会话 id 前缀> [#<seq>]`：从一次会话反查它留下了哪些记忆，可按事件序号收窄；只读、分支过滤生效、`pending` 不出现；**故意不加第 8 个工具** | **0.5.17**（0.5.27 起入口收进 `/memory admin`） | [`docs/trace.md`](trace.md)（M15-A） |
 | 零依赖词面检索升级 | 中文 bigram + 单字兜底、英文轻量词形归并、IDF 加权代替等权命中率、长度归一化让「短而精准」胜过长文堆砌；`memory_explain` 报命中 token 与各自贡献 | **0.5.17** | [`docs/semantic.md`](semantic.md)（M15-B） |
 | 服务面冻结：`ctx.memory` v1 → v1.3 | 第三方插件可依赖 `list` / `stats` / `recall` / `write` / `consolidate`，v1.3 起另有 `setEmbedder` / `capabilities` / `lastRecall`；版本用 `'1.x'` 谓词判断，永不用等号 | v1 **0.5.17**；v1.1 **0.5.18**；v1.2 **0.5.19**；v1.3 **0.5.20** | [`docs/protocol-v1.md`](protocol-v1.md) §1/§9/§10/§11 |
 | 外接嵌入器（可选） | 宿主通过服务面注入 `embed` 后才可能按语义打分：`recall({ mode: 'semantic' \| 'hybrid' })`；未注入时**逐字节**回落词面并在 `lastRecall()` 明说 `fallback: 'no-embedder'`；嵌入失败永不冒泡、永不丢记忆 | **0.5.20** | [`docs/embedder.md`](embedder.md)（M18） |
 | 工程门禁 + 变异体检 | 六道闸进 CI（Node 22.x / 24.x），并有变异抽样（`pnpm mutate:ci`，8 条约 20 秒）；另有常驻变异工具 `pnpm mutate` 回答「测试到底钉住了什么」 | 门禁 **0.5.15**；`mutate` **0.5.24**；`mutate:ci` 进 CI **0.5.25** | [`CONTRIBUTING.md`](../CONTRIBUTING.md)、[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) |
 
 里程碑编号（M6 自画像、M7 初次称呼、M8 `/sleep`、M9 refs、M10 审批门、M11 多语言、M12 分支、M13 审计、
-M15-A/B 反查与检索、M15-C 协议 v1 冻结、M16–M18 协议 v1.1/1.2/1.3）见对应 `docs/*.md` 的标题。
+M15-A/B 反查与检索、M15-C 协议 v1 冻结、M16–M18 协议 v1.1/1.2/1.3、M28 命令面与设置页精简）见对应 `docs/*.md`
+的标题。
+
+## 2.1 精简（M28，0.5.27）：少设置、少命令、能力不减
+
+用户要的是「少设置、少命令、多自动、少人工干预」，并明确**不做激进删除**：这次只动**暴露面**，不动行为、
+不动默认值、不动 Schema（[`docs/simplify.md`](simplify.md)）。
+
+- **设置面 30 → 8**：表单只渲染 8 个字段（`domainName` / `captureMode` / `recallMode` / `writePolicy` /
+  `language` / `selfPortraitEnabled` / `branchAware` / `sleepEnabled`，收敛为 4 组）；其余 22 个键**只走 patch 行**，
+  能力与热生效语义完全不变 —— Schema 未变（30 个键仍全部 `volatile()`），所以既有 patch 行用户零感知。
+- **命令面：日常 6 条 + `/memory admin`**：`/memory`（概览）/ `/memory search` / `/memory forget` /
+  `/memory self` / `/memory help` / `/sleep`。其余 20 个子命令收进 `/memory admin <子命令>`，参数语义完全沿用；
+  旧写法（`/memory pending`、`/memory approve`、`/memory trace`、`/memory audit` …）**仍是隐藏别名、行为不变**，
+  只是不再出现在 help 与 README 里。**没有删除任何命令实现**。
+- **不默认开启空闲自动梳理**：`/sleep` 仍由用户手动触发（它花 token，插件不替用户决定）。
 
 ## 3. 架构一页图
 
@@ -60,6 +75,7 @@ M15-A/B 反查与检索、M15-C 协议 v1 冻结、M16–M18 协议 v1.1/1.2/1.3
                         │  宿主半边 src/index.ts ──调用──▶ 纯函数层 src/lib.ts   │
                         │   ├─ 7 个 memory_* 工具   （ctx.tools.register）       │
                         │   ├─ /memory 与 /sleep    （ctx.commands.register）    │
+                        │   │   日常 6 条 + /memory admin <子命令>（20 个子命令） │
                         │   ├─ R1 常驻块：画像 / 自画像 / 项目印象               │
                         │   │   （ctx.systemPrompt.section + .context）          │
                         │   └─ ctx.provide('memory', …) ──▶ 协议面 ctx.memory v1.3
@@ -73,14 +89,15 @@ M15-A/B 反查与检索、M15-C 协议 v1 冻结、M16–M18 协议 v1.1/1.2/1.3
              └── memories/<id>.json  { version, record }           /memory verify 都读它
 
    浏览器半边 src/client.ts → lib/client.js：
-   注册进 keyed 的 plugins.row.config（key = dsh-plugin-memory#dsh-memory），把 30 个 volatile 字段渲染成表单
+   注册进 keyed 的 plugins.row.config（key = dsh-plugin-memory#dsh-memory），把 8 个表单字段渲染出来
+   （30 个 volatile 键里的其余 22 个只走 patch 行，Schema 未变）
 ```
 
 | 半边 / 面 | 位置 | 职责 | 关键事实 |
 |---|---|---|---|
-| 宿主半边 | `src/index.ts` | 存储、捕获、注入、整合、工具、命令、审计、服务面 | 必需接缝 `inject = ['agents','systemPrompt','storageDomain','tools','commands']`；注册 7 工具 + 2 命令 + 两条注入通道，并 `provide('memory')`（协议 §2.1） |
+| 宿主半边 | `src/index.ts` | 存储、捕获、注入、整合、工具、命令、审计、服务面 | 必需接缝 `inject = ['agents','systemPrompt','storageDomain','tools','commands']`；注册 7 工具 + 2 命令（`/memory` 与 `/sleep`，其余 20 个子命令收在 `/memory admin` 下）+ 两条注入通道，并 `provide('memory')`（协议 §2.1） |
 | 纯函数层 | `src/lib.ts` | 无 `ctx`、无 I/O 的全部判定与渲染 | 单测的全部对象；变异体检的多数目标 |
-| 客户端半边 | `src/client.ts` → `lib/client.js` | 设置表单（30 个 volatile 字段） | 编译成 CommonJS 后再包成 `__ModuleLoader__.load({ id, factory })` |
+| 客户端半边 | `src/client.ts` → `lib/client.js` | 设置表单（8 个字段，4 组；其余 22 个 volatile 键只走 patch 行） | 编译成 CommonJS 后再包成 `__ModuleLoader__.load({ id, factory })` |
 | 存储域 | `ctx.storageDomain.open({ name, version: 1, layout: 'per-record', tables: { memories } })` | 一条记录一个文件 + 一个全局水位 | 句柄只需 `global.get/set`、`table('memories').entries/put/delete`、`close`（协议 §2.2） |
 | 会话日志 | `ctx.get('sessionQuery')`；`tools/session-log.ts` | `/sleep` 补录、`/memory audit --verify`、`/memory verify` 回原文核对的精确读取来源 | DSH 一行一 zstd 帧，单帧解压只拿得到会话头（`CHANGELOG.md` 0.5.8） |
 | 协议面 | `ctx.memory`（`protocolVersion = '1.3'`） | 第三方唯一可依赖的接缝 | 工具注册、命令输出、报告文件、设置表单、存储布局都是**内部实现**，可随 patch 变（协议 §2.4） |
@@ -130,7 +147,7 @@ if (memory.protocolVersion && !/^1\./u.test(memory.protocolVersion)) return
 
 1. **`pending` 不进任何注入路径**——常驻块、每轮召回、`recall()` 默认口径全都过滤
    `status === 'active'`；注入路径一律看不到它，能看到的是无参 `list()`（原始视图）、显式 `status` 查询、
-   `/memory pending`、`/memory stats` 与 `memory_explain` 诊断。没有「这是模型自己的提议」的例外。
+   `/memory admin pending`、`/memory stats` 与 `memory_explain` 诊断。没有「这是模型自己的提议」的例外。
 2. **`refs` 不进指纹**——同 kind / scope / subject / text 而来源不同的两次写入仍是**一条**记录（第二次
    `status: 'merged'`），引用被合并进去。否则同一件事会因为「从哪来」不同而算两条，去重与 `/sleep` 幂等一起坏掉。
 3. **`branch` 进指纹**——但只在记录真的带非空标签时（`...(branch ? [branch] : [])`）。于是「到处都成立的约定」
@@ -247,16 +264,16 @@ survivors…」、0.5.23 §「Two survivors documented…」、0.5.24「One surv
 | `list()` 无参 = **全部状态的原始视图** | 无参 `list()` 返回插入序的全部状态（含 `pending` / `invalid` / `archived`）的**活对象** | 协议 §3.1；`CHANGELOG.md` 0.5.18 |
 | `recall()` 缺省池 = **active** | 缺省只收 `active`（`includeArchived: true` 时再含 `archived`），`pending` / `invalid` / `archived` 默认永不返回；`status: 'active'` 对它是**缺省**、显式传是空操作；要看原始视图须显式 `status: 'all'`。想要「模型实际看到什么」的必要参数是 `branch: 'current'` | 协议 §3.3；`CHANGELOG.md` 0.5.17/0.5.18 |
 | `ok: true` 不等于「已落盘」 | 它只表示「过了闸门并在**内存**里生效」；持久化看 `write()` 结果的 `persisted`（v1.1）或 `stats().opened` / `stats().writes` | 协议 §3.4 |
-| 审计的「尝试」视图不持久 | `/memory audit` 的内存尝试环容量由 `auditMax`（默认 50）决定，**重启即失**；只有记录派生部分是持久的 | `docs/audit.md` §1 |
+| 审计的「尝试」视图不持久 | `/memory admin audit` 的内存尝试环容量由 `auditMax`（默认 50）决定，**重启即失**；只有记录派生部分是持久的 | `docs/audit.md` §1 |
 | 压缩固化取决于部署 | 代码监听 `compaction/summary`；没挂载压缩插件的 profile 根本不会产生该事件 | README「Known limitations」 |
 | 跨会话全文检索通常不可用 | 会话查询索引出厂是 `openAt: never`，所以插件自建词面索引，历史回指只用精确读取 | README「Known limitations」 |
 | 没有图形化的记忆浏览 | 界面只做配置；浏览 / 删除 / 固定走命令与 7 个工具（GUI 不提供记忆浏览器） | README「Known limitations」 |
 | 两项显式降级 | ① 自画像不与部署的 persona 文本去重；② 部署注册了会挤掉其它 prompt 段的 `complete` 段时，自画像段随之消失，插件**不会**自动改走 `context()` 通道 | README「Known limitations」 |
 | 端到端增益未自动化 | 离线评测只测召回链路本身；「有记忆 vs 全上下文」的 Δ 是文档化的**手工**流程 | README「Known limitations」 |
 | 注入远端嵌入器会把正文送出本机 | 插件自己**不联网、不带模型**；它只把记忆正文交给被注入的 `embed`。远端 embedder ⇒ 正文离开本机——这个决定与后果属于宿主 / 用户 | `SECURITY.md`；协议 §11 隐私段 |
-| 导入文件要可信 | `/memory import` 会逐字段校验并把来源降级为 `observed`、强制 `pinned: false`，但它读的是你给的路径 | `SECURITY.md`；README 命令表 |
+| 导入文件要可信 | `/memory admin import` 会逐字段校验并把来源降级为 `observed`、强制 `pinned: false`，但它读的是你给的路径 | `SECURITY.md`；README 命令表 |
 
-## 8. 发布历史（0.5.9 → 0.5.26）
+## 8. 发布历史（0.5.9 → 0.5.27）
 
 版本号只按 **patch** 递增（`0.5.x → 0.5.x+1`），纯文档提交不升版本；协议版本与包版本相互独立。
 起点之前：`0.4.2` 是首个公开提交（宿主半边、双通道注入、7 工具、16 条 `/memory` 命令、34 个单测），
@@ -269,10 +286,10 @@ survivors…」、0.5.23 §「Two survivors documented…」、0.5.24「One surv
 | 0.5.11 | 模型可见文本多语言：模型看英文、终端看中文 |
 | 0.5.12 | 修 0.5.11：默认预算下英文自画像整段渲染不出来的问题 |
 | 0.5.13 | 分支感知的项目记忆：特性分支上的约定留在那条分支上 |
-| 0.5.14 | 写入审计与注入核对：`/memory audit` + `--verify`（缺口明说，不报假通过） |
+| 0.5.14 | 写入审计与注入核对：`/memory admin audit` + `--verify`（缺口明说，不报假通过） |
 | 0.5.15 | 工程加固：`lint` / `check:readmes` / `verify:self-contained` / 覆盖率门槛进 CI |
 | 0.5.16 | 工具输出带出处：`memory_recall` / `memory_list` 的每条命中带 `refs` |
-| 0.5.17 | 来源反查 `/memory trace` + 零依赖检索质量升级 + `ctx.memory` 冻结为协议 v1 |
+| 0.5.17 | 来源反查 `/memory admin trace` + 零依赖检索质量升级 + `ctx.memory` 冻结为协议 v1 |
 | 0.5.18 | 协议 v1.1：`list` 的三个过滤项、`write` 的 `persisted`，整份 `docs/` 进发布包 |
 | 0.5.19 | 协议 v1.2：`branch` 数组、`stats().writes`、`write` 结果带 `refs`，并给发布物加隐私自动扫描 |
 | 0.5.20 | 协议 v1.3：宿主可注入外接嵌入器（插件仍不联网、不带模型） |
@@ -282,6 +299,7 @@ survivors…」、0.5.23 §「Two survivors documented…」、0.5.24「One surv
 | 0.5.24 | `pnpm mutate` 工具化 + 发布检查清单 + 变异第三轮（40 + 41 处破坏）；套件 467 → **498** |
 | 0.5.25 | 客户端半边覆盖 3 → 16 条用例 + 交付总览 `docs/delivery.md` + 变异抽样 `pnpm mutate:ci` 进 CI（套件 498 → 524） |
 | 0.5.26 | 变异目录 29 → 92、`--json` 恢复纯 JSON、修掉变异工具用绝对路径跑错树的缺陷（套件 524 → 528） |
+| 0.5.27 | 精简（M28）：设置页 30 → 8 个字段（其余 22 个走 patch 行）、命令面收敛为日常 6 条 + `/memory admin`（旧写法仍是隐藏别名）；不删命令、不改默认值、不动 Schema |
 
 逐行依据：[`CHANGELOG.md`](../CHANGELOG.md) 对应小节；版本号用 `git tag` 复核。
 

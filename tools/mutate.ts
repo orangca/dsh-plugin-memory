@@ -634,13 +634,13 @@ export function mutationCatalogue(): Mutation[] {
       id: 'cli-field-group',
       file: 'src/client.ts',
       find: "  { name: 'domainName', kind: 'text', group: 'groupStore' },",
-      replace: "  { name: 'domainName', kind: 'text', group: 'groupRecall' },",
-      note: '记忆库名被挪进「召回与注入」分组：分组归属契约当场破。',
+      replace: "  { name: 'domainName', kind: 'text', group: 'groupOther' },",
+      note: '记忆库名被挪进「其它」分组：分组归属契约当场破。',
     },
     {
       id: 'cli-en-missing-key',
       file: 'src/client.ts',
-      find: "  auditMax: 'Audit ring capacity',\n",
+      find: "  sleepEnabled: 'Idle review switch',\n",
       replace: '',
       note: '英文表少一个键：中英字典键集合不一致，界面会掉文案。',
     },
@@ -654,15 +654,15 @@ export function mutationCatalogue(): Mutation[] {
     {
       id: 'cli-enum-order',
       file: 'src/client.ts',
-      find: "  { name: 'recallMode', kind: 'enum', options: ['off', 'dry', 'inject'], group: 'groupRecall' },",
-      replace: "  { name: 'recallMode', kind: 'enum', options: ['dry', 'off', 'inject'], group: 'groupRecall' },",
+      find: "  { name: 'recallMode', kind: 'enum', options: ['off', 'dry', 'inject'], group: 'groupStore' },",
+      replace: "  { name: 'recallMode', kind: 'enum', options: ['dry', 'off', 'inject'], group: 'groupStore' },",
       note: '枚举选项顺序被换：界面下拉与 Host union 不再逐项一致。',
     },
     {
       id: 'cli-bool01-flag',
       file: 'src/client.ts',
-      find: "  { name: 'selfPortraitEnabled', kind: 'number', bool01: true, group: 'groupRecall' },",
-      replace: "  { name: 'selfPortraitEnabled', kind: 'number', group: 'groupRecall' },",
+      find: "  { name: 'selfPortraitEnabled', kind: 'number', bool01: true, group: 'groupLanguage' },",
+      replace: "  { name: 'selfPortraitEnabled', kind: 'number', group: 'groupLanguage' },",
       note: '自画像开关丢掉 bool01 标记：界面按普通数字处理，非法文案与写回口径都跟着变。',
     },
     {
@@ -693,13 +693,10 @@ export function mutationCatalogue(): Mutation[] {
       replace: '  const view = state[field.name]',
       note: '缺视图时不再兜底空视图：sparse 快照下直接读 undefined 的字段，渲染整块崩。',
     },
-    {
-      id: 'cli-checkbox-checked',
-      file: 'src/client.ts',
-      find: "          checked: view.text === 'true',",
-      replace: "          checked: view.text !== '',",
-      note: '复选框只看「非空」：草稿里任何非空文本都显示成已勾选。',
-    },
+    // 注：原有一条 `cli-checkbox-checked`（复选框 checked 判定由 `view.text === 'true'` 改成非空判断）
+    // 在 M28 精简后**不再收录**：表单已没有 `kind: 'boolean'` 字段，renderField 的复选框分支从表单不可达，
+    // 任何断言都观察不到它被改坏 —— 收录它只会让体检永远报一条假存活。
+    // 若将来重新加入布尔字段，请把这条连同一条能翻面的用例一起恢复。该分支本身保留（不做激进删除）。
     {
       id: 'cli-select-onchange',
       file: 'src/client.ts',
