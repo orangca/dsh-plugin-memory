@@ -688,7 +688,9 @@ test('mutationCatalogue：id 唯一、note 非空；每条 find 在真实仓库�
   const repoRoot = process.env.DSH_MUTATE_SOURCE_REPO ?? join(dirname(fileURLToPath(import.meta.url)), '..')
   const catalogue = mutationCatalogue()
 
-  assert.ok(catalogue.length >= 20 && catalogue.length <= 30, `目录应在 20–30 条之间，实际 ${catalogue.length} 条`)
+  // 常驻目录是「实测被杀死的那批」的固化（见 tools/mutate.ts 的目录注释）：下限只会往上走，
+  // 上限防的是无意间把目录撑成不可复跑的规模。原断言是 20–30 条（精选规模），扩编后同步抬高下限。
+  assert.ok(catalogue.length >= 85 && catalogue.length <= 130, `目录应在 85–130 条之间，实际 ${catalogue.length} 条`)
   assert.equal(new Set(catalogue.map((mutation) => mutation.id)).size, catalogue.length, 'id 必须唯一（--only 靠它点名）')
 
   for (const mutation of catalogue) {
@@ -841,6 +843,216 @@ test('runMutationTesting：玩具仓库端到端 —— 必被杀死 / 必存活
     assert.ok(readFileSync(keptSource, 'utf8').includes('UNUSED = 2'), '副本里应当真的是变异后的文件')
     assert.equal(readFileSync(sourcePath, 'utf8'), original, '保留副本也不能碰原仓库')
     rmSync(kept.workdir, { recursive: true, force: true })
+  } finally {
+    rmSync(outer, { recursive: true, force: true })
+  }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLI 的 `--repo` / `--catalogue` 与 `--json` 的 stdout 纯度（tools/mutate.ts）
+//
+// 为什么钉这两件事：
+//   · `--json` 是给机器读的（CI 的 `pnpm mutate:ci`、本地的 `ConvertFrom-Json`）。子进程的测试输出
+//     一旦混进 stdout，消费方 `JSON.parse` 直接抛 —— 判定数字再准也没人能读。现在钉住的口径是：
+//     子进程输出落文件后摘进结果的 `output` 字段、进度行走 stderr，stdout 上有且只有一个 JSON；
+//   · 没有 `--repo` / `--catalogue`，这条路径就只能拿**真实仓库**测（一次几十秒），
+//     测试会变成负担、最后没人跑。玩具仓库把「stdout 纯度」隔离成毫秒级的事。
+//
+// 整段追加在文件末尾：既有用例一行都没动（ESM 的 import 声明会提升，写在后面同样生效）。
+
+import { spawnSync } from 'node:child_process'
+import { closeSync, openSync } from 'node:fs'
+import { loadCatalogue, parseExtras } from '../tools/mutate.ts'
+
+/** 真实 CLI 的入口（从测试文件反推，不写死任何本机路径）。 */
+function mutateCliEntry(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), '..', 'tools', 'mutate.ts')
+}
+
+/**
+ * 跑一次真实 CLI，stdout 与 stderr **分别**收进文件再读回来。
+ *
+ * 刻意不用管道捕获：沙箱里管道会 EPERM/EINVAL（tools/mutate.ts 的 `runCommand` 注释里记着这条），
+ * 而「stdout 是不是纯 JSON」恰恰是这组用例要验的东西 —— 拿不到真输出就等于没测。
+ */
+function runMutateCli(args: readonly string[], cwd: string): { status: number | null; stdout: string; stderr: string } {
+  const outFile = join(cwd, 'cli.stdout.log')
+  const errFile = join(cwd, 'cli.stderr.log')
+  const outFd = openSync(outFile, 'w')
+  const errFd = openSync(errFile, 'w')
+  let status: number | null = null
+  try {
+    const env = { ...process.env }
+    delete env.NODE_TEST_CONTEXT
+    const result = spawnSync(process.execPath, [mutateCliEntry(), ...args], {
+      cwd,
+      stdio: ['ignore', outFd, errFd],
+      windowsHide: true,
+      env,
+    })
+    status = result.status
+  } finally {
+    closeSync(outFd)
+    closeSync(errFd)
+  }
+  return { status, stdout: readFileSync(outFile, 'utf8'), stderr: readFileSync(errFile, 'utf8') }
+}
+
+/** 玩具仓库：纯 JS 源 + 恒成功的 tsc 替身（探针只验 stdout 纯度，不验编译本身）。 */
+function makeCliProbeRepo(root: string): void {
+  mkdirSync(join(root, 'src'), { recursive: true })
+  mkdirSync(join(root, 'tests'), { recursive: true })
+  mkdirSync(join(root, 'node_modules', 'typescript', 'bin'), { recursive: true })
+  writeFileSync(
+    join(root, 'package.json'),
+    JSON.stringify({ name: 'dsh-mutate-cli-probe', version: '0.0.0', type: 'module' }),
+    'utf8',
+  )
+  writeFileSync(join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { noEmit: true } }), 'utf8')
+  writeFileSync(
+    join(root, 'src', 'value.js'),
+    ['export function add(a, b) {', '  return a + b', '}', '', 'export const UNUSED = 1', ''].join('\n'),
+    'utf8',
+  )
+  writeFileSync(
+    join(root, 'tests', 'toy.test.js'),
+    [
+      "import { test } from 'node:test'",
+      "import assert from 'node:assert/strict'",
+      "import { add } from '../src/value.js'",
+      '',
+      "test('add', () => { assert.equal(add(1, 1), 2) })",
+      '',
+    ].join('\n'),
+    'utf8',
+  )
+  // `repoCommands` 要求 node_modules/typescript/bin/tsc 存在；这份替身只做一件事：退出 0。
+  writeFileSync(join(root, 'node_modules', 'typescript', 'bin', 'tsc'), 'process.exit(0)\n', 'utf8')
+}
+
+/** 两条探针变异：一条必被玩具测试杀死，一条必存活（用来验判定与计数口径）。 */
+function writeProbeCatalogue(file: string): void {
+  const catalogue: Mutation[] = [
+    { id: 'probe-killed', file: 'src/value.js', find: '  return a + b', replace: '  return a - b', note: '探针：加法改成减法，玩具测试必须红。' },
+    { id: 'probe-survived', file: 'src/value.js', find: 'export const UNUSED = 1', replace: 'export const UNUSED = 2', note: '探针：没人引用的常量，玩具测试照旧全绿。' },
+  ]
+  writeFileSync(file, JSON.stringify(catalogue), 'utf8')
+}
+
+test('parseExtras / loadCatalogue：目标参数缺值＝没指定；目录形状不对必须当场抛', () => {
+  assert.deepEqual(parseExtras([]), { repo: null, catalogueFile: null })
+  assert.deepEqual(
+    parseExtras(['--repo', 'C:/tmp/x', '--catalogue', 'C:/tmp/c.json']),
+    { repo: 'C:/tmp/x', catalogueFile: 'C:/tmp/c.json' },
+  )
+  assert.equal(parseExtras(['--repo']).repo, null, '缺值＝没指定')
+  assert.equal(parseExtras(['--repo', '   ']).repo, null, '纯空白同缺值')
+  assert.equal(parseExtras(['--unknown', '--repo', 'C:/tmp/y']).repo, 'C:/tmp/y', '未知参数不妨碍它后面的参数')
+  // `--repo` 刻意不并进 Options：parseArgs 的默认形状是既有契约，一个字段都不能变。
+  assert.deepEqual(
+    parseArgs(['--repo', 'C:/tmp/x']),
+    { limit: 8, seed: 20261004, only: null, list: false, json: false, keep: false },
+  )
+
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-mutate-catalogue-'))
+  try {
+    const good = join(dir, 'good.json')
+    const partial = join(dir, 'partial.json')
+    const notArray = join(dir, 'not-array.json')
+    writeFileSync(good, JSON.stringify([{ id: 'a', file: 'src/a.js', find: 'x', replace: 'y', note: '探针' }]), 'utf8')
+    assert.equal(loadCatalogue(good).length, 1)
+    writeFileSync(partial, JSON.stringify([{ id: 'a', file: 'src/a.js' }]), 'utf8')
+    assert.throws(() => loadCatalogue(partial), /缺字段/u, '缺字段的条目必须当场抛，不许静默跑空')
+    writeFileSync(notArray, JSON.stringify({ id: 'a' }), 'utf8')
+    assert.throws(() => loadCatalogue(notArray), /数组/u)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('mutate CLI：--json 的 stdout 有且只有一个合法 JSON（子进程输出进 output 字段、进度进 stderr）', () => {
+  const outer = mkdtempSync(join(tmpdir(), 'dsh-mutate-cli-json-'))
+  try {
+    const repo = join(outer, 'toy')
+    makeCliProbeRepo(repo)
+    const catalogue = join(outer, 'probe-catalogue.json')
+    writeProbeCatalogue(catalogue)
+
+    const run = runMutateCli(['--repo', repo, '--catalogue', catalogue, '--limit', '0', '--json'], outer)
+    assert.equal(run.status, 1, `有一条必存活 ⇒ 退出码 1（stderr：${run.stderr.slice(0, 200)}）`)
+
+    // 这就是这条用例的全部意义：stdout **整体**能被 JSON.parse —— 多一个字符就会抛。
+    const report = JSON.parse(run.stdout) as Record<string, unknown>
+    assert.deepEqual(
+      Object.keys(report).sort(),
+      ['buildErrors', 'catalogue', 'error', 'exitCode', 'kept', 'killed', 'limit', 'outcomes', 'repo', 'seed', 'survived', 'tried', 'workdir'],
+      '--json 的顶层字段是机器契约，增删都要在这里同步',
+    )
+    assert.equal(report['tried'], 2)
+    assert.equal(report['killed'], 1)
+    assert.equal(report['survived'], 1)
+    assert.equal(report['buildErrors'], 0)
+    assert.equal(report['exitCode'], 1)
+    assert.equal(report['error'], null)
+    assert.equal(report['catalogue'], 2)
+
+    const outcomes = report['outcomes'] as Array<Record<string, unknown>>
+    assert.deepEqual(outcomes.map((outcome) => outcome['id']), ['probe-killed', 'probe-survived'], '报告顺序＝目录顺序')
+    assert.deepEqual(
+      Object.keys(outcomes[0]!).sort(),
+      ['detail', 'file', 'id', 'ms', 'note', 'output', 'verdict'],
+      '单条结论的字段也是机器契约',
+    )
+    assert.equal(outcomes[0]!['verdict'], 'killed')
+    assert.equal(outcomes[1]!['verdict'], 'survived')
+    assert.ok(
+      String(outcomes[0]!['output']).includes('fail'),
+      '子进程的测试输出必须被捕获进 JSON 字段（而不是打上 stdout）',
+    )
+    assert.ok(String(outcomes[1]!['detail']).includes('全绿'))
+    // stdout 首尾都是 JSON 的括号：前面没有头行、后面没有尾行。
+    assert.ok(run.stdout.trimStart().startsWith('{'), `stdout 必须以 { 开头：${run.stdout.slice(0, 80)}`)
+    assert.ok(run.stdout.trimEnd().endsWith('}'), `stdout 必须以 } 结尾：${run.stdout.slice(-80)}`)
+    // 进度行改走 stderr，但一行都没丢。
+    assert.ok(run.stderr.includes('probe-killed'), `进度行应在 stderr：${run.stderr.slice(0, 200)}`)
+  } finally {
+    rmSync(outer, { recursive: true, force: true })
+  }
+})
+
+test('mutate CLI：--json 下未知 --only 也必须输出一个 JSON（stdout 不许空着退出）', () => {
+  const outer = mkdtempSync(join(tmpdir(), 'dsh-mutate-cli-only-'))
+  try {
+    const repo = join(outer, 'toy')
+    makeCliProbeRepo(repo)
+    const catalogue = join(outer, 'probe-catalogue.json')
+    writeProbeCatalogue(catalogue)
+
+    const run = runMutateCli(['--repo', repo, '--catalogue', catalogue, '--json', '--only', 'nope'], outer)
+    assert.equal(run.status, 2, '环境问题 ⇒ 退出码 2')
+    const report = JSON.parse(run.stdout) as Record<string, unknown>
+    assert.equal(report['exitCode'], 2)
+    assert.match(String(report['error']), /没有这条变异/u)
+  } finally {
+    rmSync(outer, { recursive: true, force: true })
+  }
+})
+
+test('mutate CLI：不带 --json 时判定行照旧（人类可读模式行为不变）', () => {
+  const outer = mkdtempSync(join(tmpdir(), 'dsh-mutate-cli-human-'))
+  try {
+    const repo = join(outer, 'toy')
+    makeCliProbeRepo(repo)
+    const catalogue = join(outer, 'probe-catalogue.json')
+    writeProbeCatalogue(catalogue)
+
+    const run = runMutateCli(['--repo', repo, '--catalogue', catalogue, '--limit', '0'], outer)
+    assert.equal(run.status, 1)
+    assert.match(run.stdout, /✔ probe-killed @ src\/value\.js killed/u, `判定行照旧：${run.stdout}`)
+    assert.match(run.stdout, /✖ probe-survived @ src\/value\.js survived/u)
+    assert.match(run.stdout, /试了 2 条，杀死 1，存活 1（编译期失败 0，用时 [\d.]+s）/u)
+    assert.match(run.stdout, /存活项（盲区）：/u)
+    assert.ok(!run.stdout.includes('"exitCode"'), '人类模式不该冒出 JSON')
   } finally {
     rmSync(outer, { recursive: true, force: true })
   }

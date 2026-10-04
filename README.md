@@ -586,6 +586,9 @@ pnpm check:readmes                                # README zh/en consistency on 
 pnpm verify:self-contained                        # assert zero runtime deps + a complete package (what `dsh plugin add` needs)
 pnpm coverage                                     # collect coverage (the node_modules exclusion must be explicit, or lib/ is dropped)
 pnpm coverage:check                               # enforce the gate (thresholds differ per input mode, see tools/coverage-check.ts)
+pnpm mutate                                       # mutation check (deterministic sample of 8, zero deps): break the impl in a scratch copy, see what the suite misses
+pnpm mutate:full                                  # same, over the whole 92-entry catalogue (~6 min) — the pre-release run
+pnpm mutate:ci                                    # the sampled 8-mutation run CI uses (~20 s), machine-readable (--json)
 node tools/eval-recall.ts                         # offline recall eval over real session logs
 node tools/bench.ts                               # hot-path benchmark (per-turn recall, per-step render, consolidation)
 node tools/deploy-dev.ts                          # mount lib/ as a new dev revision (run pnpm build first)
@@ -593,6 +596,12 @@ node tools/deploy-dev.ts --set "recallMode='dry';maxInjectedTokens=200"
 node tools/extract-asar.ts                        # extract DSH client bundles (UI debugging)
 node tools/scan-asar.ts settingsNumberField       # find where a symbol lives in app.asar
 ```
+
+The mutation check is a standing tool, not a release gate: it rewrites one plausible-looking detail at a time in a
+**scratch copy** (your `src/`, `lib/` and `tests/` are never touched), rebuilds, runs the whole suite and reports what
+survived. Exit code `0` = every break was caught, `1` = a survivor (a blind spot), `2` = an environment problem.
+`pnpm mutate --only <id>` re-checks one entry, `--keep` preserves the copy, `--seed <n>` makes the sample
+reproducible.
 
 Layout:
 
@@ -604,8 +613,10 @@ Layout:
 | `src/types.ts`, `src/shims.d.ts` | Domain types plus the DSH seam subset this plugin relies on |
 | `lib/` | Build output — **committed on purpose** (see below), shipped in the package (`files`) |
 | `tools/build-client.ts` | Wraps the compiled client into `window.__ModuleLoader__.load({ id, factory })` |
+| `tools/check-readmes.ts` | Structural zh/en check for the two READMEs: section count and shared-anchor order, code fences, table first-column keys, form field count, the `/memory` + `/sleep` command set, and the mutual top links |
 | `tools/deploy-dev.ts` | Copies `lib/` into a fresh dev revision and rewrites the profile patch |
 | `tools/session-log.ts` | Shared reader for session logs: DSH appends **one zstd frame per JSONL line**, so decoding must walk the zstd magic — a single-frame decode returns only the header |
+| `tools/mutate.ts` | The mutation-check catalogue and runner behind `pnpm mutate` / `:full` / `:ci` (zero deps; runs in a scratch copy) |
 
 Why the build output is committed: `dsh plugin add github:<owner>/<repo>` fetches **source, not artifacts** and
 runs no build script. If `lib/` were gitignored, a GitHub install would end up with a `main` pointing at a file that
@@ -624,7 +635,7 @@ Three development notes that cost real debugging time and are worth knowing:
 
 A one-page **delivery overview** — capabilities with the version each landed in, the architecture diagram, the
 protocol summary, the engineering gates, the quality evidence and the known limitations — is in
-[`docs/delivery.md`](docs/delivery.md).
+[`docs/delivery.md`](docs/delivery.md) (written in Chinese).
 
 See [`docs/dsh-mechanisms.md`](docs/dsh-mechanisms.md) for the DSH seams, slot semantics and environment facts this
 plugin is built on — written for plugin authors, with no environment-specific details.

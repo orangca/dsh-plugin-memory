@@ -3,6 +3,47 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.26 — 2026-10-04
+
+Cleanup round: the mutation catalogue now covers everything the last three rounds found, the machine-readable output
+is actually machine-readable, and the README stops lying about the tool.
+
+### Changed
+
+- **The standing catalogue grew from 29 to 92 mutations**, absorbing the recipes that had been living in test-case
+  comments: 27 from the `memory_explain`/`tags`/`field`/`value` round, 13 from the client-half round, 10 + 8 from the
+  two earlier host rounds, and 5 from the pure-layer round. A full run is now ~6 minutes, and it currently reports
+  **92 killed, 0 survived** — the catalogue is kept green, so a survivor is a real signal rather than accumulated
+  noise. CI still samples 8 (~20 s).
+- **`--json` output is pure JSON again.** Child test output used to leak into stdout, so the payload could not be
+  parsed; progress now goes to stderr and each outcome carries its underlying output in a field. `--json` also
+  reports unknown `--only` ids instead of failing silently.
+- **README and the delivery overview were corrected**: the development section now lists the three `mutate` scripts,
+  the tool table gained `tools/mutate.ts` and `tools/check-readmes.ts`, the delivery pointer says the document is in
+  Chinese, and the stale "29-entry catalogue (~67 s)" was updated to 92 entries (~6 min) in both languages and in
+  `docs/delivery.md`.
+
+### Fixed
+
+- **A defect in the mutation tool itself, and it was the dangerous kind.** The build step invoked
+  `tools/build-client.ts` through an **absolute** path, so with the command's working directory set to the scratch
+  copy, it executed the *original repository's* script — which resolves the repository root from its own location.
+  The copy's `lib/client.js` therefore stayed stale, and the first batch of client mutations were all reported as
+  *survived* when they had never been applied to the code under test. Two consequences worth stating: the results
+  were wrong, and the tool was writing into the working tree it is supposed to leave alone. It now uses
+  copy-relative paths, and the integration check confirmed the original repo's `lib/` and `build/` carried no diff.
+  Two client mutations that were genuinely equivalent under the existing assertions were rewritten into observable
+  breaks rather than dropped.
+- One existing test assertion was adjusted as a consequence, not a relaxation: the catalogue-size range moved from
+  20–30 to 85–130 (the lower bound was raised, and the catalogue's contract changed from "a curated sample" to "a
+  green full catalogue").
+
+### Notes
+
+- Suite: **524 → 528** (tools 37 → 41).
+- The tool's own lessons are recorded in its comments: a mutation harness that can silently target the wrong tree is
+  worse than no harness, because it produces confident wrong answers.
+
 ## 0.5.25 — 2026-10-04
 
 Coverage for the two areas that had none to speak of, an on-ramp document, and the mutation check moved into CI.

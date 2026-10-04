@@ -520,6 +520,9 @@ pnpm check:readmes                                # 单独跑 README 中英一�
 pnpm verify:self-contained                        # 断言零运行期依赖 + 打包清单完整（GitHub 直接安装的前提）
 pnpm coverage                                     # 跑覆盖率取数（必须显式排除 node_modules，否则 lib/ 会被整体排除）
 pnpm coverage:check                               # 按门槛判定（门槛按口径分开，见 tools/coverage-check.ts）
+pnpm mutate                                       # 变异体检（确定性抽 8 条、零依赖）：在临时副本里改坏实现，看测试漏掉了什么
+pnpm mutate:full                                  # 同上，跑完整 92 条目录（约 6 分钟）—— 发布前跑的那次
+pnpm mutate:ci                                    # CI 用的抽样 8 条（约 20 s），机器可读（--json）
 node tools/eval-recall.ts                         # 离线召回评测（读真实会话日志）
 node tools/bench.ts                               # 热路径基准（每回合召回、每 step 渲染、整合）
 node tools/deploy-dev.ts                          # 把 lib/ 挂成新的开发修订版（需先 pnpm build）
@@ -527,6 +530,10 @@ node tools/deploy-dev.ts --set "recallMode='dry';maxInjectedTokens=200"
 node tools/extract-asar.ts                        # 提取 DSH 客户端产物（排查界面问题）
 node tools/scan-asar.ts settingsNumberField       # 定位某个符号在 app.asar 里的位置
 ```
+
+变异体检是常驻工具，不是发布闸门：它每次在**临时副本**里改坏一处「看似合理」的实现细节（你的 `src/`、`lib/`、
+`tests/` 一行都不动），重新构建后跑整套测试，报出哪些没人发现。退出码 `0` = 全部被杀死，`1` = 有存活（盲区），
+`2` = 环境问题。`pnpm mutate --only <id>` 复查单条，`--keep` 保留副本，`--seed <n>` 让抽样可复现。
 
 目录职责：
 
@@ -538,8 +545,10 @@ node tools/scan-asar.ts settingsNumberField       # 定位某个符号在 app.as
 | `src/types.ts`、`src/shims.d.ts` | 领域类型 + 本插件实际依赖的 DSH 接缝子集 |
 | `lib/` | 构建产物：**刻意提交进仓库**（见下），并通过 `files` 进发布包 |
 | `tools/build-client.ts` | 把编译后的客户端包成 `window.__ModuleLoader__.load({ id, factory })` |
+| `tools/check-readmes.ts` | 两份 README 的结构一致性校验：小节数量与共有锚点顺序、代码围栏、表格首列键、表单字段数、`/memory` + `/sleep` 命令集合、顶部互链 |
 | `tools/deploy-dev.ts` | 把 `lib/` 复制成一个新的开发修订版并改写 profile patch |
 | `tools/session-log.ts` | 会话日志的共享读取模块：DSH 是**一行 JSONL 一个 zstd 帧**，必须按魔数逐帧解 —— 单帧解压只拿得到会话头 |
+| `tools/mutate.ts` | `pnpm mutate` / `:full` / `:ci` 背后的变异目录与执行器（零依赖；在临时副本里跑） |
 
 为什么把构建产物也提交：`dsh plugin add github:<owner>/<repo>` 拉的是**源码而不是产物**，也**不会**跑构建脚本。
 如果 `lib/` 被 git 忽略，GitHub 安装下来的包 `main` 会指向不存在的文件。提交它可以让安装保持「零构建步骤」——
@@ -553,7 +562,7 @@ node tools/scan-asar.ts settingsNumberField       # 定位某个符号在 app.as
   因此按 `src/types.ts` / `src/shims.d.ts` 里**实测验证过的子集**打类型，而不是导入不匹配的发布版类型。
 
 面向第一次接手的人的一页**交付总览**（能力清单与各自落地版本、架构一页图、协议面摘要、六道工程门禁、
-质量证据、已知限制、发布历史）见 [`docs/delivery.md`](docs/delivery.md)。
+质量证据、已知限制、发布历史）见 [`docs/delivery.md`](docs/delivery.md)（中文）。
 
 本插件依赖的 DSH 接缝、插槽语义与环境事实，见 [`docs/dsh-mechanisms.md`](docs/dsh-mechanisms.md)
 （面向插件作者，不含任何环境特定信息）。
