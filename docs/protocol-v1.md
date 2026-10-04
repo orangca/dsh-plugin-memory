@@ -25,14 +25,18 @@ still advance by one patch (`0.5.16 → 0.5.17`); the protocol version and the p
 
 A method that is going away keeps working for the whole of v1 and is marked deprecated in this document first.
 
-The revision you are reading is **v1.1**. It is a **pure addition** on top of v1.0: `list()` gained optional
+The revision you are reading is **v1.2**. v1.1 was a **pure addition** on top of v1.0: `list()` gained optional
 `status` / `branch` / `limit`, `recall()` two optional filters, `write()` the `persisted` field, and the service's
-`protocolVersion` moved from `'1.0'` to `'1.1'` (§9). Nothing a `'1.0'` consumer relied on changed — every
-no-argument call is byte for byte what 0.5.17 returned (§3.1, §3.3).
+`protocolVersion` moved from `'1.0'` to `'1.1'` (§9). v1.2 is again a **pure addition**, this time on top of v1.1:
+`list()` / `recall()` accept a **branch array**, `stats()` gained the `writes` counters, every `write()` **success**
+shape gained `refs`, and the service's `protocolVersion` moved from `'1.1'` to `'1.2'` (§10). Nothing a `'1.0'` or
+`'1.1'` consumer relied on changed — every no-argument call is byte for byte what 0.5.18 returned (§3.1, §3.3).
 
-Today the service object **does** carry `protocolVersion` (`'1.1'`); read it first and degrade readably on an
+Today the service object **does** carry `protocolVersion` (`'1.2'`); read it first and degrade readably on an
 unknown version rather than assuming. Decide compatibility with a `'1.x'` predicate (`/^1\./u`), **not** string
-equality, so that a later `1.2` does not lock you out; §9 has the minimal snippet.
+equality: v1.1 already asked for this and v1.2 keeps it — a consumer that compared `protocolVersion === '1.1'`
+would lock itself out of `'1.2'`, so compare on the prefix / major–minor only. §9 and §10 have minimal snippets
+that do exactly that.
 
 ## 2. Locating the service, and what to do when it is absent
 
@@ -73,9 +77,15 @@ The service object, as signatures (the bodies are internal; §3.1–§3.5 fix th
 
 ```ts
 interface MemoryService {
-  protocolVersion: string            // '1.1'
+  protocolVersion: string            // '1.2'
   list(options?: ListOptions): MemoryRecord[]
-  stats(): { records: number; version: number; opened: boolean }
+  stats(): {
+    records: number
+    version: number
+    opened: boolean
+    /** 新增：本进程内累计的写入落盘结果（v1.2）。 */
+    writes: { persisted: number; unpersisted: number }
+  }
   recall(options: RecallOptions): Array<{ record: MemoryRecord; match: number; score: number }>
   write(input: WriteMemoryInput): Promise<WriteMemoryResult>
   consolidate(reason?: string): Promise<void>
@@ -94,9 +104,11 @@ list(options?: {
    * 分支过滤：
    *   `'current'`（字符串字面量）= 用**与注入完全相同的** `branchVisible` 口径过滤当前 cwd 的分支；
    *   其它字符串 = 只保留 `branchOf(record)` 等于该值的记录（外加无标签记录？**不**：只保留等于该值的）；
+   *   数组（v1.2）= 只保留 `branchOf(record)` **落在数组里**的记录（无标签记录**不**算命中 —— 与单个字符串一致）；
+   *   **空数组 ⇒ 空结果**（不是"不过滤"）；数组里的 `'current'` 按当前分支解析（等价于把当前分支名放进数组）；
    *   `null` = 不过滤。缺省 = 不过滤（向后兼容）。
    */
-  branch?: 'current' | string | null
+  branch?: 'current' | string | readonly string[] | null
   /** 最多返回几条（>=1；非法值忽略）。缺省 = 不限。 */
   limit?: number
 }): MemoryRecord[]
@@ -105,7 +117,7 @@ list(options?: {
 | key | default | meaning |
 |---|---|---|
 | `status` | `'all'` | `'all'` = no filter (exactly today's behaviour). Any other value keeps only the rows whose §4.3 status is that value; `'active'` therefore never includes `pending`. |
-| `branch` | unset | unset / `null` = no filter (today's behaviour). `'current'` applies the **exact same** `branchVisible` rule injection uses, for the current cwd. Any other string keeps only the records whose `branchOf(record)` equals that value — records with no branch tag are **not** added. |
+| `branch` | unset | unset / `null` = no filter (today's behaviour). `'current'` applies the **exact same** `branchVisible` rule injection uses, for the current cwd. Any other string keeps only the records whose `branchOf(record)` equals that value — records with no branch tag are **not** added. **v1.2:** an **array** keeps only the records whose `branchOf(record)` is **in** the array, with the same "no tag is not a hit" rule; an **empty array yields an empty result** (it is *not* "no filter"); a `'current'` element is resolved against the current branch (the same as putting the current branch name into the array). |
 | `limit` | unset | at most that many records (`>= 1`; an invalid value is ignored). |
 
 - **Returns:** a fresh array of the records that survive the filters, in **insertion order** (load order, then
@@ -119,13 +131,15 @@ list(options?: {
 ### 3.2 `stats()`
 
 - **Arguments:** none.
-- **Returns:** `{ records: number; version: number; opened: boolean }` — exactly these three keys.
+- **Returns:** `{ records: number; version: number; opened: boolean; writes: { persisted: number; unpersisted: number } }`
+  — the three v1.0 keys plus the v1.2 `writes` counters.
 
 | field | meaning |
 |---|---|
 | `records` | records held in memory (all statuses, same set as `list()`) |
 | `version` | collection version, incremented on every successful put/delete; use it to detect change. **Not** a storage schema version |
 | `opened` | whether `ctx.storageDomain.open()` succeeded. `false` means writes are not reaching disk (see §8 gap 3) |
+| `writes` *(new in v1.2)* | this process's running count of write-persistence outcomes. `persisted`: how often `persist()` returned true (the write really reached disk); `unpersisted`: how often the write was `ok: true` but did not reach disk (domain not open, or `put` threw). The counters only grow, they are per-process and reset on restart (the same nature as `version`). Rejections (`ok: false`) are **not** counted — they were never a write. They sit alongside the internal `state.writes` counters and do not reuse them (those have a different meaning). |
 
 - **Errors:** none.
 
@@ -138,8 +152,8 @@ interface RecallOptions {
   // …既有字段不变
   /** 状态过滤；缺省 = 今天的行为（active，`includeArchived: true` 时再含 archived）。 */
   status?: 'active' | 'pending' | 'invalid' | 'archived' | 'all'
-  /** 分支过滤，语义与 `list` 的 `branch` 完全一致。缺省 = 不过滤（今天的行为）。 */
-  branch?: 'current' | string | null
+  /** 分支过滤，语义与 `list` 的 `branch` 完全一致（v1.2 起同样接受数组；**空数组 ⇒ 空结果**）。缺省 = 不过滤（今天的行为）。 */
+  branch?: 'current' | string | readonly string[] | null
 }
 ```
 
@@ -156,7 +170,7 @@ interface RecallOptions {
 | `minHits` | `number` | `2` | `mode: 'memory'` minimum informative token hits |
 | `includeArchived` | `boolean` | `false` | also consider `archived` records |
 | `status` | `'active' \| 'pending' \| 'invalid' \| 'archived' \| 'all'` | absent = today's pool | which §4.3 statuses may be returned. Absent = today's behaviour (`active`, plus `archived` when `includeArchived === true`); `'all'` = active + pending + invalid + archived, order unchanged; `'pending'` is allowed — an explicit management/audit query (§9) |
-| `branch` | `'current' \| string \| null` | unset = no filter | exactly `list`'s `branch` (§3.1): `'current'` = the injection's own `branchVisible` rule for the current cwd; any other string keeps only records whose `branchOf(record)` equals it; `null` / unset = no filter |
+| `branch` | `'current' \| string \| readonly string[] \| null` | unset = no filter | exactly `list`'s `branch` (§3.1): `'current'` = the injection's own `branchVisible` rule for the current cwd; any other string keeps only records whose `branchOf(record)` equals it; **v1.2:** an array keeps only the records whose `branchOf(record)` is in the array (no tag = not a hit) and an **empty array returns an empty result**; `null` / unset = no filter |
 
 - **Returns:** `Array<{ record: MemoryRecord; match: number; score: number }>`, sorted by `score` descending and
   then by the deterministic record order (§4.1), truncated to `limit`.
@@ -193,21 +207,21 @@ interface RecallOptions {
 | `branch` | `string` | — | branch tag; omitted = applies to every branch. Changing it **changes the fingerprint** (§4.4) |
 
 - **Returns:** a `WriteMemoryResult` object; success and rejection are both structured results (v1.1 adds
-  `persisted` to every success shape, frozen verbatim as):
+  `persisted` and v1.2 adds `refs` to every success shape, frozen verbatim as):
 
 ```ts
 type WriteMemoryResult =
-  | { ok: true; status: 'created' | 'merged'; id: string; record: MemoryRecord; boosted?: number; /** 新增 */ persisted: boolean }
-  | { ok: true; pending: true; id: string; text: string; /** 新增 */ persisted: boolean }
+  | { ok: true; status: 'created' | 'merged'; id: string; record: MemoryRecord; boosted?: number; /** 新增 */ persisted: boolean; /** 新增（v1.2） */ refs: string[] }
+  | { ok: true; pending: true; id: string; text: string; /** 新增 */ persisted: boolean; /** 新增（v1.2） */ refs: string[] }
   | { ok: false; error: string }
 ```
 
 | shape | when |
 |---|---|
-| `{ ok: true, status: 'created', id, record, persisted }` | a new record was applied; `persisted` says whether it reached the domain |
-| `{ ok: true, status: 'merged', id, record, boosted?, persisted }` | an `active` record with the same fingerprint already existed; it was updated in place |
-| `{ ok: true, pending: true, id, text, persisted }` | `writePolicy: 'ask'` queued a `model_proposed` write; **no `status` key**, nothing took effect |
-| `{ ok: false, error: '<code>: <message>' }` | rejected; **no `persisted` key**; `portrait` is added when self-portrait convergence produced a decision |
+| `{ ok: true, status: 'created', id, record, persisted, refs }` | a new record was applied; `persisted` says whether it reached the domain; `refs` carries its machine-readable references |
+| `{ ok: true, status: 'merged', id, record, boosted?, persisted, refs }` | an `active` record with the same fingerprint already existed; it was updated in place |
+| `{ ok: true, pending: true, id, text, persisted, refs }` | `writePolicy: 'ask'` queued a `model_proposed` write; **no `status` key**, nothing took effect |
+| `{ ok: false, error: '<code>: <message>' }` | rejected; **no `persisted` key and no `refs` key**; `portrait` is added when self-portrait convergence produced a decision |
 
   `record` is the full record as stored (all required fields of §4.1). `portrait` is an internal convergence
   decision whose shape is **not** frozen in v1 — ignore it unless you are diagnosing self-portrait writes.
@@ -215,6 +229,10 @@ type WriteMemoryResult =
   Domain not open, or `put` threw ⇒ `false`, while `ok` stays `true`. The `ok` meaning — "passed the gates and was
   applied to (or queued in) the in-memory store" — is **unchanged**; `persisted` just stops it being ambiguous.
   The rejection shape (`ok: false`) does **not** carry the field. Callers that ignore it are unaffected.
+- **`refs` (new in v1.2).** The **machine-readable reference strings** the record carries after this write —
+  `refsToString(refsOf(record))`, and `[]` when it has none. The caller no longer has to read `record` to get the
+  provenance, and the `pending` path, which never had a `record` at all, now has provenance too. Rejections
+  (`ok: false`) do **not** carry the field. Callers that ignore it are unaffected.
 - **Error codes** (`error` always starts with the code, then `": "`):
 
 | code | trigger |
@@ -412,7 +430,7 @@ Call `ctx.get('memory')` inside a step / effect (where services are live) and re
 | client half (`dsh.client` / `lib/client.js`) | optional | settings form + previews only; the host half and the whole service surface work without it |
 | `@deepseek-ai/schemastery` | optional peer | when unavailable the `Config` schema is dropped (or built without `volatile`); the service surface is unchanged |
 | runtime dependencies | **none** | `dependencies` is empty; the published package ships `lib/`, not `src/` |
-| protocol version field | present: `'1.1'` | §1, §9; test it with a `'1.x'` predicate (`/^1\./u`), never string equality. A `'1.0'` service simply lacks the v1.1 keys |
+| protocol version field | present: `'1.2'` | §1, §9, §10; test it with a `'1.x'` predicate (`/^1\./u`), never string equality. A `'1.1'` service simply lacks the v1.2 keys (array `branch`, `stats().writes`, `write`'s `refs`); a `'1.0'` one lacks the v1.1 keys as well |
 
 ## 8. Known gaps (awaiting a ruling)
 
@@ -468,8 +486,9 @@ additions and one packaging change:
 | 3 | `write(input)` — every **success** shape now carries `persisted: boolean`. `ok: true` still means "applied in memory"; `persisted` is the one that means "reached the storage domain". The rejection shape has no such key | §3.4 |
 | 4 | packaging — `package.json` `files` now ships the **whole `docs/`** directory (refs / self-portrait / sleep / write-policy / audit / branch / i18n / trace / semantic / dsh-mechanisms and the two protocol documents) instead of only the two protocol documents | §8 item 7 |
 
-**Check the version with a `'1.x'` predicate, never string equality** — a later `1.2` must not lock you out, and a
-service that still says `'1.0'` simply lacks the three optional keys:
+**Check the version with a `'1.x'` predicate, never string equality** — a later `1.2` must not lock you out (v1.2 has
+landed, and this predicate is what keeps you working against it), and a service that still says `'1.0'` simply lacks
+the three optional keys:
 
 ```ts
 /** The slice this caller uses; the service type is not exported (see §6). */
@@ -508,3 +527,63 @@ export async function remember(ctx: { get(name: string): unknown }, text: string
 
 Everything else in this document — §2's optionality, §4's data model and the three payload rules, §5's
 configuration surface — is v1.0 material and unchanged by v1.1.
+
+## 10. What v1.2 adds
+
+v1.2 is a **pure addition** inside v1: the service's `protocolVersion` went `'1.1' → '1.2'`, and every call that
+worked in 0.5.18 keeps its exact behaviour (a no-argument `list()` is byte for byte identical). Three surface
+additions:
+
+| # | addition | where |
+|---|---|---|
+| 1 | `list(options?)` / `recall(options)` — `branch` now also accepts a **readonly array** of branch names (`'current' \| string \| readonly string[] \| null`). A string is exactly v1.1; an array keeps the records whose `branchOf(record)` is **in** it (a record with no tag is **not** a hit); an **empty array ⇒ an empty result** — that is *not* "no filter"; `null` / unset = no filter (unchanged); a `'current'` element is resolved against the current branch | §3.1, §3.3 |
+| 2 | `stats()` — new `writes: { persisted: number; unpersisted: number }`: the per-process running count of write-persistence outcomes. `persisted` = `persist()` returned true; `unpersisted` = `ok: true` but nothing reached disk. Counters only grow, reset on restart, and rejections (`ok: false`) are not counted | §3.2 |
+| 3 | `write(input)` — every **success** shape now carries `refs: string[]`, the record's machine-readable reference strings (`[]` when it has none), including on the `pending` path. `ok: true` still means "applied in memory"; `persisted` still means "reached the storage domain". The rejection shape has neither key | §3.4 |
+
+**Check the version with a `'1.x'` predicate, never string equality** (§1) — a later `1.3` must not lock you out,
+and a service that still says `'1.1'` simply lacks the v1.2 keys:
+
+```ts
+/** The slice this caller uses; the service type is not exported (see §6). */
+interface MemoryService {
+  protocolVersion?: string
+  list(options?: { branch?: 'current' | string | readonly string[] | null; limit?: number }):
+    Array<{ id: string; text: string }>
+  write(input: { kind: string; text: string }): Promise<
+    { ok: true; pending?: boolean; persisted?: boolean; refs?: string[] } | { ok: false; error: string }
+  >
+  stats(): { records: number; version: number; opened: boolean; writes?: { persisted: number; unpersisted: number } }
+}
+
+export function memoryService(ctx: { get(name: string): unknown }): MemoryService | null {
+  const memory = ctx.get('memory') as MemoryService | undefined
+  if (!memory) return null                                  // optional service: degrade silently (§2)
+  const version = memory.protocolVersion
+  // '1.x' predicate, never `version === '1.2'`: a later minor must not lock this caller out.
+  if (version !== undefined && !/^1\./u.test(version)) return null
+  return memory
+}
+
+/** An empty branch list deliberately returns nothing — it is *not* "all branches" (§3.1, §10). */
+export function listOnBranches(ctx: { get(name: string): unknown }, branches: readonly string[]): number {
+  const memory = memoryService(ctx)
+  return memory ? memory.list({ branch: branches }).length : 0
+}
+
+export async function rememberAndProve(ctx: { get(name: string): unknown }, text: string): Promise<boolean> {
+  const memory = memoryService(ctx)
+  if (!memory) return false
+  // v1.2: stats().writes is the only *proof* that a write really reached the disk. `ok: true`
+  // still only means "applied in memory" (§3.4), so compare the counter across the call.
+  const before = memory.stats().writes?.persisted
+  const result = await memory.write({ kind: 'semantic', text })
+  if (result.ok !== true) return false                      // rejected_* ⇒ nothing was written
+  const after = memory.stats().writes?.persisted
+  if (before !== undefined && after !== undefined) return after > before   // v1.2 service
+  return result.persisted !== false                         // '1.1' fallback: persisted field
+}
+```
+
+Everything else in this document — §2's optionality, §4's data model and the three payload rules, §5's
+configuration surface, §6's example — is v1.0 / v1.1 material and unchanged by v1.2, and no v1.1 default moved:
+`list()` with no argument is still the raw view, and `stats().records` / `version` / `opened` keep their meaning.

@@ -3,6 +3,41 @@
 Version numbers advance by one patch (`0.5.0 → 0.5.1`). This file covers the public history; the repository's first
 public commit was `0.4.2`.
 
+## 0.5.19 — 2026-10-04
+
+**Protocol v1.2** (again purely additive — `protocolVersion` `'1.1'` → `'1.2'`) plus the engineering debt that
+shipping the whole `docs/` directory created.
+
+### Added
+
+- **`branch` accepts an array** in both `list()` and `recall()`: keep records whose tag is in the set, with
+  `'current'` inside the array resolved to the current branch. **An empty array means an empty result**, not "no
+  filter" — that subtlety is pinned by its own test, because getting it backwards would silently widen a query.
+- **`stats().writes: { persisted, unpersisted }`** — cumulative, in-process counts of writes that did and did not
+  reach the storage domain. This is the counter that 0.5.18's `persisted` flag made observable per call; now a
+  consumer can watch the rate without instrumenting every write. Rejections (`ok: false`) count as neither.
+- **`write()` success results carry `refs: string[]`** — the machine-readable sources of the row just written, `[]`
+  when there are none. The pending path gains it too (it never returned a `record` before, so it previously offered
+  no provenance at all). Rejection paths still carry no such field.
+- **`verify:self-contained` now scans release privacy**: every file `npm pack` would publish is checked for the
+  machine's username (read from `os.userInfo()`, never hardcoded), drive-letter and POSIX home absolute paths, and
+  the real `$DSH_HOME`. Hits name the file and line without echoing the content; binary and oversized files are
+  skipped with a reason and the output says outright that a skip is not a pass, and that an unavailable pack listing
+  means "not verified".
+
+### Notes
+
+- The privacy scan found a genuine leak on its first run — the v1.2 contract document quoted an example absolute
+  path, and that document ships. The example was rewritten to a placeholder; the checker is now the thing that
+  keeps this from recurring, which is exactly why it was worth automating instead of eyeballing.
+- Two existing assertions had to change, both acknowledged rather than worked around: the `stats()` key list (which
+  v1.2 deliberately extends) and the `protocolVersion` literal. The record shape itself is untouched — the write
+  *result* now reports `refs: []`, and there is an added assertion that the stored record still carries no `refs`
+  key at all.
+- One filtering detail worth stating: the drive-letter pattern requires that the letter not follow an identifier
+  character, otherwise generated code such as `gitdir:\s*` in `lib/` would trip it — a false positive that no source
+  change could fix.
+
 ## 0.5.18 — 2026-10-03
 
 **Protocol v1.1.** The three gaps 0.5.17 left open were all additive, and the protocol's own §1 promises that v1

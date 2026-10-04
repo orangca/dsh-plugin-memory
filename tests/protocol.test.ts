@@ -46,7 +46,8 @@ const OPTIONAL_RECORD_KEYS = ['branch', 'facet', 'refs', 'supersededBy'] as cons
 
 interface MemoryService {
   list(): Json[]
-  stats(): { records: number; version: number; opened: boolean }
+  /** M17（协议 v1.2 §2）：三个既有字段之上追加 `writes`（#2 已同步为新字段清单）。 */
+  stats(): { records: number; version: number; opened: boolean; writes: { persisted: number; unpersisted: number } }
   recall(options: Json): Array<{ record: Json; match: number; score: number }>
   write(input: Json): Promise<Json>
   consolidate(reason?: string): Promise<void>
@@ -219,9 +220,14 @@ test('protocol#2 每个方法的签名与返回结构（§3）', async (t) => {
   assert.ok(Array.isArray(service.list()), 'list() 返回数组')
   assert.equal(service.list().length, 0)
 
-  // stats()：恰好三个字段
+  // stats()：v1.2 起是四个字段（v1.1 的三个 + writes）—— 断言随契约【新增】，既有三个一字不改。
   const stats0 = service.stats()
-  assert.deepEqual(Object.keys(stats0).sort(), ['opened', 'records', 'version'])
+  assert.deepEqual(
+    Object.keys(stats0).sort(),
+    ['opened', 'records', 'version', 'writes'],
+    'protocol v1.2 §2：stats() 在三个既有字段之上追加 writes（本用例的 v1.1 部分已由 #19 钉住旧字段）',
+  )
+  assert.deepEqual(stats0.writes, { persisted: 0, unpersisted: 0 }, '空库、零写入时两个计数都必须是 0（不是缺键）')
   assert.equal(stats0.records, 0)
   assert.equal(typeof stats0.version, 'number')
   assert.equal(stats0.opened, true, 'storageDomain 可用且 open 成功时 opened 必须是 true')
@@ -504,8 +510,10 @@ test('protocol#11 两份协议文档逐节对齐，并点名 5 个方法（§1�
 /** v1.1 服务面：v1 的 5 个方法之上补 `protocolVersion` 与可选过滤参数（契约 §1/§2）。 */
 interface V11Service {
   protocolVersion?: unknown
-  list(options?: { status?: string; branch?: string | null; limit?: number }): Json[]
-  stats(): { records: number; version: number; opened: boolean }
+  /** v1.2 §1 起 `branch` 还接受字符串数组；这里是 v1.1 视图，写法仍按字符串/null。 */
+  list(options?: { status?: string; branch?: string | readonly string[] | null; limit?: number }): Json[]
+  /** v1.2 §2 起 stats() 带 `writes` —— 本视图同步，避免测试类型落后于契约。 */
+  stats(): { records: number; version: number; opened: boolean; writes: { persisted: number; unpersisted: number } }
   recall(options?: Json): Array<{ record: Json; match: number; score: number }>
   write(input: Json): Promise<Json>
   consolidate(reason?: string): Promise<void>
@@ -729,13 +737,13 @@ async function buildV11Library(harness: V11Harness): Promise<V11Library> {
 
 // ---------------------------------------------------------------- 12. §1 协议版本
 
-test('protocol#12 服务面 protocolVersion === \'1.1\'（契约 §1；调用方按 1.x 判断）', async (t) => {
+test('protocol#12 服务面 protocolVersion === \'1.2\'（契约 §1；调用方按 1.x 判断）', async (t) => {
   const harness = makeV11Harness({ config: { consolidateEnabled: false } })
   t.after(() => harness.dispose())
   await harness.settle()
 
   const version = harness.service().protocolVersion
-  assert.equal(version, '1.1', "v1 之内只做加法 ⇒ 1.0 → 1.1（docs/protocol-v1.1-changes.md 开头）")
+  assert.equal(version, '1.2', "v1 之内只做加法 ⇒ 1.0 → 1.1 → 1.2（docs/protocol-v1.2-changes.md 开头；契约 §1）")
   assert.match(String(version), /^1\.[0-9]+$/u, "protocolVersion 必须形如 '1.x'，第三方据此判断可用面")
 })
 
@@ -1134,5 +1142,248 @@ test('protocol#20 package.json 的 files 发全量 docs/（契约 §4）', () =>
   const docs = readdirSync(new URL('../docs', import.meta.url)).map((entry) => String(entry))
   for (const name of ['protocol-v1.md', 'protocol-v1.zh.md']) {
     assert.ok(docs.includes(name), `docs/ 里必须有 ${name}，实际：${docs.join(', ')}`)
+  }
+})
+
+// ================================================================ v1.2：契约 docs/protocol-v1.2-changes.md §1–§3
+//
+// 本节**纯追加**：上面 20 项只改动了两处随契约同步的既有断言
+//   · #2 的 `stats()` 字段清单（v1.2 §2 明写要新增 `writes`）；
+//   · #12 的 `protocolVersion`（v1.2 §1 明写要升到 `'1.2'`）。
+// 三条纪律与 v1.1 一节相同：① 缺省面仍与 0.5.18 逐字节相同；② 新写法只影响显式调用；
+// ③ 库与分支都用**真实写路径 + 真实临时 git 仓库**造，不手改状态字段。
+
+interface V12Service {
+  protocolVersion?: unknown
+  /** v1.2 §1：`branch` 还接受字符串数组（空数组 ⇒ 空结果）。 */
+  list(options?: Json): Json[]
+  stats(): { records: number; version: number; opened: boolean; writes: { persisted: number; unpersisted: number } }
+  recall(options?: Json): Array<{ record: Json; match: number; score: number }>
+  write(input: Json): Promise<Json>
+  consolidate(reason?: string): Promise<void>
+}
+
+/** v1.2 服务面：v1.1 的五个成员之上只多出「数组写法 / writes / refs」三件事。 */
+const v12 = (harness: V11Harness): V12Service => harness.service() as unknown as V12Service
+
+test("protocol#21 list({branch:[…]})：数组命中/不命中/空数组、含 'current'、与 status/limit 叠加（§1）", async (t) => {
+  const dir = makeBranchDir(V11_BRANCH)
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const harness = makeV11Harness({ config: { writePolicy: 'ask', consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  harness.emit('session/event', { id: 'session-v12', header: { cwd: dir } }, { type: 'session/start', seq: 1 })
+  const library = await buildV11Library(harness)
+  const service = v12(harness)
+
+  // 字符串写法仍是 v1.1 的那个表达式（数组是**新增**写法，不是替换）
+  assert.deepEqual(idsOf(service.list({ branch: V11_BRANCH })), [library.matchedProfile, library.matchedPortrait], '字符串写法一字不变')
+  const unsorted = service.list()
+
+  // 命中：branchOf 落在数组里；无标签记录**不**算命中（与单个字符串同语义）
+  const pair = service.list({ branch: [V11_BRANCH, V11_OTHER_BRANCH] })
+  assert.ok(pair.length > 0, '前置条件：两个分支上都有记录，数组用例才不是空的')
+  for (const row of pair) {
+    assert.ok(
+      [V11_BRANCH, V11_OTHER_BRANCH].includes(String(row.branch)),
+      `数组命中必须只含数组里的分支标签，实际：${String(row.branch)}`,
+    )
+  }
+  assert.deepEqual(
+    idsOf(service.list({ branch: [V11_OTHER_BRANCH] })),
+    [library.otherProfile, library.otherPortrait],
+    '单元素数组与字符串写法同结果',
+  )
+  assert.equal(
+    idsOf(service.list({ branch: [V11_BRANCH, V11_OTHER_BRANCH] })).includes(library.untaggedProfile), false,
+    '无标签记录不属于任何分支 ⇒ 数组写法不命中',
+  )
+  assert.deepEqual(idsOf(service.list({ branch: [V11_BRANCH, V11_OTHER_BRANCH] })), idsOf(pair), '数组过滤是纯读取')
+
+  // 不命中 / 空数组
+  assert.deepEqual(idsOf(service.list({ branch: ['protocol/absent'] })), [], '数组里没有的标签 ⇒ 空结果')
+  assert.deepEqual(service.list({ branch: [] }), [], '空数组 ⇒ 空结果（不是「不过滤」）')
+  assert.notEqual(service.list({ branch: [] }).length, unsorted.length, '空数组必须区别于缺省/ null')
+
+  // 数组里的 'current' 先解析成当前分支名（当前分支＝V11_BRANCH）
+  assert.deepEqual(
+    idsOf(service.list({ branch: ['current'] })),
+    [library.matchedProfile, library.matchedPortrait],
+    "['current'] ＝ 把当前分支名放进数组（无标签仍不算命中）",
+  )
+  assert.deepEqual(
+    idsOf(service.list({ branch: ['current', V11_OTHER_BRANCH] })).sort(),
+    idsOf([...service.list({ branch: V11_BRANCH }), ...service.list({ branch: V11_OTHER_BRANCH })]).sort(),
+    "['current', 其它分支] 就是两个分支的并集",
+  )
+  // 与 v1.1 的 'current'（branchVisible，含无标签）**不是**一回事 —— 数组写法更严格
+  assert.notDeepEqual(
+    idsOf(service.list({ branch: ['current'] })),
+    idsOf(service.list({ branch: 'current' })),
+    "数组里的 'current' 是「当前分支名」，不等于字符串 'current' 的 branchVisible 口径（后者含无标签记录）",
+  )
+
+  // 与 status / limit 叠加：顺序始终是无参视图的相对顺序
+  const order = idsOf(unsorted)
+  const pairIds = new Set(idsOf(pair))
+  assert.deepEqual(
+    idsOf(service.list({ branch: [V11_BRANCH, V11_OTHER_BRANCH], status: 'active' })),
+    order.filter((id) => pairIds.has(id) && service.list().find((row) => String(row.id) === id)!.status === 'active'),
+    '数组与 status 叠加（先分支后状态，顺序不变）',
+  )
+  assert.deepEqual(
+    idsOf(service.list({ branch: [V11_BRANCH, V11_OTHER_BRANCH], limit: 1 })),
+    order.filter((id) => pairIds.has(id)).slice(0, 1),
+    '数组与 limit 叠加（先过滤再截断）',
+  )
+  assert.deepEqual(service.list({ branch: [], status: 'all', limit: 3 }), [], '空数组叠加任何参数仍是空结果')
+})
+
+test("protocol#22 recall({branch:[…]})：数组命中/不命中/空数组、含 'current'，与 list 同口径（§1）", async (t) => {
+  const dir = makeBranchDir(V11_BRANCH)
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const harness = makeV11Harness({ config: { writePolicy: 'ask', consolidateEnabled: false } })
+  t.after(() => harness.dispose())
+  await harness.settle()
+  harness.emit('session/event', { id: 'session-v12', header: { cwd: dir } }, { type: 'session/start', seq: 1 })
+  const library = await buildV11Library(harness)
+  const service = v12(harness)
+  const scoped = (branch: unknown): Array<{ record: Json }> => service.recall({ query: '', branch, limit: 50 }) as Array<{ record: Json }>
+
+  // 数组命中：只留标签在数组里的记录（缺省仍只收 active）
+  assert.deepEqual(
+    hitIds(scoped([V11_OTHER_BRANCH])).sort(),
+    [library.otherProfile, library.otherPortrait].sort(),
+    '单元素数组与字符串写法同结果',
+  )
+  assert.equal(hitIds(scoped([V11_BRANCH, V11_OTHER_BRANCH])).includes(library.untaggedProfile), false, '无标签记录不算命中')
+  assert.deepEqual(
+    hitIds(scoped([V11_BRANCH, V11_OTHER_BRANCH])).sort(),
+    idsOf(service.list({ branch: [V11_BRANCH, V11_OTHER_BRANCH], status: 'active' })).sort(),
+    'recall 的数组写法与 list 同口径（同一候选池 + 缺省只收 active）',
+  )
+
+  // 不命中 / 空数组 ⇒ 空结果
+  assert.deepEqual(scoped(['protocol/absent']), [], '数组里没有的标签 ⇒ 空结果')
+  assert.deepEqual(scoped([]), [], '空数组 ⇒ 空结果（不是不过滤）')
+  assert.ok(hitIds(scoped(null)).length > 0, '对照：branch:null 仍不过滤')
+
+  // 数组里的 'current'
+  assert.deepEqual(
+    hitIds(scoped(['current'])).sort(),
+    [library.matchedProfile, library.matchedPortrait].sort(),
+    "['current'] ＝ 把当前分支名放进数组（先解析再匹配）",
+  )
+  assert.deepEqual(
+    hitIds(scoped(['current', V11_OTHER_BRANCH])).sort(),
+    [library.matchedProfile, library.matchedPortrait, library.otherProfile, library.otherPortrait].sort(),
+    "['current', 其它分支] ＝ 两个分支的并集",
+  )
+  assert.deepEqual(
+    hitIds(scoped(['current', V11_OTHER_BRANCH, ' '])).sort(),
+    [library.matchedProfile, library.matchedPortrait, library.otherProfile, library.otherPortrait].sort(),
+    '数组里的空白项不匹配任何标签（不抛，也不放宽）',
+  )
+})
+
+test('protocol#23 stats().writes：落盘成功 +1 / ok:true 未落盘 +1；拒绝路径不计入；与既有字段并列（§2）', async (t) => {
+  // a) 领域打开：created / merged / pending 三条成功路径各落盘一次
+  const open = makeV11Harness({ config: { writePolicy: 'ask', consolidateEnabled: false } })
+  t.after(() => open.dispose())
+  await open.settle()
+  const service = v12(open)
+
+  const stats0 = service.stats()
+  assert.deepEqual(Object.keys(stats0).sort(), ['opened', 'records', 'version', 'writes'], '§2：在三个既有字段之上追加 writes')
+  assert.deepEqual(stats0.writes, { persisted: 0, unpersisted: 0 }, '零写入 ⇒ 两个计数都是 0（缺键不算通过）')
+
+  await service.write({ kind: 'semantic', origin: 'observed', subject: 'v12.writes', text: V11_TEXT.mergedLead })
+  assert.deepEqual(service.stats().writes, { persisted: 1, unpersisted: 0 }, 'created 成功路径 ⇒ persisted +1')
+  await service.write({ kind: 'semantic', origin: 'observed', subject: 'v12.writes', text: V11_TEXT.mergedLead })
+  assert.deepEqual(service.stats().writes, { persisted: 2, unpersisted: 0 }, 'merged 成功路径 ⇒ persisted +1')
+  const queued = await service.write({ kind: 'semantic', subject: 'v12.writes.pending', text: V11_TEXT.pending })
+  assert.equal(queued.pending, true)
+  assert.deepEqual(service.stats().writes, { persisted: 3, unpersisted: 0 }, 'pending 成功路径（入队也要落盘）⇒ persisted +1')
+  assert.equal(open.puts.length, 3, '计数与真实 put 一一对应')
+
+  // b) 拒绝路径（ok:false）不计入 —— 那是「没写」，不是「写入未落盘」
+  const before = { ...service.stats().writes }
+  const putsBefore = open.puts.length
+  const invalid = await service.write({ kind: 'semantic', text: '' })
+  assert.equal(invalid.ok, false, '前置条件：空正文走拒绝路径')
+  const sensitive = await service.write({ kind: 'user_profile', text: '数据库密码：hunter2xyz' })
+  assert.equal(sensitive.ok, false, '前置条件：敏感文本走拒绝路径')
+  assert.deepEqual(service.stats().writes, before, '拒绝路径不得让两个计数动一下')
+  assert.equal(open.puts.length, putsBefore, '拒绝路径一次 put 都不该发生')
+
+  // c) 域未打开 / put 抛错：ok:true 但没落盘 ⇒ unpersisted +1
+  const bare = makeV11Harness({ withStorage: false, config: { consolidateEnabled: false } })
+  t.after(() => bare.dispose())
+  await bare.settle()
+  assert.equal(bare.service().stats().opened, false, '前置条件：这个宿主没有存储领域')
+  await bare.service().write({ kind: 'semantic', origin: 'observed', subject: 'v12.bare', text: '领域未打开时的一条写入。' })
+  assert.deepEqual(v12(bare).stats().writes, { persisted: 0, unpersisted: 1 }, '域未打开 ⇒ unpersisted +1（不是 persisted）')
+
+  const broken = makeV11Harness({ putFails: true, config: { consolidateEnabled: false } })
+  t.after(() => broken.dispose())
+  await broken.settle()
+  await broken.service().write({ kind: 'semantic', origin: 'observed', subject: 'v12.broken', text: 'put 抛错时的一条写入。' })
+  assert.equal(broken.service().stats().opened, true, '前置条件：领域本身是打开的')
+  assert.deepEqual(v12(broken).stats().writes, { persisted: 0, unpersisted: 1 }, 'put 抛错 ⇒ unpersisted +1')
+  await broken.service().write({ kind: 'semantic', origin: 'observed', subject: 'v12.broken.2', text: 'put 抛错时的第二条写入。' })
+  assert.deepEqual(v12(broken).stats().writes, { persisted: 0, unpersisted: 2 }, '只加不减：第二次失败继续累加')
+
+  // d) 计数不影响既有字段（records / version / opened 语义一字不改）
+  const after = service.stats()
+  assert.equal(after.records, 2, '三条成功写入里，前两条是同一条（第二写合并），库内共 2 条')
+  assert.equal(after.opened, true)
+  assert.ok(after.version > stats0.version, 'version 仍是落盘版本号，随写入增长')
+})
+
+test('protocol#24 write 两条成功路径带 refs（无引用为 []）；拒绝路径没有该字段（§3）', async (t) => {
+  // 先灌一条带 seq 的事件：宿主按 `state.seq` 推导这次写入的出处（无 sessionQuery 也不影响）。
+  const open = makeV11Harness({ config: { writePolicy: 'ask', consolidateEnabled: false } })
+  t.after(() => open.dispose())
+  await open.settle()
+  open.emit('session/event', { id: 'session-v12', seq: 9, header: { cwd: null } }, {
+    type: 'user/message', seq: 9, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '记住：构建流程统一用 pnpm。' }] },
+  })
+  const service = v12(open)
+  const expected = 'session-v12#9'
+
+  // a) created：单点引用
+  const created = await service.write({ kind: 'semantic', origin: 'observed', subject: 'v12.refs', text: V11_TEXT.mergedLead, refVia: 'tool' })
+  assert.equal(created.status, 'created')
+  assert.ok(Array.isArray(created.refs), '成功路径必须带 refs 数组')
+  assert.deepEqual(created.refs, [expected], 'refs 是本条记录携带的机器可读引用串（sessionId#from）')
+
+  // b) merged：同正文再写一次 → 合并，仍带 refs
+  const merged = await service.write({ kind: 'semantic', origin: 'observed', subject: 'v12.refs', text: V11_TEXT.mergedLead, refVia: 'tool' })
+  assert.equal(merged.status, 'merged', '前置条件：同 subject + 同正文 ⇒ 合并路径')
+  assert.deepEqual(merged.refs, [expected], '合并路径同样给出处（同一区间不重复，引用串保持一条）')
+
+  // c) pending：此前连 record 都没有，现在也要给出处
+  const queued = await service.write({ kind: 'semantic', subject: 'v12.refs.pending', text: V11_TEXT.pending, refVia: 'tool' })
+  assert.equal(queued.pending, true, '前置条件：writePolicy=ask 的模型来源写入入队')
+  assert.ok(Array.isArray(queued.refs), 'pending 成功路径也必须带 refs')
+  assert.deepEqual(queued.refs, [expected], 'pending 路径的出处来自入队记录本身')
+
+  // d) 无引用（没见过带 seq 的事件）⇒ 空数组，而不是 undefined / 缺键
+  const bare = makeV11Harness({ config: { writePolicy: 'ask', consolidateEnabled: false } })
+  t.after(() => bare.dispose())
+  await bare.settle()
+  const noRefs = await v12(bare).write({ kind: 'semantic', origin: 'observed', subject: 'v12.norefs', text: '没有 session/event 时的一条写入。' })
+  assert.equal(noRefs.ok, true)
+  assert.equal('refs' in noRefs, true, '无引用时键仍存在（值为 []），不是缺键')
+  assert.deepEqual(noRefs.refs, [], '无引用必须空数组（契约 §3 明写）')
+
+  // e) 拒绝路径（ok:false）**不加**该字段
+  const rejected: Array<[string, Json]> = [
+    ['rejected_invalid', await service.write({ kind: 'semantic', text: '' })],
+    ['rejected_sensitive', await service.write({ kind: 'user_profile', text: '数据库密码：hunter2xyz' })],
+  ]
+  for (const [label, result] of rejected) {
+    assert.equal(result.ok, false, `前置条件：${label} 必须走拒绝路径`)
+    assert.ok(!('refs' in result), `拒绝路径不得出现 refs 键：${label} → ${JSON.stringify(result)}`)
   }
 })

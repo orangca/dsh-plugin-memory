@@ -298,3 +298,116 @@ test('check-readmes：真实仓库的两份 README 结构一致（回归闸门�
   assert.deepEqual(result.problems, [], `真实 README 不该有结构差异：${result.problems.join(' / ')}`)
   assert.equal(result.ok, true)
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 发布物隐私扫描（tools/verify-self-contained.ts §4）
+//
+// 整段追加在文件末尾：既有用例一行都没动。ESM 的 import 声明会提升，写在后面同样生效。
+
+import { PRIVACY_MAX_FILE_BYTES, scanReleasePrivacy, verifySelfContained } from '../tools/verify-self-contained.ts'
+import { userInfo } from 'node:os'
+
+/** 造一个临时「仓库」目录，只写进给的文件，跑一次隐私扫描后清掉临时目录。 */
+function scanTempRepo(
+  files: Record<string, string | Buffer>,
+  overrides: { username?: string | null; dshHome?: string | null; maxBytes?: number } = {},
+): ReturnType<typeof scanReleasePrivacy> {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-privacy-'))
+  try {
+    for (const [name, content] of Object.entries(files)) {
+      const absolute = join(dir, name)
+      mkdirSync(dirname(absolute), { recursive: true })
+      writeFileSync(absolute, content)
+    }
+    return scanReleasePrivacy({ repo: dir, files: Object.keys(files), ...overrides })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+test('隐私扫描：含本机用户名的文本 ⇒ 命中本机用户名（不通过）', () => {
+  // 用户名叫什么由 os.userInfo() 现场给出，绝不把任何具体名字写死进工具或测试。
+  const detected = userInfo().username
+  const username = detected.length > 0 ? detected : 'placeholder-user'
+  const result = scanTempRepo({ 'docs/notes.md': `# 笔记\n\n作者：${username}\n` }, { username })
+  assert.equal(result.scanned, 1)
+  assert.deepEqual(result.skipped, [])
+  assert.equal(result.hitsTotal, 1)
+  assert.equal(result.hits[0]?.file, 'docs/notes.md')
+  assert.equal(result.hits[0]?.kind, 'username')
+  assert.equal(result.hits[0]?.line, 3, '要给出行号，不能只说「这个文件有问题」')
+})
+
+test('隐私扫描：含 Windows 盘符绝对路径 ⇒ 命中（不通过）', () => {
+  const result = scanTempRepo(
+    { 'README.md': '# 说明\n\n产物在 C:\\Users\\x\\proj\\lib\n' },
+    { username: null, dshHome: null },
+  )
+  assert.equal(result.hitsTotal, 1)
+  assert.equal(result.hits[0]?.kind, 'windows-drive-path')
+  assert.equal(result.hits[0]?.line, 3)
+})
+
+test('隐私扫描：含 POSIX 家目录（/home/… 与 /Users/…）⇒ 命中（不通过）', () => {
+  const result = scanTempRepo(
+    { 'docs/a.md': '见 /home/someone/notes.md\n以及 /Users/someone/notes.md\n' },
+    { username: null, dshHome: null },
+  )
+  assert.equal(result.hitsTotal, 2)
+  assert.deepEqual(result.hits.map((hit) => hit.kind), ['posix-home-path', 'posix-home-path'])
+  assert.deepEqual(result.hits.map((hit) => hit.line), [1, 2], '两种家目录写法各给出行号')
+})
+
+test('隐私扫描：干净文件 ⇒ 通过（命中为 0，扫描数如实报告）', () => {
+  const result = scanTempRepo({
+    'README.md': '# 说明\n\n产物在 <repo>/lib 下。\n',
+    'docs/b.md': '路径写成相对形式：docs/b.md\n',
+  })
+  assert.deepEqual(result.hits, [])
+  assert.equal(result.hitsTotal, 0)
+  assert.equal(result.scanned, 2)
+  assert.deepEqual(result.skipped, [])
+})
+
+test('隐私扫描：二进制与大文件被**跳过**，而不是失败', () => {
+  const binary = Buffer.concat([Buffer.from('C:\\Users\\x', 'utf8'), Buffer.from([0x00, 0x01])])
+  // 文本里确实有泄漏，但体积超过单文件上限 ⇒ 属于「没扫」：既不产生命中，也不算失败。
+  const big = `C:\\Users\\x\n${'x'.repeat(PRIVACY_MAX_FILE_BYTES)}`
+  const result = scanTempRepo({ 'lib/blob.bin': binary, 'lib/big.js': big }, { username: null, dshHome: null })
+  assert.equal(result.scanned, 0)
+  assert.equal(result.hitsTotal, 0, '跳过 ≠ 失败：读不动的文件不产生命中')
+  assert.equal(result.skipped.length, 2)
+  assert.ok(result.skipped.some((item) => item.file === 'lib/blob.bin' && item.reason.includes('二进制')))
+  assert.ok(result.skipped.some((item) => item.file === 'lib/big.js' && item.reason.includes('超过单文件上限')))
+})
+
+test('隐私扫描：真实 $DSH_HOME 出现在文本里 ⇒ 命中（不通过）', () => {
+  const result = scanTempRepo(
+    { 'docs/c.md': '记忆目录：/opt/dsh-home/memories\n' },
+    { username: null, dshHome: '/opt/dsh-home' },
+  )
+  assert.equal(result.hitsTotal, 1)
+  assert.equal(result.hits[0]?.kind, 'dsh-home')
+})
+
+test('隐私扫描：取不到用户名 / 环境里没有 $DSH_HOME 时明说「没有扫」，不假装扫过', () => {
+  const result = scanTempRepo({ 'README.md': '干净\n' }, { username: null, dshHome: null })
+  assert.deepEqual(result.hits, [])
+  assert.ok(result.notes.some((note) => note.includes('本机用户名') && note.includes('没有扫')))
+  assert.ok(result.notes.some((note) => note.includes('$DSH_HOME') && note.includes('没有扫')))
+})
+
+test('隐私扫描：拿不到 npm pack 清单时这一条**跳过**并说明原因（绝不记成通过）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-verify-skip-'))
+  try {
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'privacy-skip-probe', version: '0.0.0' }), 'utf8')
+    const result = verifySelfContained({ repo: dir, pack: false, npmCache: join(dir, 'npm-cache'), npmTimeoutMs: 1000 })
+    const privacy = result.checks.find((check) => check.id === 'privacy')
+    assert.ok(privacy !== undefined, '整体结论里必须有 privacy 这一条')
+    assert.equal(privacy.status, 'skip', '拿不到清单只能跳过，绝不能记成通过')
+    assert.ok(privacy.details.some((line) => line.includes('--no-pack')), `跳过要点名原因：${privacy.details.join(' / ')}`)
+    assert.ok(privacy.details.some((line) => line.includes('不是「通过」')), '跳过口径要与工具既有风格一致')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

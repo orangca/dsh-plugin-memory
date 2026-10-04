@@ -7,7 +7,10 @@
 //   2. src/ 与 tools/ 里的 bare import 只能指向 devDependencies 或 Node 内置模块 ——
 //      指向运行期第三方包就等于把上面那条约束抄近路绕开（类型导入不算运行期依赖）；
 //   3. 实际打包产物里必须有入口与文档（lib/index.js、lib/lib.js、lib/client.js、
-//      cordis.patch.yml、README.md、README.zh.md），否则 `files` 字段漏改也没人知道。
+//      cordis.patch.yml、README.md、README.zh.md），否则 `files` 字段漏改也没人知道；
+//   4. 发布物里不能出现隐私：本机用户名、绝对路径（盘符 / POSIX 家目录）、真实 $DSH_HOME ——
+//      `docs/` 全量进包之后，顺手贴进文档的本机路径会跟着发布出去；扫描范围就是
+//      npm pack **实际会发布的每个文件**（与第 3 条共用同一次 npm pack，不重复跑）。
 //
 // 用法：node tools/verify-self-contained.ts [--json] [--no-pack] [--repo <绝对路径>]
 //   --json      机器可读结果（CI 用）
@@ -23,11 +26,12 @@
 //   VERIFY_NPM_TIMEOUT   单次 npm 调用的超时毫秒数（默认 120000）。
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { builtinModules } from 'node:module'
-import { tmpdir } from 'node:os'
+import { tmpdir, userInfo } from 'node:os'
 import { dirname, join, resolve as resolvePath, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { TextDecoder } from 'node:util'
 
 /** 一条检查的结论。 */
 export interface CheckResult {
@@ -464,8 +468,17 @@ function readTextFile(file: string): string {
   }
 }
 
+/**
+ * npm pack 清单探测结果：检查 3（产物清单）与检查 4（隐私扫描）共用**同一次** npm pack，
+ * 所以真实清单从这里传出去，而不是让隐私扫描为了拿清单再跑一遍 npm。
+ */
+interface PackListing {
+  /** 真实发布物清单（相对仓库根的 POSIX 路径）；拿不到清单时保持 null。 */
+  files: string[] | null
+}
+
 /** 检查 3：npm pack --dry-run --json 的产物清单必须包含入口与文档。 */
-function checkPack(options: VerifyOptions): CheckResult {
+function checkPack(options: VerifyOptions, listing: PackListing): CheckResult {
   const id = 'pack'
   const title = 'npm pack 产物必须包含入口与文档'
 
@@ -575,6 +588,9 @@ function checkPack(options: VerifyOptions): CheckResult {
     }
   }
 
+  // 真的拿到清单了：交给调用方（隐私扫描）复用这一份，避免再跑一次 npm pack。
+  listing.files = files
+
   const have = new Set(files)
   const missing = REQUIRED_PACK_FILES.filter((required) => !have.has(required))
   const details = [
@@ -633,6 +649,257 @@ function firstLines(text: string, count: number): string {
     .join(' / ')
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 检查 4：发布物的隐私扫描
+//
+// 为什么：`files` 里放开 `docs/` 之后，「顺手把本机路径贴进文档」会跟着包一起被发布出去
+// （本机用户名、家目录、真实 $DSH_HOME）。靠人工扫迟早会漏，所以对 npm pack **实际会发布的每个文件**逐行扫。
+//
+// 口径（与检查 3 一致：宁可说「没验证」，也绝不说「通过」）：
+//   · 命中 ⇒ fail（退出码非零），报告 文件 + 行号 + 命中类型；**不回显命中行的内容**，
+//     免得把隐私再誊写进 CI 日志；
+//   · 二进制 / 超大文件安全跳过（读不动不算失败），但跳过必须显式说明「跳过 ≠ 通过」；
+//   · 拿不到 pack 清单（--no-pack / npm 不可用）⇒ 这一条 skip 并说明原因，绝不记成通过。
+
+/** 单文件扫描上限（字节）：超过就跳过。发布物里最大的是编译产物，量级远小于此。 */
+export const PRIVACY_MAX_FILE_BYTES = 2 * 1024 * 1024
+
+/** 单文件最多报几处明细；更多只报总数，避免一个文件刷屏。 */
+const PRIVACY_MAX_HITS_PER_FILE = 5
+
+/** 命中类型。 */
+export type PrivacyKind = 'username' | 'windows-drive-path' | 'posix-home-path' | 'dsh-home'
+
+/** 命中类型 → 人话（报告里只说类型，绝不回显命中内容）。 */
+const PRIVACY_KIND_LABELS: Readonly<Record<PrivacyKind, string>> = {
+  username: '本机用户名',
+  'windows-drive-path': 'Windows 盘符绝对路径',
+  'posix-home-path': 'POSIX 家目录绝对路径（/Users/… 或 /home/…）',
+  'dsh-home': '真实 $DSH_HOME 路径',
+}
+
+/**
+ * Windows 盘符绝对路径：`C:\…`。
+ *
+ * 为什么不是裸的 `[A-Za-z]:\\`：编译产物 lib/*.js 里有 `/^\s*gitdir:\s*(.+?)\s*$/`、
+ * `/^ref:\s*(.+)$/` 这类正则字面量，裸模式会把 `r:\`、`f:\` 认成盘符（假阳性，而且那是生成物，
+ * 从源码里也改不掉）。所以要求盘符**不紧跟在标识符字符后面**：`gitdir:` 被挡掉，`C:\Users\x` 照旧命中。
+ */
+const WINDOWS_DRIVE_PATH = /(?<![A-Za-z0-9_])[A-Za-z]:\\/u
+
+/**
+ * POSIX 家目录：`/Users/<name>/` 与 `/home/<name>/`，名字段只认 `[A-Za-z0-9._-]`。
+ * 文档里的占位写法（`/Users/<name>/`）因此不算命中 —— 它没有泄漏任何真实名字；
+ * 真实用户名（含 `.` `_` `-`）都会命中。
+ */
+const POSIX_HOME_PATH = /\/(?:Users|home)\/[A-Za-z0-9._-]+\//u
+
+/** 一条命中。 */
+export interface PrivacyHit {
+  /** 相对仓库根的 POSIX 路径。 */
+  file: string
+  /** 1 基行号。 */
+  line: number
+  /** 命中类型。 */
+  kind: PrivacyKind
+}
+
+/** 被跳过的文件与原因。 */
+export interface PrivacySkip {
+  file: string
+  reason: string
+}
+
+/** 隐私扫描输入。 */
+export interface PrivacyScanOptions {
+  /** 仓库根。 */
+  repo: string
+  /** 要扫的文件（相对仓库根的 POSIX 路径，来自 npm pack 清单）。 */
+  files: readonly string[]
+  /** 本机用户名；缺省取 `os.userInfo().username`（测试可注入）。显式 null 表示取不到。 */
+  username?: string | null
+  /** 真实 `$DSH_HOME`；缺省取 `process.env.DSH_HOME`。显式 null 表示环境里没有。 */
+  dshHome?: string | null
+  /** 单文件字节上限；缺省 `PRIVACY_MAX_FILE_BYTES`。 */
+  maxBytes?: number
+}
+
+/** 隐私扫描结论。 */
+export interface PrivacyScanResult {
+  /** 命中明细（每个文件最多 `PRIVACY_MAX_HITS_PER_FILE` 条）。 */
+  hits: PrivacyHit[]
+  /** 命中总处数（可能大于 `hits.length`）。 */
+  hitsTotal: number
+  /** 真的逐行扫过的文件数。 */
+  scanned: number
+  /** 跳过的文件（二进制 / 超大 / 读不到 / 越界）。 */
+  skipped: PrivacySkip[]
+  /** 没能覆盖到的扫描项（取不到用户名 / 没设 `$DSH_HOME`）。 */
+  notes: string[]
+}
+
+/** 本机用户名：取不到就返回空串，报告里明说这一项没扫，不假装扫过。 */
+function localUsername(): string {
+  try {
+    return userInfo().username ?? ''
+  } catch {
+    return ''
+  }
+}
+
+/** 一条隐私判据：命中类型 + 单行判定。 */
+interface PrivacyMatcher {
+  kind: PrivacyKind
+  /** line 是原文，lower 是同一行的小写副本（省得每个判据各转一次）。 */
+  match: (line: string, lower: string) => boolean
+}
+
+/**
+ * 逐行扫一批文件，找出发布物里的隐私。
+ *
+ * 只读「文本」：含 NUL 字节的按二进制跳过，非法 UTF-8 也跳过，超过 `maxBytes` 的直接跳过 ——
+ * 这三种都算「没扫」，调用方必须把 skipped 显式说出来（跳过 ≠ 通过）。
+ */
+export function scanReleasePrivacy(options: PrivacyScanOptions): PrivacyScanResult {
+  const hits: PrivacyHit[] = []
+  const skipped: PrivacySkip[] = []
+  const notes: string[] = []
+  let hitsTotal = 0
+  let scanned = 0
+
+  const maxBytes = options.maxBytes ?? PRIVACY_MAX_FILE_BYTES
+  const username = (options.username === undefined ? localUsername() : options.username) ?? ''
+  const dshHome = (options.dshHome === undefined ? (process.env.DSH_HOME ?? '') : options.dshHome) ?? ''
+  if (username.length === 0) notes.push('取不到本机用户名（os.userInfo() 不可用），「本机用户名」这一项**没有扫**。')
+  if (dshHome.length === 0) notes.push('环境里没有 $DSH_HOME，这一项**没有扫**（不是通过）。')
+
+  const usernameLower = username.toLowerCase()
+  // 同一份 $DSH_HOME，文本里可能写成反斜杠或正斜杠，两种写法都算命中。
+  const dshNeedles =
+    dshHome.length === 0 ? [] : [...new Set([dshHome, dshHome.replace(/\\/gu, '/')])].map((value) => value.toLowerCase())
+
+  const matchers: PrivacyMatcher[] = []
+  if (usernameLower.length > 0) {
+    matchers.push({ kind: 'username', match: (_line, lower) => lower.includes(usernameLower) })
+  }
+  matchers.push({ kind: 'windows-drive-path', match: (line) => WINDOWS_DRIVE_PATH.test(line) })
+  matchers.push({ kind: 'posix-home-path', match: (line) => POSIX_HOME_PATH.test(line) })
+  if (dshNeedles.length > 0) {
+    matchers.push({ kind: 'dsh-home', match: (_line, lower) => dshNeedles.some((needle) => lower.includes(needle)) })
+  }
+
+  const repoRoot = resolvePath(options.repo)
+  const rootPrefix = repoRoot.endsWith(sep) ? repoRoot : `${repoRoot}${sep}`
+
+  for (const file of options.files) {
+    const absolute = resolvePath(repoRoot, file)
+    if (absolute !== repoRoot && !absolute.startsWith(rootPrefix)) {
+      skipped.push({ file, reason: '清单里的路径越出了仓库根，未读' })
+      continue
+    }
+
+    let size: number
+    try {
+      const info = statSync(absolute)
+      if (!info.isFile()) {
+        skipped.push({ file, reason: '不是普通文件' })
+        continue
+      }
+      size = info.size
+    } catch {
+      skipped.push({ file, reason: '读不到（statSync 失败）' })
+      continue
+    }
+    if (size > maxBytes) {
+      skipped.push({ file, reason: `${size} 字节，超过单文件上限 ${maxBytes} 字节` })
+      continue
+    }
+
+    let buffer: Buffer
+    try {
+      buffer = readFileSync(absolute)
+    } catch {
+      skipped.push({ file, reason: '读不到（readFileSync 失败）' })
+      continue
+    }
+    if (buffer.includes(0)) {
+      skipped.push({ file, reason: '二进制文件（含 NUL 字节）' })
+      continue
+    }
+
+    let text: string
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(buffer)
+    } catch {
+      skipped.push({ file, reason: '不是合法 UTF-8 文本' })
+      continue
+    }
+
+    scanned += 1
+    const lines = text.split(/\r?\n/u)
+    let reported = 0
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index] ?? ''
+      const lower = line.toLowerCase()
+      // 行粒度：同一行同一种类型只报一处（行号足够定位，重复出现不再刷屏）。
+      for (const matcher of matchers) {
+        if (!matcher.match(line, lower)) continue
+        hitsTotal += 1
+        if (reported < PRIVACY_MAX_HITS_PER_FILE) {
+          hits.push({ file, line: index + 1, kind: matcher.kind })
+          reported += 1
+        }
+      }
+    }
+  }
+
+  return { hits, hitsTotal, scanned, skipped, notes }
+}
+
+/** 检查 4：npm pack 会发布的每个文件里不能出现隐私（用户名 / 绝对路径 / 真实 $DSH_HOME）。 */
+function checkPrivacy(options: VerifyOptions, packCheck: CheckResult, files: readonly string[] | null): CheckResult {
+  const id = 'privacy'
+  const title = '发布物里不能出现本机用户名、绝对路径或真实 $DSH_HOME'
+
+  if (files === null) {
+    // pack 拿不到清单：这一条必须显式「跳过」并说明原因，绝不记成通过。
+    // 原因直接引用检查 3 自己的措辞，两处口径不会各说各话。
+    const why = (packCheck.details[0] ?? '原因见上一条 pack 检查').replace(/。$/u, '')
+    return {
+      id,
+      title,
+      status: 'skip',
+      details: [
+        `没有拿到 npm pack 清单，本次没有扫描发布物隐私：${why}。`,
+        '这属于「没验证」，不是「通过」：拿不到清单时这一条只显示跳过，绝不记成通过。',
+      ],
+    }
+  }
+
+  const result = scanReleasePrivacy({ repo: options.repo, files })
+  const details = [
+    `扫描范围：npm pack 实际会发布的 ${files.length} 个文件；逐行扫过 ${result.scanned} 个，跳过 ${result.skipped.length} 个。`,
+  ]
+  for (const item of result.skipped.slice(0, 8)) details.push(`  · 跳过 ${item.file}（${item.reason}）`)
+  if (result.skipped.length > 8) details.push(`  · …另有 ${result.skipped.length - 8} 个被跳过`)
+  if (result.skipped.length > 0) {
+    details.push('跳过 ≠ 通过：被跳过的文件**没有**被扫过（二进制 / 超大文件不因为读不动就算失败）。')
+  }
+  for (const note of result.notes) details.push(note)
+
+  if (result.hits.length > 0) {
+    details.push(`命中 ${result.hitsTotal} 处（只报文件、行号与命中类型，不回显命中内容）：`)
+    for (const hit of result.hits) details.push(`  · ${hit.file}:${hit.line} 命中「${PRIVACY_KIND_LABELS[hit.kind]}」`)
+    if (result.hitsTotal > result.hits.length) details.push(`  …另有 ${result.hitsTotal - result.hits.length} 处未逐条列出`)
+    details.push('本机用户名 / 绝对路径 / 真实 $DSH_HOME 进包就等于一起发布出去：请改成占位写法（如 <home>、<name>）或把该文件移出 `files`。')
+    return { id, title, status: 'fail', details }
+  }
+
+  const clean = `干净：已扫过的 ${result.scanned} 个文件里没有本机用户名、绝对路径或真实 $DSH_HOME。`
+  details.push(result.skipped.length > 0 ? `${clean}（但跳过 ≠ 通过，见上。）` : clean)
+  return { id, title, status: 'pass', details }
+}
+
 /** 跑完整套检查。 */
 export function verifySelfContained(options: VerifyOptions): VerifyResult {
   const manifestPath = join(options.repo, 'package.json')
@@ -656,7 +923,15 @@ export function verifySelfContained(options: VerifyOptions): VerifyResult {
     }
   }
 
-  const checks = [checkDependencies(manifest), checkImports(options.repo, manifest), checkPack(options)]
+  // 同一次 npm pack 的清单：检查 3 负责拿，检查 4（隐私扫描）复用。
+  const listing: PackListing = { files: null }
+  const packCheck = checkPack(options, listing)
+  const checks = [
+    checkDependencies(manifest),
+    checkImports(options.repo, manifest),
+    packCheck,
+    checkPrivacy(options, packCheck, listing.files),
+  ]
   const failures = checks.filter((check) => check.status === 'fail').length
   const skipped = checks.filter((check) => check.status === 'skip').length
   return { ok: failures === 0, failures, skipped, checks }
@@ -712,7 +987,7 @@ if (isDirectRun()) {
       console.log(
         result.skipped > 0
           ? `通过：${result.checks.length - result.skipped} 项通过，${result.skipped} 项**跳过**（跳过原因见上，未验证 ≠ 通过）。`
-          : '通过：依赖为空、无运行期第三方导入、打包清单齐全。',
+          : '通过：依赖为空、无运行期第三方导入、打包清单齐全、发布物隐私干净。',
       )
     } else {
       console.log(`失败：${result.failures} 项不满足，${result.skipped} 项跳过。`)

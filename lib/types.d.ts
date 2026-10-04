@@ -142,8 +142,9 @@ export interface RecallOptions {
     /**
      * M16（协议 v1.1）：分支过滤，语义与 `ctx.memory.list` 的 `branch` 一致。
      * `'current'` = 与注入相同的 `branchVisible` 口径；其它字符串 = 只保留该分支标签的记录；`null`/缺省 = 不过滤。
+     * M17（协议 v1.2）：也接受**分支数组** —— 保留标签落在数组里的记录（**空数组 ⇒ 空结果**，不是"不过滤"）。
      */
-    branch?: 'current' | string | null;
+    branch?: 'current' | string | readonly string[] | null;
 }
 /** 自动捕获抽出的候选（`extractCandidates` 的返回值）。 */
 export interface CaptureCandidate {
